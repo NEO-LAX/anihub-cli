@@ -9,9 +9,6 @@
 
 ![AniHub CLI Demo](assets/demo.gif)
 
-*Terminal interface with image support:*
-![Interface Preview](assets/script-screenshot.png)
-
 ---
 
 ## ✨ Features
@@ -22,6 +19,10 @@
 - **Ukrainian Interface** support.
 
 ---
+
+## Quick Installation preview
+![Interface Preview](assets/script-screenshot.png)
+
 
 ## 🚀 Quick Installation (Linux & macOS)
 
