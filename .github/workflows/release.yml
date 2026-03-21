@@ -3,15 +3,26 @@ name: Release
 on:
   push:
     tags:
-      - 'v*' # Запускати, коли пушиш тег, наприклад v0.2.1
+      - 'v*'
 
 permissions:
-  contents: write # ДОЗВОЛЯЄМО ГІТХАБУ ПИСАТИ В РЕЛІЗИ
+  contents: write
 
 jobs:
   build:
     name: Build and Release
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: anihub-cli-linux
+            asset_name: anihub-cli-linux
+          - os: macos-latest
+            artifact_name: anihub-cli
+            asset_name: anihub-cli-macos
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,7 +30,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
@@ -27,9 +39,15 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Rename binary (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: mv target/release/anihub-cli target/release/anihub-cli-linux
+
       - name: Upload Binary to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/anihub-cli
+          files: |
+            target/release/anihub-cli-linux
+            target/release/anihub-cli
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
