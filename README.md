@@ -1,6 +1,6 @@
 # AniHub CLI
 
-Terminal client for watching anime via AniHub. Built with Rust.
+@unofficial Terminal client for watching anime via AniHub. Built with Rust.
 
 ## Features
 - Browse anime list and episodes.
