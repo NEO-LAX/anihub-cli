@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*' # Запускати, коли пушиш тег, наприклад v0.2.1
 
+permissions:
+  contents: write # ДОЗВОЛЯЄМО ГІТХАБУ ПИСАТИ В РЕЛІЗИ
+
 jobs:
   build:
     name: Build and Release
