@@ -22,3 +22,10 @@ sha2 = "0.10.9"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "net", "process", "time"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true # Прибираємо дебаг-символи, щоб файл був меншим

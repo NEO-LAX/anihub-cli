@@ -1,0 +1,91 @@
+  ~  
+   strace Downloads/anihub-cli
+execve("Downloads/anihub-cli", ["Downloads/anihub-cli"], 0x7ffe8fbce000 /* 23 vars */) = 0
+brk(NULL)                               = 0x55b445e91000
+access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+fstat(3, {st_mode=S_IFREG|0644, st_size=265495, ...}) = 0
+mmap(NULL, 265495, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7fccd2eec000
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libssl.so.3", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0755, st_size=946136, ...}) = 0
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fccd2eea000
+mmap(NULL, 944104, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7fccd2e03000
+mmap(0x7fccd2e17000, 659456, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x14000) = 0x7fccd2e17000
+mmap(0x7fccd2eb8000, 147456, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xb5000) = 0x7fccd2eb8000
+mmap(0x7fccd2edc000, 57344, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xd9000) = 0x7fccd2edc000
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libcrypto.so.3", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0755, st_size=5708896, ...}) = 0
+mmap(NULL, 5719936, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7fccd2800000
+mmap(0x7fccd2852000, 3719168, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x52000) = 0x7fccd2852000
+mmap(0x7fccd2bde000, 1126400, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x3de000) = 0x7fccd2bde000
+mmap(0x7fccd2cf1000, 528384, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x4f1000) = 0x7fccd2cf1000
+mmap(0x7fccd2d72000, 10112, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7fccd2d72000
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0644, st_size=178416, ...}) = 0
+mmap(NULL, 180712, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7fccd2dd6000
+mmap(0x7fccd2dda000, 143360, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x4000) = 0x7fccd2dda000
+mmap(0x7fccd2dfd000, 16384, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x27000) = 0x7fccd2dfd000
+mmap(0x7fccd2e01000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2a000) = 0x7fccd2e01000
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libm.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0755, st_size=1165864, ...}) = 0
+mmap(NULL, 1167688, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7fccd26e2000
+mmap(0x7fccd26f2000, 618496, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x10000) = 0x7fccd26f2000
+mmap(0x7fccd2789000, 479232, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xa7000) = 0x7fccd2789000
+mmap(0x7fccd27fe000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x11b000) = 0x7fccd27fe000
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0y\2\0\0\0\0\0"..., 832) = 832
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 840, 64) = 840
+fstat(3, {st_mode=S_IFREG|0755, st_size=2010168, ...}) = 0
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 840, 64) = 840
+mmap(NULL, 2034544, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7fccd24f1000
+mmap(0x7fccd2515000, 1511424, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x24000) = 0x7fccd2515000
+mmap(0x7fccd2686000, 319488, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x195000) = 0x7fccd2686000
+mmap(0x7fccd26d4000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1e2000) = 0x7fccd26d4000
+mmap(0x7fccd26da000, 31600, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7fccd26da000
+close(3)                                = 0
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fccd2dd4000
+mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fccd2dd1000
+arch_prctl(ARCH_SET_FS, 0x7fccd2dd1980) = 0
+set_tid_address(0x7fccd2dd1fa8)         = 3478
+set_robust_list(0x7fccd2dd1c60, 24)     = 0
+rseq(0x7fccd2dd16a0, 0x20, 0, 0x53053053) = 0
+mprotect(0x7fccd26d4000, 16384, PROT_READ) = 0
+mprotect(0x7fccd27fe000, 4096, PROT_READ) = 0
+mprotect(0x7fccd2e01000, 4096, PROT_READ) = 0
+mprotect(0x7fccd2cf1000, 516096, PROT_READ) = 0
+mprotect(0x7fccd2edc000, 40960, PROT_READ) = 0
+mprotect(0x55b436d66000, 344064, PROT_READ) = 0
+mprotect(0x7fccd2f6b000, 8192, PROT_READ) = 0
+prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
+getrandom("\x15\x7e\xc1\x0d\xcd\x84\xbe\x0b", 8, GRND_NONBLOCK) = 8
+munmap(0x7fccd2eec000, 265495)          = 0
+poll([{fd=0, events=0}, {fd=1, events=0}, {fd=2, events=0}], 3, 0) = 0 (Timeout)
+rt_sigaction(SIGPIPE, {sa_handler=SIG_IGN, sa_mask=[PIPE], sa_flags=SA_RESTORER|SA_RESTART, sa_restorer=0x7fccd252f2d0}, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
+brk(NULL)                               = 0x55b445e91000
+brk(0x55b445eb2000)                     = 0x55b445eb2000
+openat(AT_FDCWD, "/proc/self/maps", O_RDONLY|O_CLOEXEC) = 3
+prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
+fstat(3, {st_mode=S_IFREG|0444, st_size=0, ...}) = 0
+read(3, "55b4367a8000-55b436968000 r--p 0"..., 1024) = 1024
+read(3, "e2000-7fccd26f2000 r--p 00000000"..., 1024) = 1024
+read(3, "00 00:00 0 \n7fccd2dd6000-7fccd2d"..., 1024) = 1024
+read(3, "7fccd2f31000 r--p 00000000 00:00"..., 1024) = 963
+lseek(3, 0, SEEK_CUR)                   = 4035
+lseek(3, 3951, SEEK_SET)                = 3951
+close(3)                                = 0
+sched_getaffinity(3478, 32, [0 1 2 3 4 5 6 7 8 9 10 11]) = 8
+--- SIGILL {si_signo=SIGILL, si_code=ILL_ILLOPN, si_addr=0x55b436d0edcb} ---
++++ killed by SIGILL (core dumped) +++
+fish: Job 1, 'strace Downloads/anihub-cli' terminated by signal SIGILL (Illegal instruction)
+
+  ~  
+   

@@ -1,25 +1,30 @@
 # AniHub CLI
 
-Термінальний клієнт для перегляду аніме через AniHub. Побудований на Rust з використанням TUI (Ratatui).
+Terminal client for watching anime via AniHub. Built with Rust.
 
-## Особливості
-- Перегляд списку доступних аніме та серій.
-- Підтримка зображень прямо в терміналі (завдяки `ratatui-image`).
-- Інтеграція з `mpv` та `yt-dlp` для відтворення.
-- Кешування даних та історія переглядів.
+## Features
+- Browse anime list and episodes.
+- Terminal image support.
+- Integrated with mpv and yt-dlp for playback.
+- History and caching.
 
-## Швидке встановлення (Binary)
+## Quick Installation
 
-Якщо ви використовуєте Linux (x86_64), ви можете встановити програму однією командою:
+Run the following command to install the latest version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NEO-LAX/anihub-cli/master/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh?t=$(date +%s)" | bash
 ```
-*Ця команда запустить інтерактивний інсталятор з вибором опцій.*
 
-## Залежності (Runtime)
+*After installation, restart your terminal (or run `source ~/.bashrc` / `source ~/.zshrc`). Then you can launch the app by simply typing:*
 
-Для відтворення відео необхідно встановити:
+```bash
+anihub-cli
+```
+
+## Dependencies
+
+To play video, you need to install:
 - **mpv**
 - **yt-dlp**
 
@@ -33,14 +38,14 @@ sudo pacman -S mpv yt-dlp
 sudo apt update && sudo apt install mpv yt-dlp
 ```
 
-## Збірка з сирців
+## Build from Source
 
-### 1. Встановіть Rust:
+### 1. Install Rust:
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### 2. Встановіть системні залежності для білда:
+### 2. Install system dependencies:
 
 **Arch Linux:**
 ```bash
@@ -52,14 +57,14 @@ sudo pacman -S base-devel pkgconf
 sudo apt update && sudo apt install build-essential pkg-config
 ```
 
-### 3. Клонуйте та зберіть:
+### 3. Clone and build:
 ```bash
 git clone https://github.com/NEO-LAX/anihub-cli.git
 cd anihub-cli
 cargo build --release
 ```
 
-Бінарник буде знаходитись у `target/release/anihub-cli`.
+The binary will be located at `target/release/anihub-cli`.
 
-## Ліцензія
+## License
 MIT
