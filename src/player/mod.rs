@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use tokio::process::{Command, Child};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::time::{sleep, timeout, Duration};
 use tokio::task::JoinHandle;
@@ -15,12 +18,17 @@ pub struct MpvPlayer {
 
 impl MpvPlayer {
     pub fn new() -> Result<Self> {
-        let proj_dirs = ProjectDirs::from("com", "shadowgarden", "anihub-cli")
-            .context("Failed to determine project directories")?;
-
-        let socket_path = proj_dirs.data_dir().join("mpv_ipc.sock");
-
-        Ok(Self { socket_path })
+        #[cfg(unix)]
+        {
+            let proj_dirs = ProjectDirs::from("com", "shadowgarden", "anihub-cli")
+                .context("Failed to determine project directories")?;
+            let socket_path = proj_dirs.data_dir().join("mpv_ipc.sock");
+            Ok(Self { socket_path })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self { socket_path: PathBuf::from(r"\\.\pipe\anihub_mpv") })
+        }
     }
 
     pub async fn start(
@@ -30,6 +38,7 @@ impl MpvPlayer {
         anime_title: &str,
         episode_title: &str,
     ) -> Result<(Child, JoinHandle<f64>)> {
+        #[cfg(unix)]
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
@@ -65,6 +74,7 @@ impl MpvPlayer {
     }
 
     pub fn cleanup(&self) {
+        #[cfg(unix)]
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
@@ -74,15 +84,28 @@ impl MpvPlayer {
 async fn monitor_ipc(socket_path: PathBuf) -> f64 {
     let mut last_known_time = 0.0f64;
 
-    // Wait for MPV to create the socket
+    // Wait for MPV to create the socket/pipe
     for _ in 0..50 {
-        if socket_path.exists() {
-            break;
+        #[cfg(unix)]
+        if socket_path.exists() { break; }
+        
+        #[cfg(windows)]
+        {
+            // On Windows, checking existence of a pipe is different, 
+            // but we can just try to connect.
+            break; 
         }
+        
         sleep(Duration::from_millis(100)).await;
     }
 
+    #[cfg(unix)]
     let Ok(mut stream) = UnixStream::connect(&socket_path).await else {
+        return last_known_time;
+    };
+
+    #[cfg(windows)]
+    let Ok(mut stream) = ClientOptions::new().open(&socket_path) else {
         return last_known_time;
     };
 

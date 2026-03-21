@@ -8,7 +8,7 @@ Terminal client for watching anime via AniHub. Built with Rust.
 - Integrated with mpv and yt-dlp for playback.
 - History and caching.
 
-## Quick Installation
+## Quick Installation (Linux & macOS)
 
 Run the following command to install the latest version:
 
@@ -21,6 +21,14 @@ curl -fsSL "https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh
 ```bash
 anihub-cli
 ```
+
+## Windows Installation
+
+1. Download `anihub-cli-windows.exe` from the [Latest Release](https://github.com/NEO-LAX/anihub-cli/releases/latest).
+2. Rename it to `anihub-cli.exe` (optional).
+3. Ensure you have `mpv` and `yt-dlp` installed and added to your `PATH`.
+
+**Recommendation:** Use [Windows Terminal](https://aka.ms/terminal) for the best experience (including image support).
 
 ## Dependencies
 
@@ -38,33 +46,29 @@ sudo pacman -S mpv yt-dlp
 sudo apt update && sudo apt install mpv yt-dlp
 ```
 
+### macOS:
+```bash
+brew install mpv yt-dlp
+```
+
+### Windows (using [Scoop](https://scoop.sh/)):
+```powershell
+scoop install mpv yt-dlp
+```
+
 ## Build from Source
 
 ### 1. Install Rust:
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+[rustup.rs](https://rustup.rs/)
 
-### 2. Install system dependencies:
-
-**Arch Linux:**
-```bash
-sudo pacman -S base-devel pkgconf
-```
-
-**Debian/Ubuntu:**
-```bash
-sudo apt update && sudo apt install build-essential pkg-config
-```
-
-### 3. Clone and build:
+### 2. Clone and build:
 ```bash
 git clone https://github.com/NEO-LAX/anihub-cli.git
 cd anihub-cli
 cargo build --release
 ```
 
-The binary will be located at `target/release/anihub-cli`.
+The binary will be located at `target/release/anihub-cli` (or `anihub-cli.exe` on Windows).
 
 ## License
 MIT

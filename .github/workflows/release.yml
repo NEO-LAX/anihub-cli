@@ -14,12 +14,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         include:
           - os: ubuntu-latest
             asset_name: anihub-cli-linux
           - os: macos-latest
             asset_name: anihub-cli-macos
+          - os: windows-latest
+            asset_name: anihub-cli-windows.exe
 
     steps:
       - name: Checkout code
@@ -37,8 +39,14 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Rename binary
+      - name: Rename binary (Unix)
+        if: matrix.os != 'windows-latest'
         run: mv target/release/anihub-cli target/release/${{ matrix.asset_name }}
+
+      - name: Rename binary (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: mv target/release/anihub-cli.exe target/release/${{ matrix.asset_name }}
 
       - name: Upload Binary to Release
         uses: softprops/action-gh-release@v2

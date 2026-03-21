@@ -8,9 +8,11 @@ use anyhow::Result;
 /// Пише debug-повідомлення у файл, не в stderr — щоб не ламати TUI.
 fn debug_log(msg: &str) {
     use std::io::Write;
+    let mut path = std::env::temp_dir();
+    path.push("anihub_debug.log");
     let _ = std::fs::OpenOptions::new()
         .append(true).create(true)
-        .open("/tmp/anihub_debug.log")
+        .open(path)
         .and_then(|mut f| writeln!(f, "{msg}").map_err(Into::into));
 }
 use crossterm::{
