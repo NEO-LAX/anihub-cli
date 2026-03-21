@@ -10,7 +10,7 @@ OS_TYPE=$(uname -s)
 if [ "$OS_TYPE" == "Linux" ]; then
     LATEST_RELEASE_URL="$REPO_URL/releases/latest/download/anihub-cli-linux"
 elif [ "$OS_TYPE" == "Darwin" ]; then
-    LATEST_RELEASE_URL="$REPO_URL/releases/latest/download/anihub-cli"
+    LATEST_RELEASE_URL="$REPO_URL/releases/latest/download/anihub-cli-macos"
 else
     echo "⚠️  Unsupported OS: $OS_TYPE"
     exit 1
@@ -45,6 +45,7 @@ install_app() {
     mkdir -p "$INSTALL_DIR"
 
     echo -e "${BLUE}📥 Downloading binary...${NC}"
+    # Завантажуємо з суфіксом, але зберігаємо БЕЗ нього
     if curl -L "$LATEST_RELEASE_URL" -o "$INSTALL_DIR/$BINARY_NAME"; then
         chmod +x "$INSTALL_DIR/$BINARY_NAME"
         echo -e "${GREEN}✅ Installed successfully in $INSTALL_DIR/$BINARY_NAME${NC}"

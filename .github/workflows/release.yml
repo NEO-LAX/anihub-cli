@@ -17,10 +17,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         include:
           - os: ubuntu-latest
-            artifact_name: anihub-cli-linux
             asset_name: anihub-cli-linux
           - os: macos-latest
-            artifact_name: anihub-cli
             asset_name: anihub-cli-macos
 
     steps:
@@ -39,15 +37,12 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Rename binary (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: mv target/release/anihub-cli target/release/anihub-cli-linux
+      - name: Rename binary
+        run: mv target/release/anihub-cli target/release/${{ matrix.asset_name }}
 
       - name: Upload Binary to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            target/release/anihub-cli-linux
-            target/release/anihub-cli
+          files: target/release/${{ matrix.asset_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
