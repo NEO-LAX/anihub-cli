@@ -1,3 +1,3 @@
 pub mod history;
 
-pub use history::StorageManager;
+pub use history::{AppHistory, StorageManager, WatchProgress};

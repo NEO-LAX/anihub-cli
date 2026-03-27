@@ -1,7 +1,7 @@
-use super::models::{AnimeItem, AnimeSearchResponse, AnimeDetails, EpisodeSourcesResponse};
+use super::models::{AnimeDetails, AnimeItem, AnimeSearchResponse, EpisodeSourcesResponse};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use reqwest::{header, Client};
+use reqwest::{Client, header};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -41,11 +41,11 @@ impl ApiClient {
     fn generate_api_key(&self) -> String {
         let date_str = Utc::now().format("%Y-%m-%d").to_string();
         let key_str = format!("Ukr@in1anAn1me-S3curity-Key-2025_{}", date_str);
-        
+
         let mut hasher = Sha256::new();
         hasher.update(key_str.as_bytes());
         let result = hasher.finalize();
-        
+
         hex::encode(result)
     }
 
@@ -111,8 +111,15 @@ impl ApiClient {
         Ok(details)
     }
 
-    pub async fn get_episode_sources(&self, anime_id: u32, season: u32) -> Result<EpisodeSourcesResponse> {
-        let url = format!("{}/anime/{}/episode-sources?season={}", INTERNAL_API_BASE_URL, anime_id, season);
+    pub async fn get_episode_sources(
+        &self,
+        anime_id: u32,
+        season: u32,
+    ) -> Result<EpisodeSourcesResponse> {
+        let url = format!(
+            "{}/anime/{}/episode-sources?season={}",
+            INTERNAL_API_BASE_URL, anime_id, season
+        );
         let api_key = self.generate_api_key();
 
         let response = self
@@ -162,7 +169,10 @@ impl ApiClient {
 
     /// Завантажує всі доступні сезони і об'єднує студії в один список.
     /// Ashdi — пріоритет; moonanime — fallback для сезонів без ashdi-даних.
-    pub async fn get_episode_sources_for_anime(&self, anime_id: u32) -> Result<EpisodeSourcesResponse> {
+    pub async fn get_episode_sources_for_anime(
+        &self,
+        anime_id: u32,
+    ) -> Result<EpisodeSourcesResponse> {
         let mut all_studios: Vec<super::models::AshdiStudio> = Vec::new();
         let mut consecutive_empty: u32 = 0;
 
@@ -175,16 +185,20 @@ impl ApiClient {
                 Ok(sources) if !sources.moonanime.is_empty() => {
                     // Fallback: конвертуємо moonanime у AshdiStudio-формат
                     for moon in sources.moonanime {
-                        let episodes = moon.episodes.into_iter().map(|ep| {
-                            super::models::AshdiEpisode {
-                                episode_number: ep.episode_number,
-                                display_episode_number: ep.display_episode_number,
-                                title: ep.title,
-                                // iframe_url зберігаємо в полі url; розпізнаємо при відтворенні
-                                url: ep.iframe_url,
-                                ashdi_episode_id: String::new(),
-                            }
-                        }).collect::<Vec<_>>();
+                        let episodes = moon
+                            .episodes
+                            .into_iter()
+                            .map(|ep| {
+                                super::models::AshdiEpisode {
+                                    episode_number: ep.episode_number,
+                                    display_episode_number: ep.display_episode_number,
+                                    title: ep.title,
+                                    // iframe_url зберігаємо в полі url; розпізнаємо при відтворенні
+                                    url: ep.iframe_url,
+                                    ashdi_episode_id: String::new(),
+                                }
+                            })
+                            .collect::<Vec<_>>();
                         all_studios.push(super::models::AshdiStudio {
                             id: moon.id,
                             studio_name: moon.studio_name,
@@ -210,6 +224,9 @@ impl ApiClient {
 
         all_studios.sort_by(|a, b| a.season_number.cmp(&b.season_number));
 
-        Ok(EpisodeSourcesResponse { ashdi: all_studios, moonanime: Vec::new() })
+        Ok(EpisodeSourcesResponse {
+            ashdi: all_studios,
+            moonanime: Vec::new(),
+        })
     }
 }

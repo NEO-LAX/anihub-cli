@@ -1,10 +1,13 @@
-use std::collections::HashSet;
 use super::models::AnimeItem;
+use std::collections::HashSet;
 
 /// Видаляє дублікати по `id`.
 pub fn deduplicate_anime(items: Vec<AnimeItem>) -> Vec<AnimeItem> {
     let mut seen = HashSet::new();
-    items.into_iter().filter(|item| seen.insert(item.id)).collect()
+    items
+        .into_iter()
+        .filter(|item| seen.insert(item.id))
+        .collect()
 }
 
 /// Групує індекси в `items` за франшизою через prefix-matching назв.
@@ -43,7 +46,8 @@ pub fn representative_idx(items: &[AnimeItem], group: &[usize]) -> usize {
 
 /// Базова назва франшизи — найкоротший рядок у групі.
 pub fn franchise_display_name<'a>(items: &'a [AnimeItem], group: &[usize]) -> &'a str {
-    group.iter()
+    group
+        .iter()
         .map(|&i| items[i].title_ukrainian.as_str())
         .min_by_key(|s| s.len())
         .unwrap_or("")
@@ -60,7 +64,10 @@ fn same_franchise(a: &str, b: &str) -> bool {
     let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     if longer.starts_with(shorter) {
         let rest = &longer[shorter.len()..];
-        return rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':') || rest.starts_with('?');
+        return rest.is_empty()
+            || rest.starts_with(' ')
+            || rest.starts_with(':')
+            || rest.starts_with('?');
     }
     // Кейс "Назва: ..." ↔ "Назва 2: ..." або "Назва II: ..." — порівнюємо базу до ':'
     let ba = franchise_base(a);

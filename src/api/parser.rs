@@ -35,7 +35,7 @@ impl AshdiParser {
             .await
             .context("Failed to get HTML from ashdi page")?;
 
-        // Шукаємо рядок `file:'https://ashdi.vip/.../index.m3u8'` 
+        // Шукаємо рядок `file:'https://ashdi.vip/.../index.m3u8'`
         // або `file: "https://..."`
         let re = Regex::new(r#"file\s*:\s*['"](https?://[^'"]+\.m3u8)['"]"#)
             .context("Failed to compile regex")?;
