@@ -14,7 +14,7 @@ fn debug_log(msg: &str) {
         .append(true)
         .create(true)
         .open(path)
-        .and_then(|mut f| writeln!(f, "{msg}").map_err(Into::into));
+        .and_then(|mut f| writeln!(f, "{msg}"));
 }
 use api::{AshdiStudio, EpisodeSourcesResponse};
 use crossterm::{

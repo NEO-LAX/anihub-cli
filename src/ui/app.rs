@@ -1144,13 +1144,9 @@ impl AppState {
                     return;
                 }
 
-                let has_any_real_progress = episode_numbers.iter().any(|episode| {
-                    self.history.progress.values().any(|progress| {
-                        progress.anime_id == anime_id
-                            && progress.season == season_num
-                            && progress.episode == *episode
-                            && (progress.watched || progress.timestamp >= 10.0)
-                    })
+                let has_any_real_progress = episode_numbers.iter().any(|&episode| {
+                    let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode);
+                    self.history.progress.get(&key).is_some_and(|p| p.watched || p.timestamp >= 10.0)
                 });
                 let mark_watched = !has_any_real_progress;
 
@@ -1212,16 +1208,8 @@ impl AppState {
                     return;
                 };
 
-                let current_progress = self
-                    .history
-                    .progress
-                    .values()
-                    .find(|progress| {
-                        progress.anime_id == anime_id
-                            && progress.season == season_num
-                            && progress.episode == episode_number
-                    })
-                    .cloned();
+                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number);
+                let current_progress = self.history.progress.get(&key).cloned();
 
                 let result = match current_progress.as_ref() {
                     Some(progress) if progress.watched => self.storage.set_episode_watched(
@@ -1373,16 +1361,8 @@ impl AppState {
                 let Some(episode_number) = self.selected_episode_number() else {
                     return;
                 };
-                let current_progress = self
-                    .history
-                    .progress
-                    .values()
-                    .find(|progress| {
-                        progress.anime_id == anime_id
-                            && progress.season == season_num
-                            && progress.episode == episode_number
-                    })
-                    .cloned();
+                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number);
+                let current_progress = self.history.progress.get(&key).cloned();
                 let result = match current_progress.as_ref() {
                     Some(progress) if progress.watched => self.storage.set_episode_watched(
                         anime_id,

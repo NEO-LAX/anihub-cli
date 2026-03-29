@@ -1104,16 +1104,16 @@ fn latest_progress_for_group<'a>(
     app: &'a AppState,
     group: &[usize],
 ) -> Option<&'a crate::storage::WatchProgress> {
+    let mut anime_ids = Vec::with_capacity(group.len());
+    for &idx in group {
+        if let Some(item) = app.search_results.get(idx) {
+            anime_ids.push(item.id);
+        }
+    }
     app.history
         .progress
         .values()
-        .filter(|progress| {
-            group.iter().any(|&idx| {
-                app.search_results
-                    .get(idx)
-                    .is_some_and(|item| item.id == progress.anime_id)
-            })
-        })
+        .filter(|progress| anime_ids.contains(&progress.anime_id))
         .max_by_key(|progress| progress.updated_at)
 }
 
