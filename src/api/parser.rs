@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use reqwest::Client;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+static RE_M3U8: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"file\s*:\s*['"](https?://[^'"]+\.m3u8)['"]"#).unwrap()
+});
 
 pub struct AshdiParser {
     client: Client,
@@ -35,12 +40,9 @@ impl AshdiParser {
             .await
             .context("Failed to get HTML from ashdi page")?;
 
-        // Шукаємо рядок `file:'https://ashdi.vip/.../index.m3u8'` 
+        // Шукаємо рядок `file:'https://ashdi.vip/.../index.m3u8'`
         // або `file: "https://..."`
-        let re = Regex::new(r#"file\s*:\s*['"](https?://[^'"]+\.m3u8)['"]"#)
-            .context("Failed to compile regex")?;
-
-        if let Some(captures) = re.captures(&html) {
+        if let Some(captures) = RE_M3U8.captures(&html) {
             if let Some(m3u8_url) = captures.get(1) {
                 return Ok(m3u8_url.as_str().to_string());
             }

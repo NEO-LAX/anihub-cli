@@ -62,10 +62,15 @@ const ID_Q: &str = "query($i:Int){Media(id:$i,type:ANIME){id format relations{ed
 async fn gql(client: &Client, query: &'static str, vars: serde_json::Value) -> Result<Media> {
     let res: Resp = client
         .post(ANILIST_URL)
-        .json(&Req { query, variables: vars })
-        .send().await?
+        .json(&Req {
+            query,
+            variables: vars,
+        })
+        .send()
+        .await?
         .error_for_status()?
-        .json().await?;
+        .json()
+        .await?;
     res.data
         .and_then(|d| d.media)
         .ok_or_else(|| anyhow::anyhow!("AniList: no result"))
@@ -149,4 +154,3 @@ async fn bfs_from_root(client: &Client, root: Media) -> Result<Vec<FranchiseMemb
 
     Ok(members)
 }
-

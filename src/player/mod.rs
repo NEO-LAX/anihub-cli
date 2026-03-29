@@ -1,16 +1,16 @@
 use anyhow::{Context, Result};
-use tokio::process::{Command, Child};
+use directories::ProjectDirs;
+use serde_json::Value;
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
-use std::path::PathBuf;
-use std::process::Stdio;
-use directories::ProjectDirs;
-use serde_json::Value;
+use tokio::time::{Duration, sleep, timeout};
 
 pub struct MpvPlayer {
     socket_path: PathBuf,
@@ -27,7 +27,9 @@ impl MpvPlayer {
         }
         #[cfg(windows)]
         {
-            Ok(Self { socket_path: PathBuf::from(r"\\.\pipe\anihub_mpv") })
+            Ok(Self {
+                socket_path: PathBuf::from(r"\\.\pipe\anihub_mpv"),
+            })
         }
     }
 
@@ -37,7 +39,7 @@ impl MpvPlayer {
         start_time: Option<f64>,
         anime_title: &str,
         episode_title: &str,
-    ) -> Result<(Child, JoinHandle<f64>)> {
+    ) -> Result<(Child, JoinHandle<(f64, f64)>)> {
         #[cfg(unix)]
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
@@ -81,37 +83,44 @@ impl MpvPlayer {
     }
 }
 
-async fn monitor_ipc(socket_path: PathBuf) -> f64 {
+async fn monitor_ipc(socket_path: PathBuf) -> (f64, f64) {
     let mut last_known_time = 0.0f64;
+    let mut last_known_duration = 0.0f64;
 
     // Wait for MPV to create the socket/pipe
     for _ in 0..50 {
         #[cfg(unix)]
-        if socket_path.exists() { break; }
-        
+        if socket_path.exists() {
+            break;
+        }
+
         #[cfg(windows)]
         {
-            // On Windows, checking existence of a pipe is different, 
+            // On Windows, checking existence of a pipe is different,
             // but we can just try to connect.
-            break; 
+            break;
         }
-        
+
         sleep(Duration::from_millis(100)).await;
     }
 
     #[cfg(unix)]
     let Ok(mut stream) = UnixStream::connect(&socket_path).await else {
-        return last_known_time;
+        return (last_known_time, last_known_duration);
     };
 
     #[cfg(windows)]
     let Ok(mut stream) = ClientOptions::new().open(&socket_path) else {
-        return last_known_time;
+        return (last_known_time, last_known_duration);
     };
 
-    let request = "{\"command\": [\"observe_property\", 1, \"time-pos\"]}\n";
-    if stream.write_all(request.as_bytes()).await.is_err() {
-        return last_known_time;
+    for request in [
+        "{\"command\": [\"observe_property\", 1, \"time-pos\"]}\n",
+        "{\"command\": [\"observe_property\", 2, \"duration\"]}\n",
+    ] {
+        if stream.write_all(request.as_bytes()).await.is_err() {
+            return (last_known_time, last_known_duration);
+        }
     }
 
     let mut accumulated = String::new();
@@ -130,6 +139,12 @@ async fn monitor_ipc(socket_path: PathBuf) -> f64 {
                             if let Some(t) = parsed["data"].as_f64() {
                                 last_known_time = t;
                             }
+                        } else if parsed["event"] == "property-change"
+                            && parsed["name"] == "duration"
+                        {
+                            if let Some(d) = parsed["data"].as_f64() {
+                                last_known_duration = d;
+                            }
                         }
                     }
                 }
@@ -139,5 +154,5 @@ async fn monitor_ipc(socket_path: PathBuf) -> f64 {
         }
     }
 
-    last_known_time
+    (last_known_time, last_known_duration)
 }
