@@ -943,37 +943,6 @@ async fn handle_loading_tasks(app: &mut AppState) {
         }
         return;
     }
-
-    // 3. Завантаження деталей для обраного сезону у SeasonList/DubbingList/EpisodeList.
-    //    Потрібно коли аніме поточного сезону не є в search_results (напр. S4 доданий на anihub
-    //    без has_ukrainian_dub=true): search_results не містить S4, тому details треба
-    //    завантажити напряму за anime_id з studio_anime_ids.
-    if app.mode == AppMode::Normal
-        && matches!(
-            app.focus,
-            FocusPanel::SeasonList | FocusPanel::DubbingList | FocusPanel::EpisodeList
-        )
-        && app.current_details.is_none()
-    {
-        let season_anime_id = app.selected_season_num().and_then(|sn| {
-            app.current_sources.as_ref().and_then(|sources| {
-                sources
-                    .ashdi
-                    .iter()
-                    .position(|s| s.season_number == sn)
-                    .and_then(|idx| app.studio_anime_ids.get(idx))
-                    .copied()
-            })
-        });
-        if let Some(anime_id) = season_anime_id {
-            if let Some(cached) = app.details_cache.get(&anime_id).cloned() {
-                app.current_details = Some(cached);
-            } else if let Ok(details) = app.api_client.get_anime_details(anime_id).await {
-                app.details_cache.insert(anime_id, details.clone());
-                app.current_details = Some(details);
-            }
-        }
-    }
 }
 
 async fn load_library_combined_sources(
