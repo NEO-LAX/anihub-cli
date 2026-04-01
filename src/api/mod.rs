@@ -9,4 +9,4 @@ pub use grouper::{
     deduplicate_anime, franchise_display_name, group_into_franchises, representative_idx,
 };
 pub use models::*;
-pub use parser::AshdiParser;
+pub use parser::{AshdiParser, MoonAnimeParser};
