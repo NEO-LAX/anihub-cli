@@ -101,6 +101,7 @@ impl StorageManager {
         }
     }
 
+    /// Оновлює прогрес серії та повертає нову AppHistory (щоб уникнути зайвого читання з диску).
     pub fn update_progress(
         &self,
         anime_id: u32,
@@ -110,7 +111,7 @@ impl StorageManager {
         studio_name: &str,
         timestamp: f64,
         duration: f64,
-    ) -> Result<()> {
+    ) -> Result<AppHistory> {
         let mut history = self.load_history()?;
 
         let progress = WatchProgress {
@@ -130,7 +131,7 @@ impl StorageManager {
             .insert(Self::make_progress_key(anime_id, season, episode, studio_name), progress);
         self.save_history(&history)?;
 
-        Ok(())
+        Ok(history)
     }
 
     #[allow(dead_code)]

@@ -587,20 +587,40 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         return;
     }
 
+    // Якщо лише один сезон (фільм або однасезонний) — не показуємо панель "Сезони"
+    let single_season = app.unique_seasons().len() <= 1
+        && matches!(app.focus, FocusPanel::DubbingList | FocusPanel::EpisodeList);
+
     let constraints = match app.focus {
         FocusPanel::SearchList => vec![Constraint::Percentage(100)],
         FocusPanel::SeasonList => vec![Constraint::Percentage(50), Constraint::Percentage(50)],
-        FocusPanel::DubbingList => vec![
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ],
-        FocusPanel::EpisodeList => vec![
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ],
+        FocusPanel::DubbingList => {
+            if single_season {
+                vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+            } else {
+                vec![
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(34),
+                    Constraint::Percentage(33),
+                ]
+            }
+        }
+        FocusPanel::EpisodeList => {
+            if single_season {
+                vec![
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(34),
+                    Constraint::Percentage(33),
+                ]
+            } else {
+                vec![
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(25),
+                ]
+            }
+        }
     };
     let chunk_count = constraints.len();
 
@@ -662,30 +682,44 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         f.render_stateful_widget(list, list_chunks[0], &mut app.result_list_state);
     }
 
-    if chunk_count >= 2 {
+    // Визначаємо індекси чанків з урахуванням single_season
+    // single_season: [SearchList, DubbingList, EpisodeList?]
+    // normal:        [SearchList, SeasonList?, DubbingList?, EpisodeList?]
+    let season_chunk_idx: Option<usize> = if single_season { None } else if chunk_count >= 2 { Some(1) } else { None };
+    let dubbing_chunk_idx: Option<usize> = if single_season {
+        if chunk_count >= 2 { Some(1) } else { None }
+    } else if chunk_count >= 3 { Some(2) } else { None };
+    let episode_chunk_idx: Option<usize> = if single_season {
+        if chunk_count >= 3 { Some(2) } else { None }
+    } else if chunk_count >= 4 { Some(3) } else { None };
+
+    if let Some(idx) = season_chunk_idx {
         let seasons = app.unique_seasons();
         let items: Vec<ListItem> = seasons
             .iter()
             .map(|&sn| {
                 let count = app.studios_for_season(sn).len();
+                let year_str = season_year(app, sn)
+                    .map(|y| format!(" · {}", y))
+                    .unwrap_or_default();
                 let label = if count > 1 {
-                    format!("Сезон {} ({} озвучок)", sn, count)
+                    format!("Сезон {}{} ({} озвучок)", sn, year_str, count)
                 } else {
-                    format!("Сезон {}", sn)
+                    format!("Сезон {}{}", sn, year_str)
                 };
                 let marker = season_marker_for_search(app, sn);
                 ListItem::new(with_right_marker(
                     &label,
                     marker.unwrap_or(""),
-                    list_chunks[1].width.saturating_sub(6) as usize,
+                    list_chunks[idx].width.saturating_sub(6) as usize,
                 ))
             })
             .collect();
         let list = create_list(" Сезони ", items, app.focus == FocusPanel::SeasonList);
-        f.render_stateful_widget(list, list_chunks[1], &mut app.season_list_state);
+        f.render_stateful_widget(list, list_chunks[idx], &mut app.season_list_state);
     }
 
-    if chunk_count >= 3 {
+    if let Some(idx) = dubbing_chunk_idx {
         let items: Vec<ListItem> = if let Some(sn) = app.selected_season_num() {
             app.studios_for_season(sn)
                 .iter()
@@ -695,10 +729,10 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             vec![]
         };
         let list = create_list(" Озвучки ", items, app.focus == FocusPanel::DubbingList);
-        f.render_stateful_widget(list, list_chunks[2], &mut app.dubbing_list_state);
+        f.render_stateful_widget(list, list_chunks[idx], &mut app.dubbing_list_state);
     }
 
-    if chunk_count >= 4 {
+    if let Some(idx) = episode_chunk_idx {
         let items: Vec<ListItem> = if let Some(studio) = app.selected_studio() {
             let episode_owner = selected_search_anime_id(app);
             studio
@@ -757,7 +791,7 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                             return ListItem::new(with_right_marker(
                                 &label,
                                 marker,
-                                list_chunks[3].width.saturating_sub(6) as usize,
+                                list_chunks[idx].width.saturating_sub(6) as usize,
                             ));
                         }
                     }
@@ -782,7 +816,7 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     ListItem::new(with_right_marker(
                         &label,
                         marker,
-                        list_chunks[3].width.saturating_sub(6) as usize,
+                        list_chunks[idx].width.saturating_sub(6) as usize,
                     ))
                 })
                 .collect()
@@ -790,7 +824,7 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             vec![]
         };
         let list = create_list(" Серії ", items, app.focus == FocusPanel::EpisodeList);
-        f.render_stateful_widget(list, list_chunks[3], &mut app.episode_list_state);
+        f.render_stateful_widget(list, list_chunks[idx], &mut app.episode_list_state);
     }
 }
 
@@ -923,10 +957,13 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             .iter()
             .map(|&season_num| {
                 let count = app.studios_for_season(season_num).len();
+                let year_str = season_year(app, season_num)
+                    .map(|y| format!(" · {}", y))
+                    .unwrap_or_default();
                 let label = if count > 1 {
-                    format!("Сезон {} ({} озвучок)", season_num, count)
+                    format!("Сезон {}{} ({} озвучок)", season_num, year_str, count)
                 } else {
-                    format!("Сезон {}", season_num)
+                    format!("Сезон {}{}", season_num, year_str)
                 };
                 let marker = app
                     .library_selected_anime_id()
@@ -1329,13 +1366,30 @@ fn season_is_complete(app: &AppState, anime_id: u32, season_num: u32) -> bool {
     watched >= total && total > 0
 }
 
+/// Повертає рік виходу сезону season_num через studio_anime_ids → details_cache.
+fn season_year(app: &AppState, season_num: u32) -> Option<u32> {
+    let sources = app.current_sources.as_ref()?;
+    let studio_idx = sources
+        .ashdi
+        .iter()
+        .position(|s| s.season_number == season_num)?;
+    let anime_id = app.studio_anime_ids.get(studio_idx).copied()?;
+    // Спочатку details_cache, потім season_to_metadata_id
+    let year = app
+        .details_cache
+        .get(&anime_id)
+        .and_then(|d| d.year)
+        .or_else(|| {
+            app.search_results
+                .iter()
+                .find(|a| a.id == anime_id)
+                .and_then(|a| a.year)
+        });
+    year
+}
+
 fn episode_is_watched(app: &AppState, anime_id: u32, season_num: u32, episode_num: u32) -> bool {
-    app.history.progress.values().any(|progress| {
-        progress.anime_id == anime_id
-            && progress.season == season_num
-            && progress.episode == episode_num
-            && progress.watched
-    })
+    app.watched_index.contains(&(anime_id, season_num, episode_num))
 }
 
 fn episode_progress_timestamp(
@@ -1344,14 +1398,7 @@ fn episode_progress_timestamp(
     season_num: u32,
     episode_num: u32,
 ) -> Option<f64> {
-    app.history.progress.values().find_map(|progress| {
-        (progress.anime_id == anime_id
-            && progress.season == season_num
-            && progress.episode == episode_num
-            && !progress.watched
-            && progress.timestamp >= 10.0)
-            .then_some(progress.timestamp)
-    })
+    app.progress_index.get(&(anime_id, season_num, episode_num)).copied()
 }
 
 fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -> List<'a> {

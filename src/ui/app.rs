@@ -6,7 +6,7 @@ use image::DynamicImage;
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -122,6 +122,9 @@ pub struct AppState {
     pub mpv_playlist: Vec<(u32, String, u32, u32, String)>,
     pub mpv_last_time: f64,
     pub mpv_last_duration: f64,
+    /// Proxy-процес для MoonAnime HLS (Python + Playwright Firefox).
+    /// Живе поки mpv грає; вбивається при завершенні відтворення.
+    pub moonanime_proxy: Option<Child>,
 
     // Кеші та prefetch
     pub search_cache: HashMap<String, Vec<AnimeItem>>,
@@ -141,12 +144,27 @@ pub struct AppState {
 
     // AniList — кеш членів франшизи (ключ: representative_id)
     pub anilist_cache: HashMap<u32, Vec<FranchiseMember>>,
+    /// Результат combine-логіки по representative_id → (EpisodeSourcesResponse, studio_anime_ids).
+    /// Заповнюється після першого `load_combined_sources`/`load_library_combined_sources`.
+    /// Наступні навігації до тої ж групи використовують кеш і не роблять жодних запитів.
+    pub combined_sources_cache: HashMap<u32, (EpisodeSourcesResponse, Vec<u32>)>,
+    /// Канал для отримання AniList-результатів фонового prefetch.
+    /// Кожне повідомлення: (representative_id, members).
+    pub anilist_prefetch_rx: Option<mpsc::Receiver<(u32, Vec<FranchiseMember>)>>,
+
+    // O(1) індекси для перевірки переглянутих серій під час рендеру.
+    // Ребілдяться щоразу коли змінюється `history`.
+    /// (anime_id, season, episode) → true якщо watched
+    pub watched_index: HashSet<(u32, u32, u32)>,
+    /// (anime_id, season, episode) → timestamp якщо в процесі перегляду (не watched, >= 10s)
+    pub progress_index: HashMap<(u32, u32, u32), f64>,
 }
 
 impl AppState {
     pub fn new(picker: Picker) -> anyhow::Result<Self> {
         let storage = StorageManager::new()?;
         let history = storage.load_history().unwrap_or_default();
+        let (watched_index, progress_index) = Self::build_history_indexes(&history);
 
         Ok(Self {
             mode: AppMode::SearchInput,
@@ -201,6 +219,7 @@ impl AppState {
             mpv_playlist: Vec::new(),
             mpv_last_time: 0.0,
             mpv_last_duration: 0.0,
+            moonanime_proxy: None,
 
             search_cache: HashMap::new(),
             details_cache: HashMap::new(),
@@ -216,7 +235,42 @@ impl AppState {
             poster_fetch_pending: None,
 
             anilist_cache: HashMap::new(),
+            combined_sources_cache: HashMap::new(),
+            anilist_prefetch_rx: None,
+
+            watched_index,
+            progress_index,
         })
+    }
+
+    /// Будує O(1) індекси з AppHistory.
+    /// watched_index: (anime_id, season, episode) — переглянуті серії.
+    /// progress_index: (anime_id, season, episode) → timestamp — серії в процесі (>= 10s, не watched).
+    pub fn build_history_indexes(
+        history: &AppHistory,
+    ) -> (HashSet<(u32, u32, u32)>, HashMap<(u32, u32, u32), f64>) {
+        let mut watched = HashSet::new();
+        let mut progress = HashMap::new();
+        for p in history.progress.values() {
+            let key = (p.anime_id, p.season, p.episode);
+            if p.watched {
+                watched.insert(key);
+            } else if p.timestamp >= 10.0 {
+                // Беремо максимальний timestamp якщо кілька студій для одного епізоду
+                progress
+                    .entry(key)
+                    .and_modify(|t: &mut f64| *t = t.max(p.timestamp))
+                    .or_insert(p.timestamp);
+            }
+        }
+        (watched, progress)
+    }
+
+    /// Перебудовує індекси після зміни history.
+    pub fn rebuild_history_indexes(&mut self) {
+        let (watched, progress) = Self::build_history_indexes(&self.history);
+        self.watched_index = watched;
+        self.progress_index = progress;
     }
 
     // --- Хелпери для 4-панельної навігації ---
@@ -507,13 +561,22 @@ impl AppState {
         }
         match self.focus {
             FocusPanel::EpisodeList => self.focus = FocusPanel::DubbingList,
-            FocusPanel::DubbingList => self.focus = FocusPanel::SeasonList,
+            FocusPanel::DubbingList => {
+                // Якщо лише один сезон (фільм або однасезонний серіал) — пропускаємо SeasonList
+                if self.unique_seasons().len() <= 1 {
+                    self.focus = FocusPanel::SearchList;
+                    self.sidebar_anime_idx = None;
+                    self.restore_representative_poster();
+                } else {
+                    self.focus = FocusPanel::SeasonList;
+                }
+            }
             FocusPanel::SeasonList => {
                 self.focus = FocusPanel::SearchList;
                 self.sidebar_anime_idx = None;
                 self.restore_representative_poster();
             }
-            FocusPanel::SearchList => self.reset_to_home(),
+            FocusPanel::SearchList => {} // Esc на SearchList — нічого не робимо
         }
     }
 
@@ -533,11 +596,26 @@ impl AppState {
                         .current_sources
                         .as_ref()
                         .map_or(false, |s| !s.ashdi.is_empty());
-                    if has_seasons && !self.unique_seasons().is_empty() {
+                    let seasons = self.unique_seasons();
+                    if has_seasons && !seasons.is_empty() {
                         self.selected_season_index = Some(0);
                         self.season_list_state.select(Some(0));
                         self.update_sidebar_for_season();
-                        FocusPanel::SeasonList
+                        if seasons.len() == 1 {
+                            // Один сезон (фільм / однасезонний) — пропускаємо SeasonList,
+                            // одразу відкриваємо список студій озвучення.
+                            let season_num = seasons[0];
+                            let studios_len = self.studios_for_season(season_num).len();
+                            if studios_len > 0 {
+                                self.selected_dubbing_index = Some(0);
+                                self.dubbing_list_state.select(Some(0));
+                                FocusPanel::DubbingList
+                            } else {
+                                FocusPanel::SeasonList
+                            }
+                        } else {
+                            FocusPanel::SeasonList
+                        }
                     } else {
                         FocusPanel::SearchList
                     }
@@ -579,7 +657,15 @@ impl AppState {
     fn move_focus_left(&mut self) {
         match self.focus {
             FocusPanel::EpisodeList => self.focus = FocusPanel::DubbingList,
-            FocusPanel::DubbingList => self.focus = FocusPanel::SeasonList,
+            FocusPanel::DubbingList => {
+                if self.unique_seasons().len() <= 1 {
+                    self.focus = FocusPanel::SearchList;
+                    self.sidebar_anime_idx = None;
+                    self.restore_representative_poster();
+                } else {
+                    self.focus = FocusPanel::SeasonList;
+                }
+            }
             FocusPanel::SeasonList => {
                 self.focus = FocusPanel::SearchList;
                 self.sidebar_anime_idx = None;
@@ -806,6 +892,7 @@ impl AppState {
         self.loading = false;
         self.prefetching = false;
         self.prefetch_rx = None;
+        self.anilist_prefetch_rx = None;
         self.clear_status();
         self.current_poster = None;
         self.poster_fetch_pending = None;
@@ -1188,6 +1275,7 @@ impl AppState {
                 match self.storage.delete_anime_progresses(&anime_ids) {
                     Ok(()) => {
                         self.history = self.storage.load_history().unwrap_or_default();
+                self.rebuild_history_indexes();
                         self.reload_library_after_mutation();
                         self.set_info_status(format!("Прогрес для \"{}\" видалено", anime_title));
                     }
@@ -1283,6 +1371,7 @@ impl AppState {
                 }
 
                 self.history = self.storage.load_history().unwrap_or_default();
+                self.rebuild_history_indexes();
                 self.reload_library_after_mutation();
                 self.mode = if matches!(self.mode, AppMode::LibraryDubbing) {
                     AppMode::LibraryDubbing
@@ -1348,6 +1437,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.history = self.storage.load_history().unwrap_or_default();
+                self.rebuild_history_indexes();
                         self.reload_library_after_mutation();
                         self.mode = AppMode::LibraryEpisode;
                         let message = match current_progress.as_ref() {
@@ -1466,6 +1556,7 @@ impl AppState {
                     }
                 }
                 self.history = self.storage.load_history().unwrap_or_default();
+                self.rebuild_history_indexes();
                 self.set_info_status(if all_watched {
                     format!("Сезон {} позначено як непереглянутий", season_num)
                 } else {
@@ -1507,6 +1598,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.history = self.storage.load_history().unwrap_or_default();
+                self.rebuild_history_indexes();
                     }
                     Err(e) => self.set_error_status(format!("Не вдалося оновити серію: {}", e)),
                 }
