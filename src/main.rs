@@ -1506,6 +1506,47 @@ async fn load_combined_sources(app: &mut AppState, representative_id: u32) {
                 });
             }
         }
+        // Для "зайвих" сезонів (тих що виходять за межі active_franchise_ids)
+        // намагаємось знайти реальний anihub запис через AniList без dub-фільтру.
+        // Це потрібно коли S4 ще не має плеєрів (has_ukrainian_dub=false) але є на anihub —
+        // щоб показувати правильні метадані в sidebar замість даних S3.
+        app.season_to_metadata_id.clear();
+        if let Some(&last_member_id) = active_franchise_ids.last() {
+            // TV члени франшизи в AniList-порядку (хронологічно)
+            let tv_anilist_ids: Vec<u32> = app
+                .anilist_cache
+                .get(&representative_id)
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter(|m| m.is_tv)
+                        .map(|m| m.anilist_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut checked: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for (studio, &owner_id) in combined.iter().zip(anime_ids.iter()) {
+                let sn = studio.season_number;
+                // Тільки сезони де власник = останній fallback member
+                if owner_id != last_member_id || !checked.insert(sn) {
+                    continue;
+                }
+                let season_idx = (sn as usize).saturating_sub(1); // 0-indexed
+                // Сезон виходить за межі відомих членів — шукаємо реальний entry
+                if season_idx >= active_franchise_ids.len() && season_idx < tv_anilist_ids.len() {
+                    let al_id = tv_anilist_ids[season_idx];
+                    if let Ok(Some(anihub_id)) =
+                        app.api_client.get_anime_by_anilist_id_any(al_id).await
+                    {
+                        if !active_franchise_ids.contains(&anihub_id) {
+                            app.season_to_metadata_id.insert(sn, anihub_id);
+                        }
+                    }
+                }
+            }
+        }
+
         // DEBUG → /tmp/anihub_debug.log
         debug_log(&format!("[DEBUG] representative_id={representative_id}"));
         debug_log("[DEBUG] active_franchise_ids (впорядковані):");

@@ -82,6 +82,10 @@ pub struct AppState {
     pub studio_anime_ids: Vec<u32>,
     // Який search_result показувати в сайдбарі (None = selected_result_index)
     pub sidebar_anime_idx: Option<usize>,
+    // season_number → anihub_id для відображення метаданих у sidebar.
+    // Використовується коли реальний власник сезону (studio_anime_ids) не є "правильним"
+    // entry на anihub (напр. S4 завантажується з-під S3 ashdi, але на anihub є окремий запис S4).
+    pub season_to_metadata_id: std::collections::HashMap<u32, u32>,
 
     pub result_list_state: ListState,
     pub season_list_state: ListState,
@@ -161,6 +165,7 @@ impl AppState {
 
             studio_anime_ids: Vec::new(),
             sidebar_anime_idx: None,
+            season_to_metadata_id: std::collections::HashMap::new(),
 
             result_list_state: ListState::default(),
             season_list_state: ListState::default(),
@@ -765,6 +770,7 @@ impl AppState {
         self.current_poster = None;
         self.studio_anime_ids.clear();
         self.sidebar_anime_idx = None;
+        self.season_to_metadata_id.clear();
         self.selected_season_index = None;
         self.season_list_state.select(None);
         self.selected_dubbing_index = None;
@@ -789,6 +795,7 @@ impl AppState {
         self.current_details = None;
         self.studio_anime_ids.clear();
         self.sidebar_anime_idx = None;
+        self.season_to_metadata_id.clear();
         self.result_list_state.select(None);
         self.selected_season_index = None;
         self.season_list_state.select(None);
@@ -1610,10 +1617,17 @@ impl AppState {
             Some(j) => j,
             None => return,
         };
-        let anime_id = match self.studio_anime_ids.get(j).copied() {
+        let studio_owner_id = match self.studio_anime_ids.get(j).copied() {
             Some(id) => id,
             None => return,
         };
+        // Якщо є окремий anihub-запис для цього сезону (напр. S4 без dub, але є entry),
+        // використовуємо його для sidebar. Інакше — власник з studio_anime_ids.
+        let anime_id = self
+            .season_to_metadata_id
+            .get(&season_num)
+            .copied()
+            .unwrap_or(studio_owner_id);
         // Порівнюємо за anime_id, а не за позицією в search_results.
         // anime_id може не бути в search_results (напр. S3 "Вбивця романтики" при пошуку укр.),
         // тоді new_idx = None, але постер все одно треба оновити.
