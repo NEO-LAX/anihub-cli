@@ -21,7 +21,6 @@ use crossterm::{
     ExecutableCommand,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use player::MpvPlayer;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::stdout;
@@ -38,6 +37,7 @@ struct PlayTarget {
     episode_title: String,
     stream_page_url: String,
     start_time: Option<f64>,
+    studio_name: String,
 }
 
 #[tokio::main]
@@ -172,9 +172,9 @@ async fn start_episode_playback(app: &mut AppState) {
     let studio_info = app.selected_studio().and_then(|s| {
         s.episodes
             .get(e_idx)
-            .map(|ep| (ep.url.clone(), ep.episode_number, s.season_number))
+            .map(|ep| (ep.url.clone(), ep.episode_number, s.season_number, s.studio_name.clone()))
     });
-    let (target_url, episode_num, actual_season) = match studio_info {
+    let (target_url, episode_num, actual_season, studio_name) = match studio_info {
         Some(info) => info,
         None => return,
     };
@@ -251,6 +251,7 @@ async fn start_episode_playback(app: &mut AppState) {
         episode_title,
         stream_page_url: target_url,
         start_time: None,
+        studio_name,
     };
 
     play_target(app, target).await;
@@ -338,84 +339,98 @@ async fn continue_playback(app: &mut AppState, request: ContinueRequest) {
         episode_title: format!("Серія {}", resolved.episode),
         stream_page_url: resolved.url,
         start_time: resolved.start_time,
+        studio_name: resolved.studio_name,
     };
 
     play_target(app, target).await;
 }
 
 async fn play_target(app: &mut AppState, target: PlayTarget) {
-    // Якщо джерело — MoonAnime: пробуємо витягнути потік через yt-dlp з кукі браузера,
-    // якщо не виходить — відкриваємо у браузері.
-    if target.stream_page_url.starts_with("https://moonanime.art") {
+    // Якщо щось уже грає — зберігаємо прогрес поточної серії
+    if app.is_playing {
+        if let (Some(rx), Some((anime_id, title, season, episode, studio_name))) =
+            (&app.mpv_rx, &app.pending_progress)
+        {
+            let (stopped_time, duration) = *rx.borrow();
+            let _ = app.storage.update_progress(
+                *anime_id,
+                title,
+                *season,
+                *episode,
+                studio_name,
+                stopped_time,
+                duration,
+            );
+            app.history = app.storage.load_history().unwrap_or_default();
+        }
+    }
+
+    let m3u8 = if target.stream_page_url.starts_with("https://moonanime.art") {
         match try_moonanime_stream(&target.stream_page_url).await {
-            Some(stream_url) => {
-                let player = match MpvPlayer::new() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        app.set_error_status(format!("Помилка плеєра: {}", e));
-                        return;
-                    }
-                };
-                match player
-                    .start(
-                        &stream_url,
-                        target.start_time,
-                        &target.player_title,
-                        &target.episode_title,
-                    )
-                    .await
-                {
-                    Ok((child, monitor)) => {
-                        app.mpv_child = Some(child);
-                        app.mpv_monitor = Some(monitor);
-                        app.pending_progress = Some((
-                            target.anime_id,
-                            target.anime_title.clone(),
-                            target.season,
-                            target.episode,
-                        ));
-                        app.is_playing = true;
-                    }
-                    Err(e) => app.set_error_status(format!("Помилка відтворення: {}", e)),
-                }
-            }
+            Some(u) => u,
             None => {
-                // Fallback: відкриваємо у браузері
                 std::process::Command::new("xdg-open")
                     .arg(&target.stream_page_url)
                     .spawn()
                     .ok();
                 app.set_info_status("MoonAnime відкрито у браузері");
+                return;
             }
         }
-        return;
+    } else {
+        let parser = match api::AshdiParser::new() {
+            Ok(p) => p,
+            Err(e) => {
+                app.set_error_status(format!("Помилка парсера: {}", e));
+                return;
+            }
+        };
+        match parser.extract_m3u8(&target.stream_page_url).await {
+            Ok(u) => u,
+            Err(e) => {
+                app.set_error_status(format!("Помилка парсингу: {}", e));
+                return;
+            }
+        }
+    };
+
+    // Якщо MPV уже запущено — використовуємо IPC
+    if app.is_playing && app.mpv_child.is_some() {
+        let title = format!("{} - {}", target.player_title, target.episode_title);
+        let res = async {
+            app.mpv_player
+                .send_command(serde_json::json!(["loadfile", m3u8]))
+                .await?;
+            app.mpv_player
+                .send_command(serde_json::json!(["set_property", "force-media-title", title]))
+                .await?;
+            if let Some(t) = target.start_time {
+                if t > 0.0 {
+                    app.mpv_player
+                        .send_command(serde_json::json!(["set_property", "time-pos", t]))
+                        .await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if res.is_ok() {
+            app.pending_progress = Some((
+                target.anime_id,
+                target.anime_title,
+                target.season,
+                target.episode,
+                target.studio_name,
+            ));
+            return;
+        }
+        // Якщо IPC не спрацював (наприклад, mpv "завис") — йдемо далі до перезапуску
     }
 
-    let parser = match api::AshdiParser::new() {
-        Ok(p) => p,
-        Err(e) => {
-            app.set_error_status(format!("Помилка парсера: {}", e));
-            return;
-        }
-    };
-
-    let m3u8 = match parser.extract_m3u8(&target.stream_page_url).await {
-        Ok(u) => u,
-        Err(e) => {
-            app.set_error_status(format!("Помилка парсингу: {}", e));
-            return;
-        }
-    };
-
-    let player = match MpvPlayer::new() {
-        Ok(p) => p,
-        Err(e) => {
-            app.set_error_status(format!("Помилка плеєра: {}", e));
-            return;
-        }
-    };
-
-    match player
+    // Запуск нового процесу MPV
+    match app
+        .mpv_player
         .start(
             &m3u8,
             target.start_time,
@@ -424,14 +439,16 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
         )
         .await
     {
-        Ok((child, monitor)) => {
+        Ok((child, rx, monitor)) => {
             app.mpv_child = Some(child);
+            app.mpv_rx = Some(rx);
             app.mpv_monitor = Some(monitor);
             app.pending_progress = Some((
                 target.anime_id,
                 target.anime_title,
                 target.season,
                 target.episode,
+                target.studio_name,
             ));
             app.is_playing = true;
         }
@@ -446,9 +463,11 @@ struct ContinueResolvedEpisode {
     season: u32,
     episode: u32,
     season_index: usize,
+    dubbing_index: usize,
     episode_index: usize,
     url: String,
     start_time: Option<f64>,
+    studio_name: String,
 }
 
 fn resolve_continue_target(
@@ -466,10 +485,25 @@ fn resolve_continue_target(
     let season_index = seasons
         .iter()
         .position(|season| *season == progress.season)?;
-    let current_studio = sources
+    
+    let current_studio_data = sources
         .ashdi
         .iter()
-        .find(|studio| studio.season_number == progress.season)?;
+        .filter(|studio| studio.season_number == progress.season)
+        .enumerate()
+        .find(|(_, studio)| studio.studio_name == progress.studio_name)
+        .or_else(|| {
+            sources
+                .ashdi
+                .iter()
+                .filter(|studio| studio.season_number == progress.season)
+                .enumerate()
+                .next()
+        })?;
+    
+    let current_dubbing_index = current_studio_data.0;
+    let current_studio = current_studio_data.1;
+
     let current_episode_index = current_studio
         .episodes
         .iter()
@@ -481,9 +515,11 @@ fn resolve_continue_target(
             season: progress.season,
             episode: progress.episode,
             season_index,
+            dubbing_index: current_dubbing_index,
             episode_index: current_episode_index,
             url: episode.url.clone(),
             start_time: Some(progress.timestamp),
+            studio_name: current_studio.studio_name.clone(),
         });
     }
 
@@ -492,25 +528,31 @@ fn resolve_continue_target(
             season: progress.season,
             episode: next_episode.episode_number,
             season_index,
+            dubbing_index: current_dubbing_index,
             episode_index: current_episode_index + 1,
             url: next_episode.url.clone(),
             start_time: Some(0.0),
+            studio_name: current_studio.studio_name.clone(),
         });
     }
 
     let next_season = seasons.get(season_index + 1).copied()?;
-    let next_studio = sources
+    let next_studio_data = sources
         .ashdi
         .iter()
-        .find(|studio| studio.season_number == next_season)?;
-    let episode = next_studio.episodes.first()?;
+        .filter(|studio| studio.season_number == next_season)
+        .enumerate()
+        .next()?;
+    let episode = next_studio_data.1.episodes.first()?;
     Some(ContinueResolvedEpisode {
         season: next_season,
         episode: episode.episode_number,
         season_index: season_index + 1,
+        dubbing_index: next_studio_data.0,
         episode_index: 0,
         url: episode.url.clone(),
         start_time: Some(0.0),
+        studio_name: next_studio_data.1.studio_name.clone(),
     })
 }
 
@@ -558,8 +600,8 @@ fn apply_continue_context(
     app.poster_fetch_pending = Some(details.id);
     app.selected_season_index = Some(resolved.season_index);
     app.season_list_state.select(Some(resolved.season_index));
-    app.selected_dubbing_index = Some(0);
-    app.dubbing_list_state.select(Some(0));
+    app.selected_dubbing_index = Some(resolved.dubbing_index);
+    app.dubbing_list_state.select(Some(resolved.dubbing_index));
     app.selected_episode_index = Some(resolved.episode_index);
     app.episode_list_state.select(Some(resolved.episode_index));
 }
@@ -590,8 +632,8 @@ fn apply_library_continue_context(
     app.poster_fetch_pending = Some(details.id);
     app.selected_season_index = Some(resolved.season_index);
     app.season_list_state.select(Some(resolved.season_index));
-    app.selected_dubbing_index = Some(0);
-    app.dubbing_list_state.select(Some(0));
+    app.selected_dubbing_index = Some(resolved.dubbing_index);
+    app.dubbing_list_state.select(Some(resolved.dubbing_index));
     app.selected_episode_index = Some(resolved.episode_index);
     app.episode_list_state.select(Some(resolved.episode_index));
 }
@@ -624,26 +666,27 @@ async fn check_playback_finished(app: &mut AppState) {
 
     if finished {
         app.mpv_child = None;
-        let (stopped_time, duration) = if let Some(monitor) = app.mpv_monitor.take() {
-            monitor.await.unwrap_or((0.0, 0.0))
+        let (stopped_time, duration) = if let Some(rx) = app.mpv_rx.take() {
+            *rx.borrow()
         } else {
             (0.0, 0.0)
         };
-        if let Some((anime_id, title, season, episode)) = app.pending_progress.take() {
+        let _ = app.mpv_monitor.take(); // Abort/Clean up the monitor task
+
+        if let Some((anime_id, title, season, episode, studio_name)) = app.pending_progress.take() {
             let _ = app.storage.update_progress(
                 anime_id,
                 &title,
                 season,
                 episode,
+                &studio_name,
                 stopped_time,
                 duration,
             );
             app.history = app.storage.load_history().unwrap_or_default();
         }
         app.is_playing = false;
-        if let Ok(p) = MpvPlayer::new() {
-            p.cleanup();
-        }
+        app.mpv_player.cleanup();
     }
 }
 

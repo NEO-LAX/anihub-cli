@@ -109,9 +109,11 @@ pub struct AppState {
 
     // Стан відтворення
     pub is_playing: bool,
+    pub mpv_player: crate::player::MpvPlayer,
     pub mpv_child: Option<Child>,
-    pub mpv_monitor: Option<JoinHandle<(f64, f64)>>,
-    pub pending_progress: Option<(u32, String, u32, u32)>,
+    pub mpv_rx: Option<tokio::sync::watch::Receiver<(f64, f64)>>,
+    pub mpv_monitor: Option<JoinHandle<()>>,
+    pub pending_progress: Option<(u32, String, u32, u32, String)>,
 
     // Кеші та prefetch
     pub search_cache: HashMap<String, Vec<AnimeItem>>,
@@ -181,7 +183,9 @@ impl AppState {
             status_expires_at: None,
 
             is_playing: false,
+            mpv_player: crate::player::MpvPlayer::new()?,
             mpv_child: None,
+            mpv_rx: None,
             mpv_monitor: None,
             pending_progress: None,
 
@@ -1127,32 +1131,33 @@ impl AppState {
                     return;
                 };
 
-                let mut episode_numbers: Vec<u32> = sources
-                    .ashdi
-                    .iter()
-                    .filter(|studio| studio.season_number == season_num)
-                    .flat_map(|studio| studio.episodes.iter().map(|episode| episode.episode_number))
-                    .collect();
-                episode_numbers.sort_unstable();
-                episode_numbers.dedup();
+                let mut target_episodes = Vec::new();
+                for studio in sources.ashdi.iter().filter(|s| s.season_number == season_num) {
+                    for episode in &studio.episodes {
+                        target_episodes.push((studio.studio_name.clone(), episode.episode_number));
+                    }
+                }
+                target_episodes.sort_unstable();
+                target_episodes.dedup();
 
-                if episode_numbers.is_empty() {
+                if target_episodes.is_empty() {
                     return;
                 }
 
-                let has_any_real_progress = episode_numbers.iter().any(|&episode| {
-                    let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode);
+                let has_any_real_progress = target_episodes.iter().any(|(studio_name, episode)| {
+                    let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, *episode, studio_name);
                     self.history.progress.get(&key).is_some_and(|p| p.watched || p.timestamp >= 10.0)
                 });
                 let mark_watched = !has_any_real_progress;
 
-                for episode_number in &episode_numbers {
+                for (studio_name, episode_number) in &target_episodes {
                     let result = if mark_watched {
                         self.storage.set_episode_watched(
                             anime_id,
                             &anime_title,
                             season_num,
                             *episode_number,
+                            studio_name,
                             true,
                         )
                     } else {
@@ -1161,6 +1166,7 @@ impl AppState {
                             &anime_title,
                             season_num,
                             *episode_number,
+                            studio_name,
                             false,
                         )
                     };
@@ -1196,15 +1202,18 @@ impl AppState {
                 else {
                     return;
                 };
-                let Some(episode_number) = self.selected_studio().and_then(|studio| {
-                    self.selected_episode_index
-                        .and_then(|ep_idx| studio.episodes.get(ep_idx))
-                        .map(|episode| episode.episode_number)
-                }) else {
+                let Some(selected_studio) = self.selected_studio() else {
+                    return;
+                };
+                let studio_name = selected_studio.studio_name.clone();
+                let Some(episode_number) = self.selected_episode_index
+                    .and_then(|ep_idx| selected_studio.episodes.get(ep_idx))
+                    .map(|episode| episode.episode_number)
+                else {
                     return;
                 };
 
-                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number);
+                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number, &studio_name);
                 let current_progress = self.history.progress.get(&key).cloned();
 
                 let result = match current_progress.as_ref() {
@@ -1213,17 +1222,19 @@ impl AppState {
                         &anime_title,
                         season_num,
                         episode_number,
+                        &studio_name,
                         false,
                     ),
                     Some(progress) if progress.timestamp >= 10.0 && progress.timestamp < 1200.0 => {
                         self.storage
-                            .reset_episode_progress(anime_id, season_num, episode_number)
+                            .reset_episode_progress(anime_id, season_num, episode_number, &studio_name)
                     }
                     _ => self.storage.set_episode_watched(
                         anime_id,
                         &anime_title,
                         season_num,
                         episode_number,
+                        &studio_name,
                         true,
                     ),
                 };
@@ -1312,33 +1323,35 @@ impl AppState {
                 let Some(sources) = self.current_sources.as_ref() else {
                     return;
                 };
-                let mut episode_numbers: Vec<u32> = sources
-                    .ashdi
-                    .iter()
-                    .filter(|studio| studio.season_number == season_num)
-                    .flat_map(|studio| studio.episodes.iter().map(|episode| episode.episode_number))
-                    .collect();
-                episode_numbers.sort_unstable();
-                episode_numbers.dedup();
-                if episode_numbers.is_empty() {
+                let mut target_episodes = Vec::new();
+                for studio in sources.ashdi.iter().filter(|s| s.season_number == season_num) {
+                    for episode in &studio.episodes {
+                        target_episodes.push((studio.studio_name.clone(), episode.episode_number));
+                    }
+                }
+                target_episodes.sort_unstable();
+                target_episodes.dedup();
+                if target_episodes.is_empty() {
                     return;
                 }
 
-                let all_watched = episode_numbers.iter().all(|episode| {
+                let all_watched = target_episodes.iter().all(|(studio_name, episode)| {
                     self.history.progress.values().any(|progress| {
                         progress.anime_id == anime_id
                             && progress.season == season_num
                             && progress.episode == *episode
+                            && progress.studio_name == *studio_name
                             && progress.watched
                     })
                 });
 
-                for episode_number in &episode_numbers {
+                for (studio_name, episode_number) in &target_episodes {
                     let result = self.storage.set_episode_watched(
                         anime_id,
                         &anime_title,
                         season_num,
                         *episode_number,
+                        studio_name,
                         !all_watched,
                     );
                     if let Err(e) = result {
@@ -1354,10 +1367,14 @@ impl AppState {
                 });
             }
             FocusPanel::EpisodeList => {
+                let Some(selected_studio) = self.selected_studio() else {
+                    return;
+                };
+                let studio_name = selected_studio.studio_name.clone();
                 let Some(episode_number) = self.selected_episode_number() else {
                     return;
                 };
-                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number);
+                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number, &studio_name);
                 let current_progress = self.history.progress.get(&key).cloned();
                 let result = match current_progress.as_ref() {
                     Some(progress) if progress.watched => self.storage.set_episode_watched(
@@ -1365,17 +1382,19 @@ impl AppState {
                         &anime_title,
                         season_num,
                         episode_number,
+                        &studio_name,
                         false,
                     ),
                     Some(progress) if progress.timestamp >= 10.0 && progress.timestamp < 1200.0 => {
                         self.storage
-                            .reset_episode_progress(anime_id, season_num, episode_number)
+                            .reset_episode_progress(anime_id, season_num, episode_number, &studio_name)
                     }
                     _ => self.storage.set_episode_watched(
                         anime_id,
                         &anime_title,
                         season_num,
                         episode_number,
+                        &studio_name,
                         true,
                     ),
                 };

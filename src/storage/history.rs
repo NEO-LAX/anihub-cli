@@ -12,6 +12,8 @@ pub struct WatchProgress {
     pub season: u32,
     pub episode: u32,
     #[serde(default)]
+    pub studio_name: String, // Назва студії (озвучки)
+    #[serde(default)]
     pub timestamp: f64, // час у секундах, на якому зупинився користувач
     #[serde(default)]
     pub duration: f64, // загальна тривалість епізоду, якщо відома
@@ -33,8 +35,8 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
-    pub fn make_progress_key(anime_id: u32, season: u32, episode: u32) -> String {
-        format!("{anime_id}:{season}:{episode}")
+    pub fn make_progress_key(anime_id: u32, season: u32, episode: u32, studio_name: &str) -> String {
+        format!("{anime_id}:{season}:{episode}:{studio_name}")
     }
 
     pub fn new() -> Result<Self> {
@@ -65,14 +67,14 @@ impl StorageManager {
         let mut history: AppHistory =
             serde_json::from_str(&content).unwrap_or_else(|_| AppHistory::default()); // При помилці парсингу повертаємо дефолт
 
-        // Міграція старих ключів `anime_id` -> `anime_id:season:episode`.
+        // Міграція старих ключів `anime_id` -> `anime_id:season:episode:studio_name`.
         let migrated = history
             .progress
             .into_values()
             .map(|mut progress| {
                 progress.watched = Self::compute_watched(progress.timestamp, progress.duration);
                 (
-                    Self::make_progress_key(progress.anime_id, progress.season, progress.episode),
+                    Self::make_progress_key(progress.anime_id, progress.season, progress.episode, &progress.studio_name),
                     progress,
                 )
             })
@@ -105,6 +107,7 @@ impl StorageManager {
         title: &str,
         season: u32,
         episode: u32,
+        studio_name: &str,
         timestamp: f64,
         duration: f64,
     ) -> Result<()> {
@@ -115,6 +118,7 @@ impl StorageManager {
             anime_title: title.to_string(),
             season,
             episode,
+            studio_name: studio_name.to_string(),
             timestamp,
             duration,
             watched: Self::compute_watched(timestamp, duration),
@@ -123,7 +127,7 @@ impl StorageManager {
 
         history
             .progress
-            .insert(Self::make_progress_key(anime_id, season, episode), progress);
+            .insert(Self::make_progress_key(anime_id, season, episode, studio_name), progress);
         self.save_history(&history)?;
 
         Ok(())
@@ -159,12 +163,13 @@ impl StorageManager {
     }
 
     #[allow(dead_code)]
-    pub fn reset_episode_progress(&self, anime_id: u32, season: u32, episode: u32) -> Result<()> {
+    pub fn reset_episode_progress(&self, anime_id: u32, season: u32, episode: u32, studio_name: &str) -> Result<()> {
         let mut history = self.load_history()?;
         if let Some(progress) = history.progress.values_mut().find(|progress| {
             progress.anime_id == anime_id
                 && progress.season == season
                 && progress.episode == episode
+                && progress.studio_name == studio_name
         }) {
             if progress.watched {
                 progress.watched = false;
@@ -182,10 +187,11 @@ impl StorageManager {
         title: &str,
         season: u32,
         episode: u32,
+        studio_name: &str,
         watched: bool,
     ) -> Result<()> {
         let mut history = self.load_history()?;
-        let key = Self::make_progress_key(anime_id, season, episode);
+        let key = Self::make_progress_key(anime_id, season, episode, studio_name);
         let now = chrono::Utc::now().timestamp();
 
         match history.progress.get_mut(&key) {
@@ -209,6 +215,7 @@ impl StorageManager {
                         anime_title: title.to_string(),
                         season,
                         episode,
+                        studio_name: studio_name.to_string(),
                         timestamp: if watched { 1200.0 } else { 0.0 },
                         duration: 0.0,
                         watched,
