@@ -321,10 +321,6 @@ impl AppState {
                             _ => {}
                         },
                         AppMode::SearchInput => match key.code {
-                            KeyCode::Char('l') => self.open_library(),
-                            KeyCode::Char('c') if self.search_query.is_empty() => {
-                                self.request_continue()
-                            }
                             KeyCode::Enter => {
                                 self.mode = AppMode::Normal;
                                 if !self.search_query.is_empty() {
