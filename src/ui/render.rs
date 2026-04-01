@@ -156,10 +156,16 @@ fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     f.render_widget(block, area);
 
     let display_idx = app.sidebar_anime_idx.or(app.selected_result_index);
-    let has_eng = display_idx
-        .and_then(|i| app.search_results.get(i))
-        .and_then(|it| it.title_english.as_ref())
-        .is_some();
+    // Якщо поточний сезон — аніме не з пошуку (напр. S4 без ukr dub на сайті),
+    // беремо `has_eng` з current_details, а не з search_results[representative].
+    let has_eng = if let Some(d) = sidebar_details_override(app) {
+        d.title_english.is_some()
+    } else {
+        display_idx
+            .and_then(|i| app.search_results.get(i))
+            .and_then(|it| it.title_english.as_ref())
+            .is_some()
+    };
     let title_h: u16 = if has_eng { 2 } else { 1 };
 
     if app.current_poster.is_some() && inner.height > title_h + 5 {
@@ -219,7 +225,25 @@ fn render_sidebar_title_area(
     display_idx: Option<usize>,
 ) {
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(idx) = display_idx {
+
+    // Якщо обраний сезон належить аніме не з пошуку — показуємо його назву з current_details
+    if let Some(d) = sidebar_details_override(app) {
+        lines.push(
+            Line::from(Span::styled(
+                d.title_ukrainian.as_str(),
+                Style::default()
+                    .fg(COLOR_SECONDARY)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+        );
+        if let Some(eng) = &d.title_english {
+            lines.push(
+                Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                    .alignment(Alignment::Center),
+            );
+        }
+    } else if let Some(idx) = display_idx {
         if let Some(item) = app.search_results.get(idx) {
             lines.push(
                 Line::from(Span::styled(
@@ -257,7 +281,102 @@ fn render_sidebar_details_area(
     };
     let mut text: Vec<Line> = Vec::new();
 
-    if let Some(idx) = display_idx {
+    // Якщо обраний сезон — аніме не з пошуку (напр. S4 без ukr dub на anihub),
+    // відображаємо дані прямо з current_details замість search_results[representative].
+    if let Some(d) = sidebar_details_override(app) {
+        if include_title {
+            text.push(
+                Line::from(Span::styled(
+                    d.title_ukrainian.as_str(),
+                    Style::default()
+                        .fg(COLOR_SECONDARY)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            );
+            if let Some(eng) = &d.title_english {
+                text.push(
+                    Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                        .alignment(Alignment::Center),
+                );
+            }
+            text.push(mk_sep());
+        }
+
+        text.push(
+            Line::from(vec![
+                Span::styled("Тип: ", Style::default().fg(COLOR_DIM)),
+                Span::styled(d.anime_type.as_str(), Style::default().fg(COLOR_TEXT)),
+            ])
+            .alignment(Alignment::Center),
+        );
+        text.push(
+            Line::from(vec![
+                Span::styled("Рік: ", Style::default().fg(COLOR_DIM)),
+                Span::styled(
+                    d.year
+                        .map(|y| y.to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                    Style::default().fg(COLOR_TEXT),
+                ),
+            ])
+            .alignment(Alignment::Center),
+        );
+
+        if let Some(rating) = d.rating {
+            text.push(
+                Line::from(vec![
+                    Span::styled("Рейтинг: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled(
+                        format!("{:.1} ⭐", rating),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+                .alignment(Alignment::Center),
+            );
+        }
+        if let Some(ep_count) = d.episodes_count {
+            text.push(
+                Line::from(vec![
+                    Span::styled("Серій: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled(ep_count.to_string(), Style::default().fg(COLOR_TEXT)),
+                ])
+                .alignment(Alignment::Center),
+            );
+        }
+
+        let has_extra = d.genres.as_ref().map_or(false, |g| !g.is_empty())
+            || d.dubbing_studios.as_ref().map_or(false, |s| !s.is_empty());
+        if has_extra {
+            text.push(mk_sep());
+        }
+
+        if let Some(studios) = &d.dubbing_studios {
+            if !studios.is_empty() {
+                let s = studios
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                text.push(Line::from(vec![
+                    Span::styled("Озвучка: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled(s, Style::default().fg(Color::Green)),
+                ]));
+            }
+        }
+
+        if let Some(genres) = &d.genres {
+            if !genres.is_empty() {
+                text.push(Line::from(""));
+                text.push(Line::from(vec![
+                    Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled(genres.join(" · "), Style::default().fg(COLOR_HIGHLIGHT)),
+                ]));
+            }
+        }
+    } else if let Some(idx) = display_idx {
         if let Some(item) = app.search_results.get(idx) {
             if include_title {
                 text.push(
@@ -1355,6 +1474,27 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Повертає `current_details` якщо поточний сезон належить аніме, якого немає в `search_results`
+/// (наприклад, S4 доданий на anihub але без `has_ukrainian_dub`, тому не потрапив у пошук).
+/// Використовується в sidebar для відображення правильних метаданих замість репрезентанта.
+fn sidebar_details_override(app: &AppState) -> Option<&api::AnimeDetails> {
+    // Якщо sidebar_anime_idx встановлений — аніме є в search_results, нічого перевизначати
+    if app.sidebar_anime_idx.is_some() {
+        return None;
+    }
+    let details = app.current_details.as_ref()?;
+    // ID репрезентанта групи (той, що показується по замовчуванню)
+    let rep_id = app
+        .selected_result_index
+        .and_then(|i| app.search_results.get(i))
+        .map(|a| a.id);
+    // Якщо current_details для того самого аніме — перевизначення не потрібне
+    if rep_id == Some(details.id) {
+        return None;
+    }
+    Some(details)
 }
 
 fn count_seasons(items: &[crate::api::AnimeItem], group: &[usize]) -> (usize, usize) {
