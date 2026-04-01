@@ -79,6 +79,22 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Drain AniList prefetch results → anilist_cache
+        if let Some(rx) = &mut app.anilist_prefetch_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok((rep_id, members)) => {
+                        app.anilist_cache.insert(rep_id, members);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        app.anilist_prefetch_rx = None;
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                }
+            }
+        }
+
         if let Some(ids) = app.pending_prefetch_ids.take() {
             spawn_prefetch_for_ids(&mut app, ids);
         }
@@ -125,7 +141,7 @@ async fn main() -> Result<()> {
                         if pos < app.mpv_playlist.len() {
                             // Зберігаємо прогрес для попередньої серії
                             if let Some((anime_id, title, season, episode, studio_name)) = &app.pending_progress {
-                                let _ = app.storage.update_progress(
+                                if let Ok(new_history) = app.storage.update_progress(
                                     *anime_id,
                                     title,
                                     *season,
@@ -133,8 +149,10 @@ async fn main() -> Result<()> {
                                     studio_name,
                                     app.mpv_last_time,
                                     app.mpv_last_duration,
-                                );
-                                app.history = app.storage.load_history().unwrap_or_default();
+                                ) {
+                                    app.history = new_history;
+                                    app.rebuild_history_indexes();
+                                }
                             }
 
                             // Оновлюємо pending_progress на нову серію
@@ -160,20 +178,20 @@ async fn main() -> Result<()> {
                                             next_target.studio_name.clone(),
                                         ));
                                         let player2 = app.mpv_player.clone();
-                                        tokio::spawn(async move {
-                                            let m3u8 = if next_target.stream_page_url.starts_with("https://moonanime.art") {
-                                                try_moonanime_stream(&next_target.stream_page_url).await
-                                            } else {
-                                                if let Ok(parser) = api::AshdiParser::new() {
+                                        // MoonAnime: preload пропускаємо — proxy не можна передати з tokio::spawn
+                                        // Наступна серія запуститься через start_episode_playback при EndFile
+                                        if !next_target.stream_page_url.starts_with("https://moonanime.art") {
+                                            tokio::spawn(async move {
+                                                let m3u8 = if let Ok(parser) = api::AshdiParser::new() {
                                                     parser.extract_m3u8(&next_target.stream_page_url).await.ok()
                                                 } else {
                                                     None
+                                                };
+                                                if let Some(url) = m3u8 {
+                                                    let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
                                                 }
-                                            };
-                                            if let Some(url) = m3u8 {
-                                                let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
-                                            }
-                                        });
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -453,7 +471,7 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
     // Якщо щось уже грає — зберігаємо прогрес поточної серії
     if app.is_playing {
         if let Some((anime_id, title, season, episode, studio_name)) = &app.pending_progress {
-            let _ = app.storage.update_progress(
+            if let Ok(new_history) = app.storage.update_progress(
                 *anime_id,
                 title,
                 *season,
@@ -461,14 +479,23 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
                 studio_name,
                 app.mpv_last_time,
                 app.mpv_last_duration,
-            );
-            app.history = app.storage.load_history().unwrap_or_default();
+            ) {
+                app.history = new_history;
+                app.rebuild_history_indexes();
+            }
         }
     }
 
     let m3u8 = if target.stream_page_url.starts_with("https://moonanime.art") {
+        // Вбиваємо попередній proxy якщо є
+        if let Some(mut old) = app.moonanime_proxy.take() {
+            let _ = old.kill().await;
+        }
         match try_moonanime_stream(&target.stream_page_url).await {
-            Some(u) => u,
+            Some((url, proxy_child)) => {
+                app.moonanime_proxy = Some(proxy_child);
+                url
+            }
             None => {
                 std::process::Command::new("xdg-open")
                     .arg(&target.stream_page_url)
@@ -543,21 +570,20 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
                     next_target.episode,
                     next_target.studio_name.clone(),
                 ));
-                let player2 = app.mpv_player.clone();
-                tokio::spawn(async move {
-                    let m3u8 = if next_target.stream_page_url.starts_with("https://moonanime.art") {
-                        try_moonanime_stream(&next_target.stream_page_url).await
-                    } else {
-                        if let Ok(parser) = api::AshdiParser::new() {
+                // MoonAnime: preload пропускаємо — proxy не можна передати з tokio::spawn
+                if !next_target.stream_page_url.starts_with("https://moonanime.art") {
+                    let player2 = app.mpv_player.clone();
+                    tokio::spawn(async move {
+                        let m3u8 = if let Ok(parser) = api::AshdiParser::new() {
                             parser.extract_m3u8(&next_target.stream_page_url).await.ok()
                         } else {
                             None
+                        };
+                        if let Some(url) = m3u8 {
+                            let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
                         }
-                    };
-                    if let Some(url) = m3u8 {
-                        let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
-                    }
-                });
+                    });
+                }
             }
             return;
         }
@@ -607,21 +633,20 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
                     next_target.episode,
                     next_target.studio_name.clone(),
                 ));
-                let player2 = app.mpv_player.clone();
-                tokio::spawn(async move {
-                    let m3u8 = if next_target.stream_page_url.starts_with("https://moonanime.art") {
-                        try_moonanime_stream(&next_target.stream_page_url).await
-                    } else {
-                        if let Ok(parser) = api::AshdiParser::new() {
+                // MoonAnime: preload пропускаємо — proxy не можна передати з tokio::spawn
+                if !next_target.stream_page_url.starts_with("https://moonanime.art") {
+                    let player2 = app.mpv_player.clone();
+                    tokio::spawn(async move {
+                        let m3u8 = if let Ok(parser) = api::AshdiParser::new() {
                             parser.extract_m3u8(&next_target.stream_page_url).await.ok()
                         } else {
                             None
+                        };
+                        if let Some(url) = m3u8 {
+                            let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
                         }
-                    };
-                    if let Some(url) = m3u8 {
-                        let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
-                    }
-                });
+                    });
+                }
             }
         }
         Err(e) => {
@@ -844,7 +869,7 @@ async fn check_playback_finished(app: &mut AppState) {
         let _ = app.mpv_monitor.take(); // Abort/Clean up the monitor task
 
         if let Some((anime_id, title, season, episode, studio_name)) = app.pending_progress.take() {
-            let _ = app.storage.update_progress(
+            if let Ok(new_history) = app.storage.update_progress(
                 anime_id,
                 &title,
                 season,
@@ -852,11 +877,17 @@ async fn check_playback_finished(app: &mut AppState) {
                 &studio_name,
                 stopped_time,
                 duration,
-            );
-            app.history = app.storage.load_history().unwrap_or_default();
+            ) {
+                app.history = new_history;
+                app.rebuild_history_indexes();
+            }
         }
         app.is_playing = false;
         app.mpv_player.cleanup();
+        // Зупиняємо MoonAnime proxy якщо він ще живий
+        if let Some(mut proxy) = app.moonanime_proxy.take() {
+            let _ = proxy.kill().await;
+        }
     }
 }
 
@@ -905,7 +936,15 @@ async fn handle_loading_tasks(app: &mut AppState) {
                 .collect();
 
             if app.current_sources.is_none() || current_ids != expected_ids {
-                load_library_combined_sources(app, &selected_ids, representative_id).await;
+                // Перевіряємо combined_sources_cache перед повним перерахунком
+                if let Some((cached_sources, cached_ids)) =
+                    app.combined_sources_cache.get(&representative_id).cloned()
+                {
+                    app.current_sources = Some(cached_sources);
+                    app.studio_anime_ids = cached_ids;
+                } else {
+                    load_library_combined_sources(app, &selected_ids, representative_id).await;
+                }
             }
         }
 
@@ -942,7 +981,14 @@ async fn handle_loading_tasks(app: &mut AppState) {
 
                 // Об'єднані джерела з усіх TV-членів франшизи
                 if app.current_sources.is_none() {
-                    load_combined_sources(app, item.id).await;
+                    if let Some((cached_sources, cached_ids)) =
+                        app.combined_sources_cache.get(&item.id).cloned()
+                    {
+                        app.current_sources = Some(cached_sources);
+                        app.studio_anime_ids = cached_ids;
+                    } else {
+                        load_combined_sources(app, item.id).await;
+                    }
                 }
 
                 // Постер: ставимо в чергу на фоновий fetch (після наступного render)
@@ -1200,11 +1246,14 @@ async fn load_library_combined_sources(
     }
 
     if !combined.is_empty() {
-        app.studio_anime_ids = anime_ids;
-        app.current_sources = Some(EpisodeSourcesResponse {
+        let final_sources = EpisodeSourcesResponse {
             ashdi: combined,
             moonanime: Vec::new(),
-        });
+        };
+        app.combined_sources_cache
+            .insert(representative_id, (final_sources.clone(), anime_ids.clone()));
+        app.studio_anime_ids = anime_ids;
+        app.current_sources = Some(final_sources);
     }
 }
 
@@ -1233,6 +1282,28 @@ fn apply_search_results(app: &mut AppState, results: Vec<api::AnimeItem>) {
         app.selected_result_index = Some(rep);
         app.loading = true;
         app.pending_prefetch_ids = Some(app.search_results.iter().map(|anime| anime.id).collect());
+
+        // AniList prefetch: для кожної групи де є TV-члени з anilist_id
+        let anilist_groups: Vec<(u32, u32)> = app
+            .franchise_groups
+            .iter()
+            .filter_map(|group| {
+                let rep_idx = api::representative_idx(&app.search_results, group);
+                let rep_id = app.search_results[rep_idx].id;
+                // Перший TV-член з anilist_id
+                group.iter().find_map(|&i| {
+                    let item = &app.search_results[i];
+                    if item.anime_type.to_lowercase() == "tv" {
+                        item.anilist_id.map(|al_id| (rep_id, al_id))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        if !anilist_groups.is_empty() {
+            spawn_anilist_prefetch(app, anilist_groups);
+        }
     } else {
         app.result_list_state.select(None);
         app.selected_group_index = None;
@@ -1246,30 +1317,46 @@ fn spawn_prefetch_for_ids(app: &mut AppState, ids: Vec<u32>) {
         abort.abort();
     }
 
-    let pending: Vec<u32> = ids
-        .into_iter()
+    // Завантажуємо тільки ті, яких ще немає в кешах
+    let pending_sources: Vec<u32> = ids
+        .iter()
+        .copied()
         .filter(|anime_id| !app.sources_cache.contains_key(anime_id))
         .collect();
+    let pending_details: Vec<u32> = ids
+        .into_iter()
+        .filter(|anime_id| !app.details_cache.contains_key(anime_id))
+        .collect();
 
-    if pending.is_empty() {
+    if pending_sources.is_empty() && pending_details.is_empty() {
         app.prefetch_rx = None;
         app.prefetching = false;
         return;
     }
 
     let client = app.api_client.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
     let task = tokio::spawn(async move {
         let mut join_set: JoinSet<(
             u32,
             Option<api::AnimeDetails>,
             Option<EpisodeSourcesResponse>,
         )> = JoinSet::new();
-        for anime_id in pending {
-            let client = client.clone();
+
+        // Sources prefetch
+        for anime_id in pending_sources {
+            let c = client.clone();
             join_set.spawn(async move {
-                let sources = client.get_episode_sources_for_anime(anime_id).await.ok();
+                let sources = c.get_episode_sources_for_anime(anime_id).await.ok();
                 (anime_id, None, sources)
+            });
+        }
+        // Details prefetch
+        for anime_id in pending_details {
+            let c = client.clone();
+            join_set.spawn(async move {
+                let details = c.get_anime_details(anime_id).await.ok();
+                (anime_id, details, None)
             });
         }
 
@@ -1286,6 +1373,40 @@ fn spawn_prefetch_for_ids(app: &mut AppState, ids: Vec<u32>) {
     app.preload_abort = Some(task.abort_handle());
     app.prefetch_rx = Some(rx);
     app.prefetching = true;
+}
+
+/// Запускає фоновий prefetch AniList-даних для кожної групи.
+/// Результат (representative_id, members) надходить через `anilist_prefetch_rx`.
+fn spawn_anilist_prefetch(app: &mut AppState, groups: Vec<(u32, u32)>) {
+    // groups: Vec<(representative_id, first_tv_anilist_id)>
+    let pending: Vec<(u32, u32)> = groups
+        .into_iter()
+        .filter(|(rep_id, _)| !app.anilist_cache.contains_key(rep_id))
+        .collect();
+
+    if pending.is_empty() {
+        app.anilist_prefetch_rx = None;
+        return;
+    }
+
+    let http_client = app.api_client.http_client().clone();
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        let mut join_set: JoinSet<(u32, Vec<api::anilist::FranchiseMember>)> = JoinSet::new();
+        for (rep_id, anilist_id) in pending {
+            let c = http_client.clone();
+            join_set.spawn(async move {
+                let members = api::anilist::get_franchise_members_by_id(&c, anilist_id).await;
+                (rep_id, members)
+            });
+        }
+        while let Some(Ok((rep_id, members))) = join_set.join_next().await {
+            if tx.send((rep_id, members)).await.is_err() {
+                break;
+            }
+        }
+    });
+    app.anilist_prefetch_rx = Some(rx);
 }
 
 /// Об'єднує джерела серій з усіх TV-елементів поточної франшизи.
@@ -1610,7 +1731,10 @@ async fn load_combined_sources(app: &mut AppState, representative_id: u32) {
                 .await
             {
                 Ok(sources) => {
-                    app.studio_anime_ids = vec![representative_id; sources.ashdi.len()];
+                    let ids = vec![representative_id; sources.ashdi.len()];
+                    app.combined_sources_cache
+                        .insert(representative_id, (sources.clone(), ids.clone()));
+                    app.studio_anime_ids = ids;
                     app.current_sources = Some(sources);
                 }
                 Err(e) => app.set_error_status(format!("Помилка джерел: {}", e)),
@@ -1621,10 +1745,15 @@ async fn load_combined_sources(app: &mut AppState, representative_id: u32) {
         let sources = if let Some(cached) = app.sources_cache.get(&anime_id).cloned() {
             Some(cached)
         } else {
-            app.api_client
+            let fetched = app
+                .api_client
                 .get_episode_sources_for_anime(anime_id)
                 .await
-                .ok()
+                .ok();
+            if let Some(ref s) = fetched {
+                app.sources_cache.insert(anime_id, s.clone());
+            }
+            fetched
         };
         if let Some(sources) = sources {
             for studio in sources.ashdi {
@@ -1635,11 +1764,14 @@ async fn load_combined_sources(app: &mut AppState, representative_id: u32) {
     }
 
     if !combined.is_empty() {
-        app.studio_anime_ids = anime_ids;
-        app.current_sources = Some(EpisodeSourcesResponse {
+        let final_sources = EpisodeSourcesResponse {
             ashdi: combined,
             moonanime: Vec::new(),
-        });
+        };
+        app.combined_sources_cache
+            .insert(representative_id, (final_sources.clone(), anime_ids.clone()));
+        app.studio_anime_ids = anime_ids;
+        app.current_sources = Some(final_sources);
     } else {
         match app
             .api_client
@@ -1647,7 +1779,10 @@ async fn load_combined_sources(app: &mut AppState, representative_id: u32) {
             .await
         {
             Ok(sources) => {
-                app.studio_anime_ids = vec![representative_id; sources.ashdi.len()];
+                let ids = vec![representative_id; sources.ashdi.len()];
+                app.combined_sources_cache
+                    .insert(representative_id, (sources.clone(), ids.clone()));
+                app.studio_anime_ids = ids;
                 app.current_sources = Some(sources);
             }
             Err(e) => app.set_error_status(format!("Помилка джерел: {}", e)),
@@ -1827,111 +1962,204 @@ async fn find_anihub_id(
 /// Python-скрипт для Playwright: відкриває iframe сторінку headless Chromium,
 /// перехоплює перший мережевий запит до `s.moonanime.art/*.m3u8` і виводить URL у stdout.
 /// m3u8 URL формується обфускованим JS на стороні клієнта — статичний парсинг HTML не працює.
+/// Playwright скрипт для MoonAnime:
+/// 1. Firefox headless завантажує iframe сторінку (обходить TLS fingerprint CDN s.moonanime.art)
+/// 2. Перехоплює master m3u8 URL (генерується obfuscated JS)
+/// 3. Завантажує master manifest через JS fetch (browser контекст)
+/// 4. Знаходить найкращу якість (1080p → 720p → перша)
+/// 5. Завантажує variant manifest через JS fetch
+/// 6. Зберігає у /tmp/anihub_moon_stream.m3u8 (segments — прямі s3.mooncdn.space URLs, доступні без proxy)
+/// 7. Виводить шлях до файлу в stdout → mpv грає локальний manifest
+/// Playwright скрипт для MoonAnime:
+/// 1. Firefox headless завантажує iframe (обходить TLS fingerprint CDN s.moonanime.art)
+/// 2. Перехоплює master m3u8 URL, завантажує manifest через JS fetch
+/// 3. Знаходить найкращу якість, завантажує variant manifest
+/// 4. Запускає локальний HTTP сервер (Content-Type: application/vnd.apple.mpegurl)
+///    щоб mpv правильно розпізнав HLS (без HTTP → трактує як M3U плейлист)
+/// 5. Виводить http://127.0.0.1:PORT/stream.m3u8 → Rust передає mpv
+/// 6. Завершується коли Rust закриває stdin (mpv завершив відтворення)
 const MOONANIME_PLAYWRIGHT_SCRIPT: &str = r#"
-import asyncio, sys
+import asyncio, sys, re, socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
+
+_manifest = b""
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", str(len(_manifest)))
+        self.end_headers()
+        self.wfile.write(_manifest)
+    def log_message(self, *a): pass
+
+async def js_fetch(page, url):
+    return await page.evaluate("""async (url) => {
+        const r = await fetch(url, {
+            headers: {"Origin": "https://moonanime.art", "Referer": "https://moonanime.art/"}
+        });
+        return {status: r.status, text: await r.text()};
+    }""", url)
 
 async def main():
+    global _manifest
     from playwright.async_api import async_playwright
-    url = sys.argv[1]
+    iframe_url = sys.argv[1]
+
+    # Один браузерний сеанс: завантажуємо iframe, ловимо media URL через event.
+    # Підтримуємо два формати:
+    #   HLS:  s.moonanime.art/...m3u8  — завантажуємо variant manifest, роздаємо через HTTP proxy
+    #   WebM: s.moonanime.art/content/v/...  — отримуємо redirect URL (s1.mooncdn.space),
+    #         який mpv може грати напряму без proxy
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.firefox.launch(headless=True)
         ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
             extra_http_headers={
                 "Accept-Language": "uk,en-US;q=0.9,en;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;"
-                          "q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
             },
         )
         page = await ctx.new_page()
-        result = []
+        master_url = None
+        webm_url = None
         async def on_req(req):
-            if "s.moonanime" in req.url and ".m3u8" in req.url:
-                result.append(req.url)
+            nonlocal master_url, webm_url
+            if "s.moonanime" in req.url and ".m3u8" in req.url and not master_url:
+                master_url = req.url
+            elif "s.moonanime" in req.url and "/content/v/" in req.url and not webm_url:
+                webm_url = req.url
         page.on("request", on_req)
         try:
-            await page.goto(url, wait_until="networkidle", timeout=20000)
-            await asyncio.sleep(3)
+            await page.goto(iframe_url, wait_until="networkidle", timeout=20000)
+            await asyncio.sleep(2)
+            # WebM-плеєр потребує кліку для старту відтворення
+            if not master_url:
+                try:
+                    await page.click("body")
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
         except Exception:
             pass
-        if result:
-            print(result[0])
-        await browser.close()
+
+        if master_url:
+            # --- HLS шлях: завантажуємо variant manifest і роздаємо через HTTP proxy ---
+            master = await js_fetch(page, master_url)
+            if master["status"] != 200:
+                await browser.close()
+                sys.exit(1)
+
+            variants = re.findall(r'(https://s\.moonanime\.art/[^\s]+\.m3u8[^\s]*)', master["text"])
+            if not variants:
+                await browser.close()
+                sys.exit(1)
+            best = next((v for v in variants if "1080" in v),
+                   next((v for v in variants if "720" in v), variants[0]))
+
+            variant = await js_fetch(page, best)
+            if variant["status"] != 200:
+                await browser.close()
+                sys.exit(1)
+
+            _manifest = variant["text"].encode("utf-8")
+            await browser.close()
+
+            s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+            srv = HTTPServer(("127.0.0.1", port), Handler)
+            Thread(target=srv.serve_forever, daemon=True).start()
+
+            print(f"http://127.0.0.1:{port}/stream.m3u8", flush=True)
+
+            import time
+            while True:
+                time.sleep(60)
+
+        elif webm_url:
+            # --- WebM шлях: отримуємо фінальний URL через редирект, mpv грає напряму ---
+            result = await page.evaluate("""async (url) => {
+                try {
+                    const r = await fetch(url, {redirect: "follow", headers: {Range: "bytes=0-0"}});
+                    return {finalUrl: r.url, status: r.status};
+                } catch(e) {
+                    return {error: e.toString()};
+                }
+            }""", webm_url)
+            await browser.close()
+
+            final_url = result.get("finalUrl", "")
+            status = result.get("status", 0)
+            if not final_url or status not in (200, 206):
+                sys.exit(1)
+
+            # s1.mooncdn.space доступний для mpv без proxy
+            print(final_url, flush=True)
+            # Виходимо — proxy не потрібен
+
+        else:
+            await browser.close()
+            sys.exit(1)
 
 asyncio.run(main())
 "#;
 
-/// Витягує пряме m3u8-посилання з moonanime embed-сторінки.
+/// Запускає MoonAnime HLS proxy (Python + Playwright Firefox headless).
+/// Скрипт завантажує variant manifest через browser JS fetch (обходить TLS fingerprint),
+/// стартує локальний HTTP сервер з Content-Type: application/vnd.apple.mpegurl,
+/// виводить URL в stdout. Процес живе доки Rust не викличе kill().
 ///
-/// Стратегія (у порядку):
-///   1. Playwright headless Chromium — перехоплює мережевий запит до CDN.
-///      URL формується obfuscated JS на стороні клієнта; потрібен встановлений
-///      `playwright` Python-пакет (`pip install playwright && playwright install chromium`).
-///   2. yt-dlp — додатковий fallback (не підтримує moonanime, але може спрацювати
-///      якщо з'явиться офіційний екстрактор).
-///
-/// Повертає `Some(m3u8_url)` або `None` якщо обидва методи не спрацювали.
-async fn try_moonanime_stream(iframe_url: &str) -> Option<String> {
+/// Повертає `Some((http_url, child_process))` або `None` якщо не вдалось.
+async fn try_moonanime_stream(
+    iframe_url: &str,
+) -> Option<(String, tokio::process::Child)> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // --- Крок 1: Playwright headless (основний метод) ---
     let script_path = std::env::temp_dir().join("anihub_moon_extract.py");
-    if std::fs::write(&script_path, MOONANIME_PLAYWRIGHT_SCRIPT).is_ok() {
-        match tokio::process::Command::new("python3")
-            .arg(&script_path)
-            .arg(iframe_url)
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
-                let raw = String::from_utf8_lossy(&output.stdout);
-                if let Some(url) = raw.lines().find(|l| l.contains("m3u8")) {
-                    let url = url.trim().to_string();
-                    debug_log(&format!("[moonanime] playwright OK: {}", url));
-                    return Some(url);
-                }
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                debug_log(&format!("[moonanime] playwright failed: {}", stderr.lines().next().unwrap_or("unknown error")));
-            }
-            Err(e) => {
-                debug_log(&format!("[moonanime] python3 not found: {}", e));
+    std::fs::write(&script_path, MOONANIME_PLAYWRIGHT_SCRIPT).ok()?;
+
+    let mut child = tokio::process::Command::new("python3")
+        .arg(&script_path)
+        .arg(iframe_url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Читаємо першу непорожню лінію зі stdout — це HTTP URL proxy
+    let stdout = child.stdout.take()?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let read_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(40),
+        reader.read_line(&mut line),
+    )
+    .await;
+
+    match read_result {
+        Ok(Ok(_)) => {
+            let url = line.trim().to_string();
+            // Приймаємо і HLS proxy (http://127.0.0.1) і WebM direct URL (https://s1.mooncdn.space)
+            if url.starts_with("http://") || url.starts_with("https://") {
+                debug_log(&format!("[moonanime] stream OK: {}", url));
+                Some((url, child))
+            } else {
+                debug_log(&format!("[moonanime] bad output: {:?}", url));
+                let _ = child.kill().await;
+                None
             }
         }
-    }
-
-    // --- Крок 2: yt-dlp fallback (не підтримує moonanime, але залишаємо на майбутнє) ---
-    for browser in &["firefox", "chrome", "chromium"] {
-        let Ok(output) = tokio::process::Command::new("yt-dlp")
-            .args([
-                "--cookies-from-browser",
-                browser,
-                "--get-url",
-                "--no-playlist",
-                "--no-warnings",
-                "--quiet",
-                iframe_url,
-            ])
-            .output()
-            .await
-        else {
-            continue;
-        };
-
-        if output.status.success() {
-            let raw = String::from_utf8_lossy(&output.stdout);
-            if let Some(url) = raw.lines().find(|l| !l.trim().is_empty()) {
-                let url = url.trim().to_string();
-                if !url.is_empty() {
-                    debug_log(&format!("[moonanime] yt-dlp OK: {}", url));
-                    return Some(url);
-                }
-            }
+        Ok(Err(e)) => {
+            debug_log(&format!("[moonanime] read error: {}", e));
+            let _ = child.kill().await;
+            None
+        }
+        Err(_) => {
+            debug_log("[moonanime] proxy timeout (>40s)");
+            let _ = child.kill().await;
+            None
         }
     }
-
-    None
 }
 
 /// Повертає id першого (найстаршого за роком) TV-члена поточної франшизи.

@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::{Client, header};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const API_BASE_URL: &str = "https://api.anihub.in.ua";
@@ -199,40 +200,65 @@ impl ApiClient {
         let mut all_studios: Vec<super::models::AshdiStudio> = Vec::new();
         let mut consecutive_empty: u32 = 0;
 
+        // Відстежуємо перший moon iframe URL кожного сезону (без trailing slash).
+        // Використовується для виявлення standalone-vs-franchise дублікатів:
+        // якщо S1 і S-N мають однакові moon URL → той самий контент; S1 = "власна сторінка",
+        // S-N = правильна позиція у франшизі. Треба перейменувати S1 → S-N.
+        let mut season_first_moon_url: HashMap<u32, String> = HashMap::new();
+
         for season in 1u32..=8 {
             match self.get_episode_sources(anime_id, season).await {
-                Ok(sources) if !sources.ashdi.is_empty() => {
-                    all_studios.extend(sources.ashdi);
-                    consecutive_empty = 0;
-                }
-                Ok(sources) if !sources.moonanime.is_empty() => {
-                    // Fallback: конвертуємо moonanime у AshdiStudio-формат
-                    for moon in sources.moonanime {
-                        let episodes = moon
-                            .episodes
-                            .into_iter()
-                            .map(|ep| {
-                                super::models::AshdiEpisode {
+                Ok(sources) => {
+                    // Завжди зберігаємо перший moon URL, навіть якщо використовуємо ashdi.
+                    if let Some(first_moon_ep) = sources
+                        .moonanime
+                        .iter()
+                        .filter_map(|m| m.episodes.first())
+                        .next()
+                    {
+                        let normalized = first_moon_ep
+                            .iframe_url
+                            .trim_end_matches('/')
+                            .to_string();
+                        if !normalized.is_empty() {
+                            season_first_moon_url.insert(season, normalized);
+                        }
+                    }
+
+                    if !sources.ashdi.is_empty() {
+                        all_studios.extend(sources.ashdi);
+                        consecutive_empty = 0;
+                    } else if !sources.moonanime.is_empty() {
+                        // Fallback: конвертуємо moonanime у AshdiStudio-формат
+                        for moon in sources.moonanime {
+                            let episodes = moon
+                                .episodes
+                                .into_iter()
+                                .map(|ep| super::models::AshdiEpisode {
                                     episode_number: ep.episode_number,
                                     display_episode_number: ep.display_episode_number,
                                     title: ep.title,
-                                    // iframe_url зберігаємо в полі url; розпізнаємо при відтворенні
                                     url: ep.iframe_url,
                                     ashdi_episode_id: String::new(),
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        all_studios.push(super::models::AshdiStudio {
-                            id: moon.id,
-                            studio_name: moon.studio_name,
-                            season_number: moon.season_number,
-                            episodes,
-                            episodes_count: moon.episodes_count,
-                        });
+                                })
+                                .collect::<Vec<_>>();
+                            all_studios.push(super::models::AshdiStudio {
+                                id: moon.id,
+                                studio_name: moon.studio_name,
+                                season_number: moon.season_number,
+                                episodes,
+                                episodes_count: moon.episodes_count,
+                            });
+                        }
+                        consecutive_empty = 0;
+                    } else {
+                        consecutive_empty += 1;
+                        if consecutive_empty >= 3 {
+                            break;
+                        }
                     }
-                    consecutive_empty = 0;
                 }
-                _ => {
+                Err(_) => {
                     consecutive_empty += 1;
                     if consecutive_empty >= 3 {
                         break;
@@ -243,6 +269,42 @@ impl ApiClient {
 
         if all_studios.is_empty() {
             anyhow::bail!("No episode sources found for anime {}", anime_id);
+        }
+
+        // Виявляємо standalone-vs-franchise дублікати:
+        // якщо moon URL сезону 1 збігається з moon URL сезону N (N>1), то S1 — це "власна сторінка"
+        // того ж контенту що й S-N. Перейменовуємо S1-студії у правильний сезон S-N.
+        if let Some(s1_url) = season_first_moon_url.get(&1).cloned() {
+            let franchise_season = season_first_moon_url
+                .iter()
+                .filter(|(s, _)| **s > 1)
+                .filter(|(_, url)| url.as_str() == s1_url.as_str())
+                .map(|(s, _)| *s)
+                .max();
+
+            if let Some(fs) = franchise_season {
+                for s in all_studios.iter_mut() {
+                    if s.season_number == 1 {
+                        s.season_number = fs;
+                    }
+                }
+                // Після перейменування можуть бути дублікати (season_number, studio_name).
+                // Зберігаємо запис з більшою кількістю епізодів.
+                let mut deduped: Vec<super::models::AshdiStudio> = Vec::new();
+                for studio in all_studios {
+                    if let Some(pos) = deduped.iter().position(|s| {
+                        s.season_number == studio.season_number
+                            && s.studio_name == studio.studio_name
+                    }) {
+                        if studio.episodes.len() > deduped[pos].episodes.len() {
+                            deduped[pos] = studio;
+                        }
+                    } else {
+                        deduped.push(studio);
+                    }
+                }
+                all_studios = deduped;
+            }
         }
 
         all_studios.sort_by(|a, b| a.season_number.cmp(&b.season_number));
