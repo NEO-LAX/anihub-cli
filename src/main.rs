@@ -1824,26 +1824,84 @@ async fn find_anihub_id(
         .flatten()
 }
 
+/// Python-скрипт для Playwright: відкриває iframe сторінку headless Chromium,
+/// перехоплює перший мережевий запит до `s.moonanime.art/*.m3u8` і виводить URL у stdout.
+/// m3u8 URL формується обфускованим JS на стороні клієнта — статичний парсинг HTML не працює.
+const MOONANIME_PLAYWRIGHT_SCRIPT: &str = r#"
+import asyncio, sys
+
+async def main():
+    from playwright.async_api import async_playwright
+    url = sys.argv[1]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            extra_http_headers={
+                "Accept-Language": "uk,en-US;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;"
+                          "q=0.9,image/avif,image/webp,*/*;q=0.8",
+            },
+        )
+        page = await ctx.new_page()
+        result = []
+        async def on_req(req):
+            if "s.moonanime" in req.url and ".m3u8" in req.url:
+                result.append(req.url)
+        page.on("request", on_req)
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=20000)
+            await asyncio.sleep(3)
+        except Exception:
+            pass
+        if result:
+            print(result[0])
+        await browser.close()
+
+asyncio.run(main())
+"#;
+
 /// Витягує пряме m3u8-посилання з moonanime embed-сторінки.
 ///
 /// Стратегія (у порядку):
-///   1. `MoonAnimeParser` — HTTP fetch embed page + regex. Підписані URL (sig=...)
-///      самодостатні для авторизації, тому mpv може грати без cookies.
-///   2. `yt-dlp --cookies-from-browser` — fallback якщо сторінка вимагає аутентифікацію
-///      або regex не знайшов URL (потрібен встановлений yt-dlp).
+///   1. Playwright headless Chromium — перехоплює мережевий запит до CDN.
+///      URL формується obfuscated JS на стороні клієнта; потрібен встановлений
+///      `playwright` Python-пакет (`pip install playwright && playwright install chromium`).
+///   2. yt-dlp — додатковий fallback (не підтримує moonanime, але може спрацювати
+///      якщо з'явиться офіційний екстрактор).
 ///
 /// Повертає `Some(m3u8_url)` або `None` якщо обидва методи не спрацювали.
 async fn try_moonanime_stream(iframe_url: &str) -> Option<String> {
-    // --- Крок 1: власний парсер (найшвидший, без зовнішніх залежностей) ---
-    if let Ok(parser) = api::MoonAnimeParser::new() {
-        if let Ok(url) = parser.extract_m3u8(iframe_url).await {
-            return Some(url);
+
+    // --- Крок 1: Playwright headless (основний метод) ---
+    let script_path = std::env::temp_dir().join("anihub_moon_extract.py");
+    if std::fs::write(&script_path, MOONANIME_PLAYWRIGHT_SCRIPT).is_ok() {
+        match tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .arg(iframe_url)
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                let raw = String::from_utf8_lossy(&output.stdout);
+                if let Some(url) = raw.lines().find(|l| l.contains("m3u8")) {
+                    let url = url.trim().to_string();
+                    debug_log(&format!("[moonanime] playwright OK: {}", url));
+                    return Some(url);
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                debug_log(&format!("[moonanime] playwright failed: {}", stderr.lines().next().unwrap_or("unknown error")));
+            }
+            Err(e) => {
+                debug_log(&format!("[moonanime] python3 not found: {}", e));
+            }
         }
     }
 
-    // --- Крок 2: yt-dlp з кукі браузера (fallback) ---
-    // Використовуємо лише якщо парсер не знайшов URL (напр. сторінка за авторизацією
-    // або структура змінилась). yt-dlp перебирає браузери у порядку.
+    // --- Крок 2: yt-dlp fallback (не підтримує moonanime, але залишаємо на майбутнє) ---
     for browser in &["firefox", "chrome", "chromium"] {
         let Ok(output) = tokio::process::Command::new("yt-dlp")
             .args([
@@ -1866,6 +1924,7 @@ async fn try_moonanime_stream(iframe_url: &str) -> Option<String> {
             if let Some(url) = raw.lines().find(|l| !l.trim().is_empty()) {
                 let url = url.trim().to_string();
                 if !url.is_empty() {
+                    debug_log(&format!("[moonanime] yt-dlp OK: {}", url));
                     return Some(url);
                 }
             }
