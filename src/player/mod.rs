@@ -12,6 +12,16 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 
+#[derive(Clone, Debug)]
+pub enum MpvEvent {
+    Progress(f64, f64),
+    PlaylistPos(usize),
+    FileStarted,
+    FileLoaded,
+    EndFile,
+}
+
+#[derive(Clone)]
 pub struct MpvPlayer {
     socket_path: PathBuf,
 }
@@ -56,7 +66,7 @@ impl MpvPlayer {
         start_time: Option<f64>,
         anime_title: &str,
         episode_title: &str,
-    ) -> Result<(Child, tokio::sync::watch::Receiver<(f64, f64)>, JoinHandle<()>)> {
+    ) -> Result<(Child, tokio::sync::mpsc::UnboundedReceiver<MpvEvent>, JoinHandle<()>)> {
         #[cfg(unix)]
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
@@ -87,7 +97,7 @@ impl MpvPlayer {
             .spawn()
             .context("Failed to start mpv. Please make sure mpv is installed.")?;
 
-        let (tx, rx) = tokio::sync::watch::channel((0.0, 0.0));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let socket_path_clone = self.socket_path.clone();
         let monitor = tokio::spawn(async move { monitor_ipc(socket_path_clone, tx).await });
 
@@ -102,7 +112,7 @@ impl MpvPlayer {
     }
 }
 
-async fn monitor_ipc(socket_path: PathBuf, tx: tokio::sync::watch::Sender<(f64, f64)>) {
+async fn monitor_ipc(socket_path: PathBuf, tx: tokio::sync::mpsc::UnboundedSender<MpvEvent>) {
     let mut last_known_time = 0.0f64;
     let mut last_known_duration = 0.0f64;
 
@@ -136,6 +146,7 @@ async fn monitor_ipc(socket_path: PathBuf, tx: tokio::sync::watch::Sender<(f64, 
     for request in [
         "{\"command\": [\"observe_property\", 1, \"time-pos\"]}\n",
         "{\"command\": [\"observe_property\", 2, \"duration\"]}\n",
+        "{\"command\": [\"observe_property\", 3, \"playlist-pos\"]}\n",
     ] {
         if stream.write_all(request.as_bytes()).await.is_err() {
             return;
@@ -154,18 +165,29 @@ async fn monitor_ipc(socket_path: PathBuf, tx: tokio::sync::watch::Sender<(f64, 
                     let line = accumulated[..pos].to_string();
                     accumulated = accumulated[pos + 1..].to_string();
                     if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
-                        if parsed["event"] == "property-change" && parsed["name"] == "time-pos" {
-                            if let Some(t) = parsed["data"].as_f64() {
-                                last_known_time = t;
-                                let _ = tx.send((last_known_time, last_known_duration));
+                        if parsed["event"] == "property-change" {
+                            let name = parsed["name"].as_str().unwrap_or("");
+                            if name == "time-pos" {
+                                if let Some(t) = parsed["data"].as_f64() {
+                                    last_known_time = t;
+                                    let _ = tx.send(MpvEvent::Progress(last_known_time, last_known_duration));
+                                }
+                            } else if name == "duration" {
+                                if let Some(d) = parsed["data"].as_f64() {
+                                    last_known_duration = d;
+                                    let _ = tx.send(MpvEvent::Progress(last_known_time, last_known_duration));
+                                }
+                            } else if name == "playlist-pos" {
+                                if let Some(p) = parsed["data"].as_u64() {
+                                    let _ = tx.send(MpvEvent::PlaylistPos(p as usize));
+                                }
                             }
-                        } else if parsed["event"] == "property-change"
-                            && parsed["name"] == "duration"
-                        {
-                            if let Some(d) = parsed["data"].as_f64() {
-                                last_known_duration = d;
-                                let _ = tx.send((last_known_time, last_known_duration));
-                            }
+                        } else if parsed["event"] == "start-file" {
+                            let _ = tx.send(MpvEvent::FileStarted);
+                        } else if parsed["event"] == "file-loaded" {
+                            let _ = tx.send(MpvEvent::FileLoaded);
+                        } else if parsed["event"] == "end-file" {
+                            let _ = tx.send(MpvEvent::EndFile);
                         }
                     }
                 }

@@ -111,9 +111,12 @@ pub struct AppState {
     pub is_playing: bool,
     pub mpv_player: crate::player::MpvPlayer,
     pub mpv_child: Option<Child>,
-    pub mpv_rx: Option<tokio::sync::watch::Receiver<(f64, f64)>>,
+    pub mpv_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::player::MpvEvent>>,
     pub mpv_monitor: Option<JoinHandle<()>>,
     pub pending_progress: Option<(u32, String, u32, u32, String)>,
+    pub mpv_playlist: Vec<(u32, String, u32, u32, String)>,
+    pub mpv_last_time: f64,
+    pub mpv_last_duration: f64,
 
     // Кеші та prefetch
     pub search_cache: HashMap<String, Vec<AnimeItem>>,
@@ -188,6 +191,9 @@ impl AppState {
             mpv_rx: None,
             mpv_monitor: None,
             pending_progress: None,
+            mpv_playlist: Vec::new(),
+            mpv_last_time: 0.0,
+            mpv_last_duration: 0.0,
 
             search_cache: HashMap::new(),
             details_cache: HashMap::new(),

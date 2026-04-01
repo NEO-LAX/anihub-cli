@@ -106,6 +106,96 @@ async fn main() -> Result<()> {
             continue_playback(&mut app, request).await;
         }
 
+        let mut mpv_events = Vec::new();
+        if let Some(rx) = &mut app.mpv_rx {
+            while let Ok(event) = rx.try_recv() {
+                mpv_events.push(event);
+            }
+        }
+
+        for event in mpv_events {
+            match event {
+                    crate::player::MpvEvent::Progress(t, d) => {
+                        app.mpv_last_time = t;
+                        app.mpv_last_duration = d;
+                    }
+                    crate::player::MpvEvent::PlaylistPos(pos) => {
+                        if pos < app.mpv_playlist.len() {
+                            // Зберігаємо прогрес для попередньої серії
+                            if let Some((anime_id, title, season, episode, studio_name)) = &app.pending_progress {
+                                let _ = app.storage.update_progress(
+                                    *anime_id,
+                                    title,
+                                    *season,
+                                    *episode,
+                                    studio_name,
+                                    app.mpv_last_time,
+                                    app.mpv_last_duration,
+                                );
+                                app.history = app.storage.load_history().unwrap_or_default();
+                            }
+
+                            // Оновлюємо pending_progress на нову серію
+                            app.pending_progress = Some(app.mpv_playlist[pos].clone());
+                            app.mpv_last_time = 0.0;
+                            app.mpv_last_duration = 0.0;
+
+                            if let Some(pending) = &app.pending_progress {
+                                let title = format!("{} - Серія {}", pending.1, pending.3);
+                                let player = app.mpv_player.clone();
+                                tokio::spawn(async move {
+                                    let _ = player.send_command(serde_json::json!(["set_property", "force-media-title", title])).await;
+                                });
+
+                                // Якщо це остання серія в списку відтворення, спробуємо знайти наступну
+                                if pos == app.mpv_playlist.len() - 1 {
+                                    if let Some(next_target) = get_next_episode(&app, pending) {
+                                        app.mpv_playlist.push((
+                                            next_target.anime_id,
+                                            next_target.anime_title.clone(),
+                                            next_target.season,
+                                            next_target.episode,
+                                            next_target.studio_name.clone(),
+                                        ));
+                                        let player2 = app.mpv_player.clone();
+                                        tokio::spawn(async move {
+                                            let m3u8 = if next_target.stream_page_url.starts_with("https://moonanime.art") {
+                                                try_moonanime_stream(&next_target.stream_page_url).await
+                                            } else {
+                                                if let Ok(parser) = api::AshdiParser::new() {
+                                                    parser.extract_m3u8(&next_target.stream_page_url).await.ok()
+                                                } else {
+                                                    None
+                                                }
+                                            };
+                                            if let Some(url) = m3u8 {
+                                                let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    crate::player::MpvEvent::FileStarted => {}
+                    crate::player::MpvEvent::FileLoaded => {
+                        if let Some((anime_id, _title, season, episode, studio_name)) = &app.pending_progress {
+                            let key = crate::storage::StorageManager::make_progress_key(*anime_id, *season, *episode, studio_name);
+                            if let Some(saved) = app.history.progress.get(&key) {
+                                if saved.timestamp > 0.0 && saved.timestamp < saved.duration.max(1200.0) && !saved.watched {
+                                    let player = app.mpv_player.clone();
+                                    let time_to_resume = saved.timestamp;
+                                    tokio::spawn(async move {
+                                        let _ = player.send_command(serde_json::json!(["set_property", "time-pos", time_to_resume])).await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    crate::player::MpvEvent::EndFile => {}
+                }
+        }
+
         if app.is_playing {
             check_playback_finished(&mut app).await;
         }
@@ -348,18 +438,15 @@ async fn continue_playback(app: &mut AppState, request: ContinueRequest) {
 async fn play_target(app: &mut AppState, target: PlayTarget) {
     // Якщо щось уже грає — зберігаємо прогрес поточної серії
     if app.is_playing {
-        if let (Some(rx), Some((anime_id, title, season, episode, studio_name))) =
-            (&app.mpv_rx, &app.pending_progress)
-        {
-            let (stopped_time, duration) = *rx.borrow();
+        if let Some((anime_id, title, season, episode, studio_name)) = &app.pending_progress {
             let _ = app.storage.update_progress(
                 *anime_id,
                 title,
                 *season,
                 *episode,
                 studio_name,
-                stopped_time,
-                duration,
+                app.mpv_last_time,
+                app.mpv_last_duration,
             );
             app.history = app.storage.load_history().unwrap_or_default();
         }
@@ -418,11 +505,46 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
         if res.is_ok() {
             app.pending_progress = Some((
                 target.anime_id,
-                target.anime_title,
+                target.anime_title.clone(),
                 target.season,
                 target.episode,
-                target.studio_name,
+                target.studio_name.clone(),
             ));
+            app.mpv_playlist.clear();
+            app.mpv_playlist.push((
+                target.anime_id,
+                target.anime_title.clone(),
+                target.season,
+                target.episode,
+                target.studio_name.clone(),
+            ));
+            app.mpv_last_time = 0.0;
+            app.mpv_last_duration = 0.0;
+            
+            if let Some(next_target) = get_next_episode(&app, app.pending_progress.as_ref().unwrap()) {
+                app.mpv_playlist.push((
+                    next_target.anime_id,
+                    next_target.anime_title.clone(),
+                    next_target.season,
+                    next_target.episode,
+                    next_target.studio_name.clone(),
+                ));
+                let player2 = app.mpv_player.clone();
+                tokio::spawn(async move {
+                    let m3u8 = if next_target.stream_page_url.starts_with("https://moonanime.art") {
+                        try_moonanime_stream(&next_target.stream_page_url).await
+                    } else {
+                        if let Ok(parser) = api::AshdiParser::new() {
+                            parser.extract_m3u8(&next_target.stream_page_url).await.ok()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(url) = m3u8 {
+                        let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
+                    }
+                });
+            }
             return;
         }
         // Якщо IPC не спрацював (наприклад, mpv "завис") — йдемо далі до перезапуску
@@ -445,12 +567,47 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
             app.mpv_monitor = Some(monitor);
             app.pending_progress = Some((
                 target.anime_id,
-                target.anime_title,
+                target.anime_title.clone(),
                 target.season,
                 target.episode,
-                target.studio_name,
+                target.studio_name.clone(),
             ));
             app.is_playing = true;
+            app.mpv_playlist.clear();
+            app.mpv_playlist.push((
+                target.anime_id,
+                target.anime_title.clone(),
+                target.season,
+                target.episode,
+                target.studio_name.clone(),
+            ));
+            app.mpv_last_time = 0.0;
+            app.mpv_last_duration = 0.0;
+            
+            if let Some(next_target) = get_next_episode(&app, app.pending_progress.as_ref().unwrap()) {
+                app.mpv_playlist.push((
+                    next_target.anime_id,
+                    next_target.anime_title.clone(),
+                    next_target.season,
+                    next_target.episode,
+                    next_target.studio_name.clone(),
+                ));
+                let player2 = app.mpv_player.clone();
+                tokio::spawn(async move {
+                    let m3u8 = if next_target.stream_page_url.starts_with("https://moonanime.art") {
+                        try_moonanime_stream(&next_target.stream_page_url).await
+                    } else {
+                        if let Ok(parser) = api::AshdiParser::new() {
+                            parser.extract_m3u8(&next_target.stream_page_url).await.ok()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(url) = m3u8 {
+                        let _ = player2.send_command(serde_json::json!(["loadfile", url, "append"])).await;
+                    }
+                });
+            }
         }
         Err(e) => {
             app.set_error_status(format!("Помилка відтворення: {}", e));
@@ -666,11 +823,9 @@ async fn check_playback_finished(app: &mut AppState) {
 
     if finished {
         app.mpv_child = None;
-        let (stopped_time, duration) = if let Some(rx) = app.mpv_rx.take() {
-            *rx.borrow()
-        } else {
-            (0.0, 0.0)
-        };
+        let stopped_time = app.mpv_last_time;
+        let duration = app.mpv_last_duration;
+        app.mpv_rx = None;
         let _ = app.mpv_monitor.take(); // Abort/Clean up the monitor task
 
         if let Some((anime_id, title, season, episode, studio_name)) = app.pending_progress.take() {
@@ -1635,4 +1790,70 @@ fn get_first_tv_id(app: &ui::AppState) -> Option<u32> {
         .collect();
     tv.sort_by_key(|&(_, y)| y);
     tv.first().map(|(id, _)| *id)
+}
+
+fn get_next_episode(app: &AppState, current: &(u32, String, u32, u32, String)) -> Option<PlayTarget> {
+    let (current_anime_id, current_title, current_season, current_episode, current_studio) = current;
+    
+    let sources = app.sources_cache.get(current_anime_id).or_else(|| app.current_sources.as_ref())?;
+    
+    // Check if the current studio data is present
+    let mut seasons: Vec<u32> = sources.ashdi.iter().map(|s| s.season_number).collect();
+    seasons.sort();
+    seasons.dedup();
+    
+    let season_index = seasons.iter().position(|&s| s == *current_season)?;
+    
+    // Find the studio index for current
+    let (studio_idx, studio_data) = sources.ashdi.iter().enumerate()
+        .filter(|(_, s)| s.season_number == *current_season)
+        .find(|(_, s)| s.studio_name == *current_studio)?;
+        
+    let ep_index = studio_data.episodes.iter().position(|e| e.episode_number == *current_episode)?;
+    
+    if let Some(next_ep) = studio_data.episodes.get(ep_index + 1) {
+        let anime_id = app.studio_anime_ids.get(studio_idx).copied().unwrap_or(*current_anime_id);
+        let title = app.details_cache.get(&anime_id).map(|d| d.title_ukrainian.clone())
+            .unwrap_or_else(|| current_title.clone());
+        let player_title = app.details_cache.get(&anime_id)
+            .map(|d| format!("{} ({})", d.title_ukrainian, d.year.unwrap_or(0)))
+            .unwrap_or_else(|| title.clone());
+            
+        return Some(PlayTarget {
+            anime_id,
+            anime_title: title,
+            player_title,
+            season: *current_season,
+            episode: next_ep.episode_number,
+            episode_title: format!("Серія {}", next_ep.episode_number),
+            stream_page_url: next_ep.url.clone(),
+            start_time: None,
+            studio_name: current_studio.clone(),
+        });
+    }
+    
+    // Next season
+    let next_season = seasons.get(season_index + 1).copied()?;
+    let (next_studio_idx, next_studio_data) = sources.ashdi.iter().enumerate()
+        .find(|(_, s)| s.season_number == next_season)?;
+    let next_ep = next_studio_data.episodes.first()?;
+    
+    let anime_id = app.studio_anime_ids.get(next_studio_idx).copied().unwrap_or(*current_anime_id);
+    let title = app.details_cache.get(&anime_id).map(|d| d.title_ukrainian.clone())
+        .unwrap_or_else(|| current_title.clone());
+    let player_title = app.details_cache.get(&anime_id)
+        .map(|d| format!("{} ({})", d.title_ukrainian, d.year.unwrap_or(0)))
+        .unwrap_or_else(|| title.clone());
+        
+    Some(PlayTarget {
+        anime_id,
+        anime_title: title,
+        player_title,
+        season: next_season,
+        episode: next_ep.episode_number,
+        episode_title: format!("Серія {}", next_ep.episode_number),
+        stream_page_url: next_ep.url.clone(),
+        start_time: None,
+        studio_name: next_studio_data.studio_name.clone(),
+    })
 }
