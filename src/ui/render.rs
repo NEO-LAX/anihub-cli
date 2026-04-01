@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
@@ -47,6 +47,8 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
     } else if let Some((_, anime_title)) = app.pending_delete_confirmation.clone() {
         let msg = format!("Видалити прогрес для\n{}\n\n[y/n]", anime_title);
         render_popup(f, "Підтвердження", &msg, COLOR_ERROR);
+    } else if app.show_help {
+        render_help_popup(f);
     }
 }
 
@@ -409,27 +411,16 @@ fn render_sidebar_details_area(
 }
 
 fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
-    let state_area = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(36)])
-        .split(area)[1];
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
 
-    let shortcuts = if app.is_library_mode() {
-        match app.mode {
-            AppMode::Library => "c продовжити  d видалити  ↑↓ список  →/Enter сезони",
-            AppMode::LibrarySeason => "x toggle сезон  ↑↓ сезон  →/Enter озвучки  Esc/← назад",
-            AppMode::LibraryDubbing => "x toggle сезон  ↑↓ озвучка  →/Enter серії  Esc/← назад",
-            AppMode::LibraryEpisode => "x toggle серію  ↑↓ серія  Esc/← назад  q вихід",
-            _ => "",
-        }
-    } else {
-        match app.focus {
-            FocusPanel::SearchList => "/ пошук  l бібліотека  ↑↓ список  →/Enter вибір  q вихід",
-            FocusPanel::SeasonList => "↑↓ сезон  →/Enter озвучки  ←/Esc назад  q вихід",
-            FocusPanel::DubbingList => "↑↓ озвучка  →/Enter серії  ←/Esc назад  q вихід",
-            FocusPanel::EpisodeList => "↑↓ список  Enter відтворити  ←/Esc назад  q вихід",
-        }
-    };
+    let shortcuts = " h/? Довідка   q Вихід   Esc Назад ";
 
     let state = app
         .status_message
@@ -453,14 +444,21 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
     f.render_widget(
         Paragraph::new(shortcuts)
             .style(Style::default().fg(COLOR_DIM).bg(COLOR_BG_DARK))
-            .alignment(Alignment::Center),
-        area,
+            .alignment(Alignment::Left),
+        chunks[0],
     );
+
     f.render_widget(
         Paragraph::new(state)
-            .style(Style::default().fg(COLOR_SECONDARY).bg(COLOR_BG_DARK))
-            .alignment(Alignment::Right),
-        state_area,
+            .style(Style::default().fg(COLOR_SECONDARY).bg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Center),
+        chunks[1],
+    );
+
+    f.render_widget(
+        Paragraph::new("") // Right side could be used later for version or online status
+            .style(Style::default().bg(COLOR_BG_DARK)),
+        chunks[2],
     );
 }
 
@@ -509,12 +507,14 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     None => name.to_string(),
                 }
             };
-            let marker = if franchise_is_complete(app, group) {
-                "✓"
-            } else {
-                ""
-            };
-            let mut lines = vec![Line::from(with_right_marker(&title, marker, list_width))];
+            let mut marker = String::new();
+            if app.history.bookmarks.contains(&rep.id) {
+                marker.push('★');
+            }
+            if franchise_is_complete(app, group) {
+                marker.push('✓');
+            }
+            let mut lines = vec![Line::from(with_right_marker(&title, &marker, list_width))];
             if let Some(progress) = latest_progress_for_group(app, group) {
                 lines.push(Line::from(Span::styled(
                     format!(
@@ -771,14 +771,16 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         .library_items
         .iter()
         .map(|item| {
-            let marker = if library_anime_is_complete(item) {
-                "✓"
-            } else {
-                ""
-            };
+            let mut marker = String::new();
+            if app.history.bookmarks.contains(&item.latest_progress.anime_id) {
+                marker.push('★');
+            }
+            if library_anime_is_complete(item) {
+                marker.push('✓');
+            }
             let line_1 = with_right_marker(
                 &item.anime_title,
-                marker,
+                &marker,
                 chunks[0].width.saturating_sub(6) as usize,
             );
             let line_2 = format!(
@@ -1272,6 +1274,67 @@ fn render_popup(f: &mut Frame, title: &str, msg: &str, color: Color) {
         .alignment(Alignment::Center)
         .wrap(ratatui::widgets::Wrap { trim: true });
     f.render_widget(text, area);
+}
+
+fn render_help_popup(f: &mut Frame) {
+    let title = " Довідка (Гарячі клавіші) ";
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+        ))
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_PRIMARY))
+        .bg(COLOR_BG_DARK);
+    
+    let area = centered_rect(65, 55, f.area());
+    f.render_widget(Clear, area);
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .margin(1)
+        .split(inner_area);
+
+    let left_col = vec![
+        Line::from(vec![Span::styled(" Глобальні ", Style::default().bg(COLOR_SECONDARY).fg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))]),
+        Line::from("  /      — Пошук"),
+        Line::from("  l      — Бібліотека"),
+        Line::from("  ? / h  — Довідка"),
+        Line::from("  q      — Вийти"),
+        Line::from(""),
+        Line::from(vec![Span::styled(" Навігація ", Style::default().bg(COLOR_SECONDARY).fg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))]),
+        Line::from("  ↑ / ↓  — Список"),
+        Line::from("  → / ↵  — Вперед"),
+        Line::from("  ← / Esc— Назад"),
+    ];
+
+    let right_col = vec![
+        Line::from(vec![Span::styled(" Дії з аніме ", Style::default().bg(COLOR_SECONDARY).fg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))]),
+        Line::from("  Enter  — Play (MPV)"),
+        Line::from("  c      — Resume (Last)"),
+        Line::from("  x      — Watched Toggle"),
+        Line::from("  b      — Bookmark ★"),
+        Line::from("  d      — Delete Progress"),
+        Line::from("  o      — Open in Browser"),
+    ];
+
+    f.render_widget(Paragraph::new(left_col), chunks[0]);
+    f.render_widget(Paragraph::new(right_col), chunks[1]);
+
+    // Footer hint centered at the bottom of the popup
+    let footer_area = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
+    f.render_widget(
+        Paragraph::new(Span::styled(" Натисніть будь-яку клавішу щоб закрити ", Style::default().fg(COLOR_DIM)))
+            .alignment(Alignment::Center),
+        footer_area,
+    );
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

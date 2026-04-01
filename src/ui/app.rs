@@ -106,6 +106,7 @@ pub struct AppState {
     pub continue_request: Option<ContinueRequest>,
     pub status_message: Option<(String, StatusKind)>,
     pub status_expires_at: Option<Instant>,
+    pub show_help: bool,
 
     // Стан відтворення
     pub is_playing: bool,
@@ -184,6 +185,7 @@ impl AppState {
             continue_request: None,
             status_message: None,
             status_expires_at: None,
+            show_help: false,
 
             is_playing: false,
             mpv_player: crate::player::MpvPlayer::new()?,
@@ -308,15 +310,30 @@ impl AppState {
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    if self.show_help {
+                        self.show_help = false;
+                        return Ok(());
+                    }
+
                     if self.handle_pending_delete_confirmation(key.code) {
                         return Ok(());
                     }
                     self.clear_info_status();
+
+                    if self.mode != AppMode::SearchInput {
+                        if key.code == KeyCode::Char('?') || key.code == KeyCode::Char('h') {
+                            self.show_help = true;
+                            return Ok(());
+                        }
+                    }
+
                     match self.mode {
                         AppMode::Normal => match key.code {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char('c') => self.request_continue(),
                             KeyCode::Char('x') => self.toggle_search_selection_watched(),
+                            KeyCode::Char('b') => self.toggle_bookmark(),
+                            KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('l') => self.open_library(),
                             KeyCode::Esc => self.handle_esc(),
                             KeyCode::Char('/') => {
@@ -350,6 +367,8 @@ impl AppState {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char('c') => self.request_continue(),
                             KeyCode::Char('d') => self.delete_library_selection(),
+                            KeyCode::Char('b') => self.toggle_bookmark(),
+                            KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
                             KeyCode::Left => {}
                             KeyCode::Esc => self.reset_to_home(),
@@ -361,6 +380,8 @@ impl AppState {
                         AppMode::LibrarySeason => match key.code {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char('x') => self.toggle_library_selection_watched(),
+                            KeyCode::Char('b') => self.toggle_bookmark(),
+                            KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
                             KeyCode::Left => self.leave_library_level(),
                             KeyCode::Esc => self.leave_library_level(),
@@ -372,6 +393,8 @@ impl AppState {
                         AppMode::LibraryDubbing => match key.code {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char('x') => self.toggle_library_selection_watched(),
+                            KeyCode::Char('b') => self.toggle_bookmark(),
+                            KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
                             KeyCode::Left => self.leave_library_level(),
                             KeyCode::Esc => self.leave_library_level(),
@@ -383,6 +406,8 @@ impl AppState {
                         AppMode::LibraryEpisode => match key.code {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char('x') => self.toggle_library_selection_watched(),
+                            KeyCode::Char('b') => self.toggle_bookmark(),
+                            KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
                             KeyCode::Left => self.leave_library_level(),
                             KeyCode::Esc => self.leave_library_level(),
@@ -396,6 +421,74 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    fn get_current_anime_context(&self) -> Option<(u32, String, String)> {
+        if self.is_library_mode() {
+            let anime = self.library_selected_anime()?;
+            let anime_id = match self.mode {
+                AppMode::LibrarySeason | AppMode::LibraryDubbing | AppMode::LibraryEpisode => {
+                    self.selected_season_num()
+                        .and_then(|sn| {
+                            self.studios_for_season(sn)
+                                .iter()
+                                .find_map(|studio| {
+                                    if anime.anime_ids.contains(&studio.id) { // Not quite right, but we need the seasonal ID
+                                         Some(studio.id)
+                                    } else { None }
+                                })
+                        })
+                        .unwrap_or(anime.latest_progress.anime_id)
+                }
+                _ => anime.latest_progress.anime_id
+            };
+            
+            let slug = self.details_cache.get(&anime_id)
+                .map(|d| d.slug.clone())
+                .unwrap_or_default();
+            Some((anime_id, anime.anime_title.clone(), slug))
+        } else {
+            // Priority 1: Specifically selected seasonal ID if focused on details
+            let anime_id = match self.focus {
+                FocusPanel::SeasonList | FocusPanel::DubbingList | FocusPanel::EpisodeList => {
+                    self.search_selected_season_anime_id()
+                }
+                _ => None
+            };
+
+            if let Some(id) = anime_id {
+                if let Some(item) = self.search_results.iter().find(|i| i.id == id) {
+                    return Some((id, item.title_ukrainian.clone(), item.slug.clone()));
+                }
+            }
+
+            // Priority 2: Sidebar/Selected result index
+            let idx = self.sidebar_anime_idx.or(self.selected_result_index)?;
+            let item = self.search_results.get(idx)?;
+            Some((item.id, item.title_ukrainian.clone(), item.slug.clone()))
+        }
+    }
+
+    pub fn toggle_bookmark(&mut self) {
+        if let Some((anime_id, title, _)) = self.get_current_anime_context() {
+            match self.storage.toggle_bookmark(anime_id) {
+                Ok(true) => self.set_info_status(format!("Додано до закладок: {}", title)),
+                Ok(false) => self.set_info_status(format!("Видалено із закладок: {}", title)),
+                Err(e) => self.set_error_status(format!("Помилка закладок: {}", e)),
+            }
+            self.history = self.storage.load_history().unwrap_or_default();
+        }
+    }
+
+    pub fn open_in_browser(&mut self) {
+        if let Some((id, title, _)) = self.get_current_anime_context() {
+            let url = format!("https://anihub.in.ua/anime/{}", id);
+            if std::process::Command::new("xdg-open").arg(&url).spawn().is_ok() {
+                self.set_info_status(format!("Відкрито в браузері: {}", title));
+            } else {
+                self.set_error_status("Не вдалося відкрити браузер");
+            }
+        }
     }
 
     fn handle_esc(&mut self) {
