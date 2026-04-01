@@ -38,6 +38,8 @@ struct PlayTarget {
     stream_page_url: String,
     start_time: Option<f64>,
     studio_name: String,
+    /// HTTP Referer для mpv — "https://ashdi.vip/" або "https://moonanime.art/"
+    referrer: String,
 }
 
 #[tokio::main]
@@ -332,6 +334,7 @@ async fn start_episode_playback(app: &mut AppState) {
         .unwrap_or_else(|| progress_title.clone());
 
     let episode_title = format!("Серія {}", episode_num);
+    let is_moonanime = target_url.starts_with("https://moonanime.art");
     let target = PlayTarget {
         anime_id: progress_anime_id,
         anime_title: progress_title,
@@ -342,6 +345,11 @@ async fn start_episode_playback(app: &mut AppState) {
         stream_page_url: target_url,
         start_time: None,
         studio_name,
+        referrer: if is_moonanime {
+            "https://moonanime.art/".to_string()
+        } else {
+            "https://ashdi.vip/".to_string()
+        },
     };
 
     play_target(app, target).await;
@@ -420,6 +428,7 @@ async fn continue_playback(app: &mut AppState, request: ContinueRequest) {
         details.title_ukrainian,
         details.year.unwrap_or(0)
     );
+    let is_moonanime = resolved.url.starts_with("https://moonanime.art");
     let target = PlayTarget {
         anime_id: progress.anime_id,
         anime_title: progress.anime_title.clone(),
@@ -430,6 +439,11 @@ async fn continue_playback(app: &mut AppState, request: ContinueRequest) {
         stream_page_url: resolved.url,
         start_time: resolved.start_time,
         studio_name: resolved.studio_name,
+        referrer: if is_moonanime {
+            "https://moonanime.art/".to_string()
+        } else {
+            "https://ashdi.vip/".to_string()
+        },
     };
 
     play_target(app, target).await;
@@ -558,6 +572,7 @@ async fn play_target(app: &mut AppState, target: PlayTarget) {
             target.start_time,
             &target.player_title,
             &target.episode_title,
+            &target.referrer,
         )
         .await
     {
@@ -1809,9 +1824,26 @@ async fn find_anihub_id(
         .flatten()
 }
 
-/// Намагається витягнути URL потоку з moonanime через yt-dlp з кукі браузера.
-/// Перебирає Firefox, Chrome, Chromium. Повертає None якщо не вдалось.
+/// Витягує пряме m3u8-посилання з moonanime embed-сторінки.
+///
+/// Стратегія (у порядку):
+///   1. `MoonAnimeParser` — HTTP fetch embed page + regex. Підписані URL (sig=...)
+///      самодостатні для авторизації, тому mpv може грати без cookies.
+///   2. `yt-dlp --cookies-from-browser` — fallback якщо сторінка вимагає аутентифікацію
+///      або regex не знайшов URL (потрібен встановлений yt-dlp).
+///
+/// Повертає `Some(m3u8_url)` або `None` якщо обидва методи не спрацювали.
 async fn try_moonanime_stream(iframe_url: &str) -> Option<String> {
+    // --- Крок 1: власний парсер (найшвидший, без зовнішніх залежностей) ---
+    if let Ok(parser) = api::MoonAnimeParser::new() {
+        if let Ok(url) = parser.extract_m3u8(iframe_url).await {
+            return Some(url);
+        }
+    }
+
+    // --- Крок 2: yt-dlp з кукі браузера (fallback) ---
+    // Використовуємо лише якщо парсер не знайшов URL (напр. сторінка за авторизацією
+    // або структура змінилась). yt-dlp перебирає браузери у порядку.
     for browser in &["firefox", "chrome", "chromium"] {
         let Ok(output) = tokio::process::Command::new("yt-dlp")
             .args([
@@ -1819,6 +1851,7 @@ async fn try_moonanime_stream(iframe_url: &str) -> Option<String> {
                 browser,
                 "--get-url",
                 "--no-playlist",
+                "--no-warnings",
                 "--quiet",
                 iframe_url,
             ])
@@ -1830,13 +1863,15 @@ async fn try_moonanime_stream(iframe_url: &str) -> Option<String> {
 
         if output.status.success() {
             let raw = String::from_utf8_lossy(&output.stdout);
-            // yt-dlp може повернути декілька рядків — беремо перший непорожній
-            let url = raw.lines().find(|l| !l.trim().is_empty())?.trim();
-            if !url.is_empty() {
-                return Some(url.to_string());
+            if let Some(url) = raw.lines().find(|l| !l.trim().is_empty()) {
+                let url = url.trim().to_string();
+                if !url.is_empty() {
+                    return Some(url);
+                }
             }
         }
     }
+
     None
 }
 
@@ -1891,6 +1926,7 @@ fn get_next_episode(app: &AppState, current: &(u32, String, u32, u32, String)) -
             .map(|d| format!("{} ({})", d.title_ukrainian, d.year.unwrap_or(0)))
             .unwrap_or_else(|| title.clone());
             
+        let is_moonanime = next_ep.url.starts_with("https://moonanime.art");
         return Some(PlayTarget {
             anime_id,
             anime_title: title,
@@ -1901,22 +1937,28 @@ fn get_next_episode(app: &AppState, current: &(u32, String, u32, u32, String)) -
             stream_page_url: next_ep.url.clone(),
             start_time: None,
             studio_name: current_studio.clone(),
+            referrer: if is_moonanime {
+                "https://moonanime.art/".to_string()
+            } else {
+                "https://ashdi.vip/".to_string()
+            },
         });
     }
-    
+
     // Next season
     let next_season = seasons.get(season_index + 1).copied()?;
     let (next_studio_idx, next_studio_data) = sources.ashdi.iter().enumerate()
         .find(|(_, s)| s.season_number == next_season)?;
     let next_ep = next_studio_data.episodes.first()?;
-    
+
     let anime_id = app.studio_anime_ids.get(next_studio_idx).copied().unwrap_or(*current_anime_id);
     let title = app.details_cache.get(&anime_id).map(|d| d.title_ukrainian.clone())
         .unwrap_or_else(|| current_title.clone());
     let player_title = app.details_cache.get(&anime_id)
         .map(|d| format!("{} ({})", d.title_ukrainian, d.year.unwrap_or(0)))
         .unwrap_or_else(|| title.clone());
-        
+
+    let is_moonanime = next_ep.url.starts_with("https://moonanime.art");
     Some(PlayTarget {
         anime_id,
         anime_title: title,
@@ -1927,5 +1969,10 @@ fn get_next_episode(app: &AppState, current: &(u32, String, u32, u32, String)) -
         stream_page_url: next_ep.url.clone(),
         start_time: None,
         studio_name: next_studio_data.studio_name.clone(),
+        referrer: if is_moonanime {
+            "https://moonanime.art/".to_string()
+        } else {
+            "https://ashdi.vip/".to_string()
+        },
     })
 }

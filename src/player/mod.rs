@@ -66,6 +66,7 @@ impl MpvPlayer {
         start_time: Option<f64>,
         anime_title: &str,
         episode_title: &str,
+        referrer: &str,
     ) -> Result<(Child, tokio::sync::mpsc::UnboundedReceiver<MpvEvent>, JoinHandle<()>)> {
         #[cfg(unix)]
         if self.socket_path.exists() {
@@ -76,7 +77,7 @@ impl MpvPlayer {
             m3u8_url.to_string(),
             format!("--input-ipc-server={}", self.socket_path.display()),
             format!("--force-media-title={} - {}", anime_title, episode_title),
-            "--referrer=https://ashdi.vip/".to_string(),
+            format!("--referrer={}", referrer),
             "--force-window=yes".to_string(),
             "--no-terminal".to_string(),
             "--vo=gpu-next".to_string(),
