@@ -13,9 +13,12 @@
 
 ## ✨ Features
 - **Browse** the full AniHub catalog, genres, and characters.
-- **Terminal Image Support** (requires a compatible terminal like Kitty, WezTerm, or Windows Terminal).
-- **Smooth Playback** integrated with `mpv` and `yt-dlp`.
-- **History & Caching** for quick access to your favorite titles.
+- **Instant Navigation:** Advanced caching and background prefetching for zero-latency browsing.
+- **Smart Flow:** Automatically skips season selection for movies and single-season entries.
+- **Rich Metadata:** View release years and detailed information instantly.
+- **Terminal Image Support:** Supports Kitty, WezTerm, and Windows Terminal.
+- **Smooth Playback:** Powered by `mpv`, `yt-dlp`, and Playwright for complex stream extraction.
+- **History & Progress:** O(1) history indexing ensures fast resume even with large libraries.
 - **Ukrainian Interface** support.
 
 ---
@@ -54,18 +57,19 @@ anihub-cli
 
 ## 🛠 Dependencies
 
-To play video, you must have these installed:
+To play all sources (including MoonAnime), you need:
 - **[mpv](https://mpv.io/)** (Media player)
-- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** (Video downloader/streamer)
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** (Stream handler)
+- **[Playwright](https://playwright.dev/python/)** (Required for MoonAnime stream extraction)
 
 ### Install commands:
 
 | OS | Command |
 | :--- | :--- |
-| **Arch Linux** | `sudo pacman -S mpv yt-dlp` |
-| **Ubuntu/Debian** | `sudo apt update && sudo apt install mpv yt-dlp` |
-| **macOS** | `brew install mpv yt-dlp` |
-| **Windows** | `scoop install mpv yt-dlp` |
+| **Arch Linux** | `sudo pacman -S mpv yt-dlp python-playwright && playwright install chromium` |
+| **Ubuntu/Debian** | `sudo apt update && sudo apt install mpv yt-dlp python3-pip && pip install playwright && playwright install chromium` |
+| **macOS** | `brew install mpv yt-dlp playwright && playwright install chromium` |
+| **Windows** | `scoop install mpv yt-dlp && pip install playwright && playwright install chromium` |
 
 ---
 
