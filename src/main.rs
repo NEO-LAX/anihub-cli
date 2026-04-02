@@ -1959,7 +1959,7 @@ async fn find_anihub_id(
         .flatten()
 }
 
-/// Python-скрипт для Playwright: відкриває iframe сторінку headless Chromium,
+/// Python-скрипт для Playwright: відкриває iframe сторінку headless Firefox,
 /// перехоплює перший мережевий запит до `s.moonanime.art/*.m3u8` і виводить URL у stdout.
 /// m3u8 URL формується обфускованим JS на стороні клієнта — статичний парсинг HTML не працює.
 /// Playwright скрипт для MoonAnime:
