@@ -66,10 +66,10 @@ To play all sources (including MoonAnime), you need:
 
 | OS | Command |
 | :--- | :--- |
-| **Arch Linux** | `sudo pacman -S mpv yt-dlp python-playwright && playwright install chromium` |
-| **Ubuntu/Debian** | `sudo apt update && sudo apt install mpv yt-dlp python3-pip && pip install playwright && playwright install chromium` |
-| **macOS** | `brew install mpv yt-dlp playwright && playwright install chromium` |
-| **Windows** | `scoop install mpv yt-dlp && pip install playwright && playwright install chromium` |
+| **Arch Linux** | `sudo pacman -S mpv yt-dlp python-playwright && playwright install firefox` |
+| **Ubuntu/Debian** | `sudo apt update && sudo apt install mpv yt-dlp python3-pip && pip install playwright && playwright install firefox` |
+| **macOS** | `brew install mpv yt-dlp playwright && playwright install firefox` |
+| **Windows** | `scoop install mpv yt-dlp && pip install playwright && playwright install firefox` |
 
 ---
 

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+#[cfg(unix)]
 use directories::ProjectDirs;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -48,7 +49,7 @@ impl MpvPlayer {
         let mut stream = UnixStream::connect(&self.socket_path).await?;
 
         #[cfg(windows)]
-        let mut stream = ClientOptions::new().open(&self.socket_path).await?;
+        let mut stream = ClientOptions::new().open(&self.socket_path)?;
 
         let request = serde_json::json!({
             "command": command
@@ -126,8 +127,8 @@ async fn monitor_ipc(socket_path: PathBuf, tx: tokio::sync::mpsc::UnboundedSende
 
         #[cfg(windows)]
         {
-            // On Windows, checking existence of a pipe is different,
-            // but we can just try to connect.
+            // On Windows, pipe is handled by driver, breaking early
+            // as we can't easily check for its existence like a file.
             break;
         }
 
