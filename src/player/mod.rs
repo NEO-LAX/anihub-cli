@@ -45,19 +45,25 @@ impl MpvPlayer {
     }
 
     pub async fn send_command(&self, command: Value) -> Result<()> {
-        #[cfg(unix)]
-        let mut stream = UnixStream::connect(&self.socket_path).await?;
-
-        #[cfg(windows)]
-        let mut stream = ClientOptions::new().open(&self.socket_path)?;
-
         let request = serde_json::json!({
             "command": command
         });
         let mut request_str = serde_json::to_string(&request)?;
         request_str.push('\n');
 
-        stream.write_all(request_str.as_bytes()).await?;
+        #[cfg(unix)]
+        {
+            let mut stream = UnixStream::connect(&self.socket_path).await?;
+            stream.write_all(request_str.as_bytes()).await?;
+        }
+
+        #[cfg(windows)]
+        {
+            // For Windows Named Pipes (Tokio is async)
+            let mut stream = ClientOptions::new().open(&self.socket_path)?;
+            stream.write_all(request_str.as_bytes()).await?;
+        }
+
         Ok(())
     }
 
@@ -127,8 +133,8 @@ async fn monitor_ipc(socket_path: PathBuf, tx: tokio::sync::mpsc::UnboundedSende
 
         #[cfg(windows)]
         {
-            // On Windows, pipe is handled by driver, breaking early
-            // as we can't easily check for its existence like a file.
+            // On Windows, checking existence of a pipe is non-trivial,
+            // we break early and let the connect handle it.
             break;
         }
 
@@ -136,13 +142,15 @@ async fn monitor_ipc(socket_path: PathBuf, tx: tokio::sync::mpsc::UnboundedSende
     }
 
     #[cfg(unix)]
-    let Ok(mut stream) = UnixStream::connect(&socket_path).await else {
-        return;
+    let mut stream = match UnixStream::connect(&socket_path).await {
+        Ok(s) => s,
+        Err(_) => return,
     };
 
     #[cfg(windows)]
-    let Ok(mut stream) = ClientOptions::new().open(&socket_path) else {
-        return;
+    let mut stream = match ClientOptions::new().open(&socket_path) {
+        Ok(s) => s,
+        Err(_) => return,
     };
 
     for request in [
