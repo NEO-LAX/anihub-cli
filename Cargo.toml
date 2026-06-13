@@ -11,6 +11,8 @@ directories = "6.0.0"
 hex = "0.4.3"
 image = "0.25.10"
 interprocess = "2.4.0"
+lru = "0.12"
+moka = { version = "0.12", features = ["sync"] }
 ratatui = "0.30.0"
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
 regex = "1.12.3"

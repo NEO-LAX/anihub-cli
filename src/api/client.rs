@@ -33,6 +33,9 @@ impl ApiClient {
         let client = Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(6)
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -198,18 +201,26 @@ impl ApiClient {
         anime_id: u32,
     ) -> Result<EpisodeSourcesResponse> {
         let mut all_studios: Vec<super::models::AshdiStudio> = Vec::new();
-        let mut consecutive_empty: u32 = 0;
 
         // Відстежуємо перший moon iframe URL кожного сезону (без trailing slash).
-        // Використовується для виявлення standalone-vs-franchise дублікатів:
-        // якщо S1 і S-N мають однакові moon URL → той самий контент; S1 = "власна сторінка",
-        // S-N = правильна позиція у франшизі. Треба перейменувати S1 → S-N.
         let mut season_first_moon_url: HashMap<u32, String> = HashMap::new();
 
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+        let mut join_set = tokio::task::JoinSet::new();
+
         for season in 1u32..=8 {
-            match self.get_episode_sources(anime_id, season).await {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let client_clone = self.clone();
+            join_set.spawn(async move {
+                let result = client_clone.get_episode_sources(anime_id, season).await;
+                drop(permit);
+                (season, result)
+            });
+        }
+
+        while let Some(Ok((season, result))) = join_set.join_next().await {
+            match result {
                 Ok(sources) => {
-                    // Завжди зберігаємо перший moon URL, навіть якщо використовуємо ashdi.
                     if let Some(first_moon_ep) = sources
                         .moonanime
                         .iter()
@@ -227,9 +238,7 @@ impl ApiClient {
 
                     if !sources.ashdi.is_empty() {
                         all_studios.extend(sources.ashdi);
-                        consecutive_empty = 0;
                     } else if !sources.moonanime.is_empty() {
-                        // Fallback: конвертуємо moonanime у AshdiStudio-формат
                         for moon in sources.moonanime {
                             let episodes = moon
                                 .episodes
@@ -250,20 +259,9 @@ impl ApiClient {
                                 episodes_count: moon.episodes_count,
                             });
                         }
-                        consecutive_empty = 0;
-                    } else {
-                        consecutive_empty += 1;
-                        if consecutive_empty >= 3 {
-                            break;
-                        }
                     }
                 }
-                Err(_) => {
-                    consecutive_empty += 1;
-                    if consecutive_empty >= 3 {
-                        break;
-                    }
-                }
+                Err(_) => {}
             }
         }
 

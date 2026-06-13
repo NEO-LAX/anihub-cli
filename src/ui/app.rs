@@ -127,9 +127,9 @@ pub struct AppState {
     pub moonanime_proxy: Option<Child>,
 
     // Кеші та prefetch
-    pub search_cache: HashMap<String, Vec<AnimeItem>>,
-    pub details_cache: HashMap<u32, AnimeDetails>,
-    pub sources_cache: HashMap<u32, EpisodeSourcesResponse>,
+    pub search_cache: moka::sync::Cache<String, Vec<AnimeItem>>,
+    pub details_cache: moka::sync::Cache<u32, AnimeDetails>,
+    pub sources_cache: moka::sync::Cache<u32, EpisodeSourcesResponse>,
     pub prefetching: bool,
     pub prefetch_rx:
         Option<mpsc::Receiver<(u32, Option<AnimeDetails>, Option<EpisodeSourcesResponse>)>>,
@@ -139,15 +139,16 @@ pub struct AppState {
     // Обкладинка
     pub picker: Picker,
     pub current_poster: Option<StatefulProtocol>,
-    pub poster_cache: HashMap<u32, DynamicImage>,
+    pub poster_cache: moka::sync::Cache<u32, std::sync::Arc<DynamicImage>>,
     pub poster_fetch_pending: Option<u32>,
 
     // AniList — кеш членів франшизи (ключ: representative_id)
-    pub anilist_cache: HashMap<u32, Vec<FranchiseMember>>,
+    pub anilist_cache: moka::sync::Cache<u32, Vec<FranchiseMember>>,
     /// Результат combine-логіки по representative_id → (EpisodeSourcesResponse, studio_anime_ids).
     /// Заповнюється після першого `load_combined_sources`/`load_library_combined_sources`.
     /// Наступні навігації до тої ж групи використовують кеш і не роблять жодних запитів.
-    pub combined_sources_cache: HashMap<u32, (EpisodeSourcesResponse, Vec<u32>)>,
+    pub combined_sources_cache: moka::sync::Cache<u32, (EpisodeSourcesResponse, Vec<u32>)>,
+    pub combined_sources_rx: Option<tokio::sync::mpsc::Receiver<Option<(EpisodeSourcesResponse, Vec<u32>)>>>,
     /// Канал для отримання AniList-результатів фонового prefetch.
     /// Кожне повідомлення: (representative_id, members).
     pub anilist_prefetch_rx: Option<mpsc::Receiver<(u32, Vec<FranchiseMember>)>>,
@@ -221,9 +222,9 @@ impl AppState {
             mpv_last_duration: 0.0,
             moonanime_proxy: None,
 
-            search_cache: HashMap::new(),
-            details_cache: HashMap::new(),
-            sources_cache: HashMap::new(),
+            search_cache: moka::sync::Cache::builder().max_capacity(50).build(),
+            details_cache: moka::sync::Cache::builder().max_capacity(100).build(),
+            sources_cache: moka::sync::Cache::builder().max_capacity(100).build(),
             prefetching: false,
             prefetch_rx: None,
             preload_abort: None,
@@ -231,11 +232,12 @@ impl AppState {
 
             picker,
             current_poster: None,
-            poster_cache: HashMap::new(),
+            poster_cache: moka::sync::Cache::builder().max_capacity(30).build(),
             poster_fetch_pending: None,
 
-            anilist_cache: HashMap::new(),
-            combined_sources_cache: HashMap::new(),
+            anilist_cache: moka::sync::Cache::builder().max_capacity(100).build(),
+            combined_sources_cache: moka::sync::Cache::builder().max_capacity(100).build(),
+            combined_sources_rx: None,
             anilist_prefetch_rx: None,
 
             watched_index,
@@ -1679,9 +1681,9 @@ impl AppState {
             return;
         };
 
-        self.current_details = self.details_cache.get(&anime_id).cloned();
-        if let Some(img) = self.poster_cache.get(&anime_id).cloned() {
-            self.current_poster = Some(self.picker.new_resize_protocol(img));
+        self.current_details = self.details_cache.get(&anime_id);
+        if let Some(img) = self.poster_cache.get(&anime_id) {
+            self.current_poster = Some(self.picker.new_resize_protocol((*img).clone()));
             self.poster_fetch_pending = None;
         } else {
             self.current_poster = None;
@@ -1731,12 +1733,12 @@ impl AppState {
             return;
         }
         self.sidebar_anime_idx = self.search_results.iter().position(|a| a.id == anime_id);
-        self.current_details = self.details_cache.get(&anime_id).cloned();
+        self.current_details = self.details_cache.get(&anime_id);
         if self.current_details.is_none() {
             self.loading = true;
         }
-        if let Some(img) = self.poster_cache.get(&anime_id).cloned() {
-            self.current_poster = Some(self.picker.new_resize_protocol(img));
+        if let Some(img) = self.poster_cache.get(&anime_id) {
+            self.current_poster = Some(self.picker.new_resize_protocol((*img).clone()));
         } else {
             self.current_poster = None;
             self.poster_fetch_pending = Some(anime_id);
@@ -1753,8 +1755,8 @@ impl AppState {
         });
 
         if let Some(id) = first_tv_id {
-            if let Some(img) = self.poster_cache.get(&id).cloned() {
-                self.current_poster = Some(self.picker.new_resize_protocol(img));
+            if let Some(img) = self.poster_cache.get(&id) {
+                self.current_poster = Some(self.picker.new_resize_protocol((*img).clone()));
             } else {
                 self.current_poster = None;
             }

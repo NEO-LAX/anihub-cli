@@ -1,5 +1,6 @@
 mod api;
 mod player;
+mod prefetch_bg;
 mod storage;
 mod ui;
 
@@ -117,6 +118,28 @@ async fn main() -> Result<()> {
             start_episode_playback(&mut app).await;
         }
 
+
+        if let Some(rx) = &mut app.combined_sources_rx {
+            match rx.try_recv() {
+                Ok(Some((sources, ids))) => {
+                    app.current_sources = Some(sources);
+                    app.studio_anime_ids = ids;
+                    app.loading = false;
+                    app.combined_sources_rx = None;
+                }
+                Ok(None) => {
+                    app.loading = false;
+                    app.combined_sources_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    // Still loading
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    app.loading = false;
+                    app.combined_sources_rx = None;
+                }
+            }
+        }
         if let Some(request) = app.continue_request.take() {
             app.loading = true;
             terminal.draw(|f| ui::render(f, &mut app))?;
@@ -236,8 +259,8 @@ async fn main() -> Result<()> {
 /// Завантажує постер для anime_id без блокування UI.
 async fn fetch_poster_for_anime(app: &mut AppState, anime_id: u32) {
     if app.poster_cache.contains_key(&anime_id) {
-        if let Some(img) = app.poster_cache.get(&anime_id).cloned() {
-            app.current_poster = Some(app.picker.new_resize_protocol(img));
+        if let Some(img) = app.poster_cache.get(&anime_id) {
+            app.current_poster = Some(app.picker.new_resize_protocol((*img).clone()));
         }
         return;
     }
@@ -267,7 +290,7 @@ async fn fetch_poster_for_anime(app: &mut AppState, anime_id: u32) {
     if let Some(url) = poster_url {
         if let Ok(img) = app.api_client.fetch_poster(&url).await {
             let proto = app.picker.new_resize_protocol(img.clone());
-            app.poster_cache.insert(anime_id, img);
+            app.poster_cache.insert(anime_id, std::sync::Arc::new(img));
             app.current_poster = Some(proto);
         }
     }
@@ -298,7 +321,7 @@ async fn start_episode_playback(app: &mut AppState) {
         Some(i) => i,
         None => return,
     };
-    let studio_idx = app.current_sources.as_ref().and_then(|sources| {
+    let studio_idx = app.current_sources.clone().and_then(|sources| {
         sources
             .ashdi
             .iter()
@@ -754,7 +777,7 @@ fn resolve_continue_target(
 }
 
 async fn get_or_fetch_details(app: &mut AppState, anime_id: u32) -> Option<api::AnimeDetails> {
-    if let Some(details) = app.details_cache.get(&anime_id).cloned() {
+    if let Some(details) = app.details_cache.get(&anime_id) {
         return Some(details);
     }
     let details = app.api_client.get_anime_details(anime_id).await.ok()?;
@@ -763,7 +786,7 @@ async fn get_or_fetch_details(app: &mut AppState, anime_id: u32) -> Option<api::
 }
 
 async fn get_or_fetch_sources(app: &mut AppState, anime_id: u32) -> Option<EpisodeSourcesResponse> {
-    if let Some(sources) = app.sources_cache.get(&anime_id).cloned() {
+    if let Some(sources) = app.sources_cache.get(&anime_id) {
         return Some(sources);
     }
     let sources = app
@@ -898,7 +921,7 @@ async fn handle_loading_tasks(app: &mut AppState) {
     if app.mode == AppMode::Normal && !app.search_query.is_empty() {
         let query = app.search_query.trim().to_string();
         let cache_key = query.to_lowercase();
-        let cached = app.search_cache.get(&cache_key).cloned();
+        let cached = app.search_cache.get(&cache_key);
 
         match cached {
             Some(results) => {
@@ -938,19 +961,45 @@ async fn handle_loading_tasks(app: &mut AppState) {
             if app.current_sources.is_none() || current_ids != expected_ids {
                 // Перевіряємо combined_sources_cache перед повним перерахунком
                 if let Some((cached_sources, cached_ids)) =
-                    app.combined_sources_cache.get(&representative_id).cloned()
+                    app.combined_sources_cache.get(&representative_id)
                 {
                     app.current_sources = Some(cached_sources);
                     app.studio_anime_ids = cached_ids;
                 } else {
-                    load_library_combined_sources(app, &selected_ids, representative_id).await;
+                    app.loading = true;
+                    app.current_sources = None; // Reset sources while loading
+                    
+                    let api_client = app.api_client.clone();
+                    let details_cache = app.details_cache.clone();
+                    let sources_cache = app.sources_cache.clone();
+                    let anilist_cache = app.anilist_cache.clone();
+                    let combined_sources_cache = app.combined_sources_cache.clone();
+                    let selected_ids = selected_ids.clone();
+                    
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    app.combined_sources_rx = Some(rx);
+                    
+                    tokio::spawn(async move {
+                        let res = crate::prefetch_bg::compute_library_combined_sources(
+                            api_client,
+                            details_cache,
+                            sources_cache,
+                            anilist_cache,
+                            selected_ids,
+                            representative_id,
+                        ).await;
+                        if let Some((sources, ids)) = res.clone() {
+                            combined_sources_cache.insert(representative_id, (sources.clone(), ids.clone()));
+                        }
+                        let _ = tx.send(res).await;
+                    });
                 }
             }
         }
 
         if let Some(context_anime_id) = app.library_selected_anime_id() {
             if app.current_details.as_ref().map(|details| details.id) != Some(context_anime_id) {
-                if let Some(cached) = app.details_cache.get(&context_anime_id).cloned() {
+                if let Some(cached) = app.details_cache.get(&context_anime_id) {
                     app.current_details = Some(cached);
                 } else if let Ok(details) = app.api_client.get_anime_details(context_anime_id).await
                 {
@@ -972,7 +1021,7 @@ async fn handle_loading_tasks(app: &mut AppState) {
             if let Some(item) = app.search_results.get(idx).cloned() {
                 // Деталі
                 if app.current_details.is_none() {
-                    if let Some(cached) = app.details_cache.get(&item.id).cloned() {
+                    if let Some(cached) = app.details_cache.get(&item.id) {
                         app.current_details = Some(cached);
                     } else if let Ok(details) = app.api_client.get_anime_details(item.id).await {
                         app.current_details = Some(details);
@@ -982,12 +1031,53 @@ async fn handle_loading_tasks(app: &mut AppState) {
                 // Об'єднані джерела з усіх TV-членів франшизи
                 if app.current_sources.is_none() {
                     if let Some((cached_sources, cached_ids)) =
-                        app.combined_sources_cache.get(&item.id).cloned()
+                        app.combined_sources_cache.get(&item.id)
                     {
                         app.current_sources = Some(cached_sources);
                         app.studio_anime_ids = cached_ids;
                     } else {
-                        load_combined_sources(app, item.id).await;
+                        app.loading = true;
+                        app.current_sources = None; // Reset sources while loading
+                        
+                        let api_client = app.api_client.clone();
+                        let details_cache = app.details_cache.clone();
+                        let sources_cache = app.sources_cache.clone();
+                        let anilist_cache = app.anilist_cache.clone();
+                        let combined_sources_cache = app.combined_sources_cache.clone();
+                        
+                        let representative_id = item.id;
+                        let mut current_tv_ids = Vec::new();
+                        if let Some(g_idx) = app.selected_group_index {
+                            if let Some(group) = app.franchise_groups.get(g_idx) {
+                                for &i in group {
+                                    let a = &app.search_results[i];
+                                    if a.anime_type.to_lowercase() == "tv" {
+                                        current_tv_ids.push(a.id);
+                                    }
+                                }
+                            }
+                        }
+                        if current_tv_ids.is_empty() {
+                            current_tv_ids.push(representative_id);
+                        }
+                        
+                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                        app.combined_sources_rx = Some(rx);
+                        
+                        tokio::spawn(async move {
+                            let res = crate::prefetch_bg::compute_library_combined_sources(
+                                api_client,
+                                details_cache,
+                                sources_cache,
+                                anilist_cache,
+                                current_tv_ids,
+                                representative_id,
+                            ).await;
+                            if let Some((sources, ids)) = res.clone() {
+                                combined_sources_cache.insert(representative_id, (sources.clone(), ids.clone()));
+                            }
+                            let _ = tx.send(res).await;
+                        });
                     }
                 }
 
@@ -1017,7 +1107,7 @@ async fn handle_loading_tasks(app: &mut AppState) {
         && app.current_details.is_none()
     {
         let season_anime_id = app.selected_season_num().and_then(|sn| {
-            app.current_sources.as_ref().and_then(|sources| {
+            app.current_sources.clone().and_then(|sources| {
                 sources
                     .ashdi
                     .iter()
@@ -1027,7 +1117,7 @@ async fn handle_loading_tasks(app: &mut AppState) {
             })
         });
         if let Some(anime_id) = season_anime_id {
-            if let Some(cached) = app.details_cache.get(&anime_id).cloned() {
+            if let Some(cached) = app.details_cache.get(&anime_id) {
                 app.current_details = Some(cached);
             } else if let Ok(details) = app.api_client.get_anime_details(anime_id).await {
                 app.details_cache.insert(anime_id, details.clone());
@@ -1037,225 +1127,6 @@ async fn handle_loading_tasks(app: &mut AppState) {
     }
 }
 
-async fn load_library_combined_sources(
-    app: &mut AppState,
-    current_tv_ids: &[u32],
-    representative_id: u32,
-) {
-    let mut tv_with_year: Vec<(u32, u32)> = Vec::new();
-    let mut id_to_anilist: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-
-    for &anime_id in current_tv_ids {
-        let details = if let Some(cached) = app.details_cache.get(&anime_id).cloned() {
-            Some(cached)
-        } else if let Ok(details) = app.api_client.get_anime_details(anime_id).await {
-            app.details_cache.insert(anime_id, details.clone());
-            Some(details)
-        } else {
-            None
-        };
-
-        let year = details.as_ref().and_then(|d| d.year).unwrap_or(0);
-        tv_with_year.push((anime_id, year));
-        if let Some(al_id) = details.and_then(|d| d.anilist_id) {
-            id_to_anilist.insert(anime_id, al_id);
-        }
-    }
-
-    let extra_tv =
-        augment_library_franchise_with_anilist(app, current_tv_ids, representative_id).await;
-    for (id, year, al_id) in extra_tv {
-        if !tv_with_year
-            .iter()
-            .any(|(existing_id, _)| *existing_id == id)
-        {
-            tv_with_year.push((id, year));
-        }
-        id_to_anilist.entry(id).or_insert(al_id);
-    }
-
-    tv_with_year.sort_by(|&(a_id, a_year), &(b_id, b_year)| {
-        let a_al = id_to_anilist.get(&a_id).copied().unwrap_or(u32::MAX);
-        let b_al = id_to_anilist.get(&b_id).copied().unwrap_or(u32::MAX);
-        a_al.cmp(&b_al).then(a_year.cmp(&b_year))
-    });
-
-    let franchise_tv_ids: Vec<u32> = tv_with_year.into_iter().map(|(id, _)| id).collect();
-    if franchise_tv_ids.is_empty() {
-        return;
-    }
-
-    let multi = franchise_tv_ids.len() > 1;
-    let mut combined: Vec<AshdiStudio> = Vec::new();
-    let mut anime_ids: Vec<u32> = Vec::new();
-
-    if multi {
-        let mut join_set: tokio::task::JoinSet<(u32, Option<EpisodeSourcesResponse>)> =
-            tokio::task::JoinSet::new();
-        for &anime_id in &franchise_tv_ids {
-            if let Some(cached) = app.sources_cache.get(&anime_id).cloned() {
-                join_set.spawn(async move { (anime_id, Some(cached)) });
-            } else {
-                let client = app.api_client.clone();
-                join_set.spawn(async move {
-                    (
-                        anime_id,
-                        client.get_episode_sources_for_anime(anime_id).await.ok(),
-                    )
-                });
-            }
-        }
-
-        let mut fetched: Vec<(u32, Option<EpisodeSourcesResponse>)> =
-            Vec::with_capacity(franchise_tv_ids.len());
-        while let Some(Ok(result)) = join_set.join_next().await {
-            fetched.push(result);
-        }
-        fetched.sort_by_key(|(id, _)| {
-            franchise_tv_ids
-                .iter()
-                .position(|&x| x == *id)
-                .unwrap_or(usize::MAX)
-        });
-
-        let mut all: Vec<(u32, AshdiStudio)> = Vec::new();
-        let mut per_member: std::collections::HashMap<u32, Vec<AshdiStudio>> =
-            std::collections::HashMap::new();
-        for (anime_id, sources) in fetched {
-            if let Some(sources) = sources {
-                app.sources_cache.insert(anime_id, sources.clone());
-                per_member.insert(anime_id, sources.ashdi.clone());
-                for studio in sources.ashdi {
-                    all.push((anime_id, studio));
-                }
-            }
-        }
-
-        let active_franchise_ids: Vec<u32> = franchise_tv_ids
-            .iter()
-            .copied()
-            .filter(|id| per_member.contains_key(id))
-            .collect();
-        let mut best: Vec<(u32, AshdiStudio)> = Vec::new();
-        for (aid, studio) in &all {
-            if let Some(pos) = best.iter().position(|(_, s)| {
-                s.season_number == studio.season_number && s.studio_name == studio.studio_name
-            }) {
-                if studio.episodes.len() >= best[pos].1.episodes.len() {
-                    best[pos] = (*aid, studio.clone());
-                }
-            } else {
-                best.push((*aid, studio.clone()));
-            }
-        }
-        best.sort_by(|(_, a), (_, b)| {
-            a.season_number
-                .cmp(&b.season_number)
-                .then(b.episodes_count.cmp(&a.episodes_count))
-        });
-        let unique_season_nums: Vec<u32> = {
-            let mut v: Vec<u32> = Vec::new();
-            for (_, s) in &best {
-                if !v.contains(&s.season_number) {
-                    v.push(s.season_number);
-                }
-            }
-            v
-        };
-        let n_seasons = unique_season_nums.len();
-        let n_members = active_franchise_ids.len();
-
-        if n_members >= 2 * n_seasons.max(1) {
-            let mut season_counter = 1u32;
-            let mut claimed_urls: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for &anime_id in &active_franchise_ids {
-                let Some(member_studios) = per_member.get(&anime_id) else {
-                    continue;
-                };
-                let mut season_nums: Vec<u32> =
-                    member_studios.iter().map(|s| s.season_number).collect();
-                season_nums.sort();
-                season_nums.dedup();
-                let chosen = season_nums
-                    .iter()
-                    .find(|&&s_num| {
-                        member_studios
-                            .iter()
-                            .filter(|s| s.season_number == s_num)
-                            .any(|s| {
-                                s.episodes
-                                    .first()
-                                    .map(|e| !claimed_urls.contains(&e.url))
-                                    .unwrap_or(false)
-                            })
-                    })
-                    .copied();
-                let Some(chosen_s) = chosen else { continue };
-                for studio in member_studios
-                    .iter()
-                    .filter(|s| s.season_number == chosen_s)
-                {
-                    if let Some(ep) = studio.episodes.first() {
-                        claimed_urls.insert(ep.url.clone());
-                    }
-                    combined.push(AshdiStudio {
-                        season_number: season_counter,
-                        ..studio.clone()
-                    });
-                    anime_ids.push(anime_id);
-                }
-                season_counter += 1;
-            }
-        } else {
-            let member_offset = n_members.saturating_sub(n_seasons);
-            for (data_aid, studio) in best {
-                let season_pos = unique_season_nums
-                    .iter()
-                    .position(|&s| s == studio.season_number)
-                    .unwrap_or(0);
-                let new_season = (season_pos + 1) as u32;
-                let owner_id = active_franchise_ids
-                    .get(season_pos + member_offset)
-                    .copied()
-                    .unwrap_or_else(|| active_franchise_ids.last().copied().unwrap_or(data_aid));
-                anime_ids.push(owner_id);
-                combined.push(AshdiStudio {
-                    season_number: new_season,
-                    ..studio
-                });
-            }
-        }
-    } else {
-        let anime_id = franchise_tv_ids[0];
-        let sources = if let Some(cached) = app.sources_cache.get(&anime_id).cloned() {
-            Some(cached)
-        } else {
-            app.api_client
-                .get_episode_sources_for_anime(anime_id)
-                .await
-                .ok()
-        };
-        if let Some(sources) = sources {
-            app.sources_cache.insert(anime_id, sources.clone());
-            for studio in sources.ashdi {
-                anime_ids.push(anime_id);
-                combined.push(studio);
-            }
-        }
-    }
-
-    if !combined.is_empty() {
-        let final_sources = EpisodeSourcesResponse {
-            ashdi: combined,
-            moonanime: Vec::new(),
-        };
-        app.combined_sources_cache
-            .insert(representative_id, (final_sources.clone(), anime_ids.clone()));
-        app.studio_anime_ids = anime_ids;
-        app.current_sources = Some(final_sources);
-    }
-}
 
 fn apply_search_results(app: &mut AppState, results: Vec<api::AnimeItem>) {
     app.search_results = results;
@@ -1302,7 +1173,7 @@ fn apply_search_results(app: &mut AppState, results: Vec<api::AnimeItem>) {
             })
             .collect();
         if !anilist_groups.is_empty() {
-            spawn_anilist_prefetch(app, anilist_groups);
+            spawn_super_prefetch(app);
         }
     } else {
         app.result_list_state.select(None);
@@ -1377,587 +1248,71 @@ fn spawn_prefetch_for_ids(app: &mut AppState, ids: Vec<u32>) {
 
 /// Запускає фоновий prefetch AniList-даних для кожної групи.
 /// Результат (representative_id, members) надходить через `anilist_prefetch_rx`.
-fn spawn_anilist_prefetch(app: &mut AppState, groups: Vec<(u32, u32)>) {
-    // groups: Vec<(representative_id, first_tv_anilist_id)>
-    let pending: Vec<(u32, u32)> = groups
-        .into_iter()
-        .filter(|(rep_id, _)| !app.anilist_cache.contains_key(rep_id))
-        .collect();
 
-    if pending.is_empty() {
-        app.anilist_prefetch_rx = None;
+fn spawn_super_prefetch(app: &mut AppState) {
+    let mut tasks = Vec::new();
+    for group in &app.franchise_groups {
+        if group.is_empty() { continue; }
+        let rep_idx = api::representative_idx(&app.search_results, group);
+        let rep_id = app.search_results[rep_idx].id;
+        if app.combined_sources_cache.contains_key(&rep_id) { continue; }
+
+        let mut tv_ids = Vec::new();
+        for &i in group {
+            let item = &app.search_results[i];
+            if item.anime_type.to_lowercase() == "tv" {
+                tv_ids.push(item.id);
+            }
+        }
+        if tv_ids.is_empty() {
+            tv_ids.push(rep_id);
+        }
+        tasks.push((rep_id, tv_ids));
+    }
+
+    if tasks.is_empty() {
         return;
     }
 
-    let http_client = app.api_client.http_client().clone();
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let api_client = app.api_client.clone();
+    let details_cache = app.details_cache.clone();
+    let sources_cache = app.sources_cache.clone();
+    let anilist_cache = app.anilist_cache.clone();
+    let combined_sources_cache = app.combined_sources_cache.clone();
+
     tokio::spawn(async move {
-        let mut join_set: JoinSet<(u32, Vec<api::anilist::FranchiseMember>)> = JoinSet::new();
-        for (rep_id, anilist_id) in pending {
-            let c = http_client.clone();
+        // Ми можемо обробляти їх паралельно з JoinSet, але щоб не спамити API,
+        // можна лімітувати concurrency через Semaphore.
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (rep_id, tv_ids) in tasks {
+            let api_client = api_client.clone();
+            let details_cache = details_cache.clone();
+            let sources_cache = sources_cache.clone();
+            let anilist_cache = anilist_cache.clone();
+            let combined_sources_cache = combined_sources_cache.clone();
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
             join_set.spawn(async move {
-                let members = api::anilist::get_franchise_members_by_id(&c, anilist_id).await;
-                (rep_id, members)
+                let _permit = permit;
+                if let Some((sources, ids)) = crate::prefetch_bg::compute_library_combined_sources(
+                    api_client,
+                    details_cache,
+                    sources_cache,
+                    anilist_cache,
+                    tv_ids,
+                    rep_id,
+                ).await {
+                    combined_sources_cache.insert(rep_id, (sources, ids));
+                }
             });
         }
-        while let Some(Ok((rep_id, members))) = join_set.join_next().await {
-            if tx.send((rep_id, members)).await.is_err() {
-                break;
-            }
-        }
+        while let Some(_) = join_set.join_next().await {}
     });
-    app.anilist_prefetch_rx = Some(rx);
 }
 
-/// Об'єднує джерела серій з усіх TV-елементів поточної франшизи.
-/// Також збагачує через AniList (знаходить приховані члени з іншими назвами та фільми).
-async fn load_combined_sources(app: &mut AppState, representative_id: u32) {
-    // Будуємо початковий список TV-членів (id, year) з franchise_groups
-    let mut tv_with_year: Vec<(u32, u32)> = if let Some(g_idx) = app.selected_group_index {
-        if let Some(group) = app.franchise_groups.get(g_idx) {
-            let mut tv: Vec<(u32, u32)> = group
-                .iter()
-                .map(|&i| &app.search_results[i])
-                .filter(|a| a.anime_type.to_lowercase() == "tv")
-                .map(|a| (a.id, a.year.unwrap_or(0)))
-                .collect();
-            // Сортуємо за anilist_id (відображає порядок виходу), fallback — рік
-            // Рік дубляжу на anihub може бути пізніший оригінального, тому anilist_id надійніший
-            tv.sort_by(|&(a_id, a_year), &(b_id, b_year)| {
-                let a_al = app
-                    .search_results
-                    .iter()
-                    .find(|a| a.id == a_id)
-                    .and_then(|a| a.anilist_id)
-                    .unwrap_or(u32::MAX);
-                let b_al = app
-                    .search_results
-                    .iter()
-                    .find(|a| a.id == b_id)
-                    .and_then(|a| a.anilist_id)
-                    .unwrap_or(u32::MAX);
-                a_al.cmp(&b_al).then(a_year.cmp(&b_year))
-            });
-            tv
-        } else {
-            vec![(representative_id, 0)]
-        }
-    } else {
-        vec![(representative_id, 0)]
-    };
 
-    // Збагачуємо через AniList лише якщо є хоча б один TV-член.
-    // Якщо tv_with_year порожній (фільм/ova/спец) — не шукаємо, бо AniList поверне TV-сезони
-    // і вони з'являться замість самого фільму.
-    if !tv_with_year.is_empty() {
-        let current_tv_ids: Vec<u32> = tv_with_year.iter().map(|(id, _)| *id).collect();
-        // id_to_anilist: зберігаємо anilist_id для всіх TV-членів (включно з augmented),
-        // щоб сортувати за ним (нижчий = раніший сезон) замість ненадійного year.
-        let mut id_to_anilist: std::collections::HashMap<u32, u32> = app
-            .search_results
-            .iter()
-            .filter_map(|a| a.anilist_id.map(|al| (a.id, al)))
-            .collect();
-
-        let extra_tv =
-            augment_franchise_with_anilist(app, &current_tv_ids, representative_id).await;
-        for (id, year, al_id) in extra_tv {
-            if !tv_with_year.iter().any(|(i, _)| *i == id) {
-                tv_with_year.push((id, year));
-            }
-            id_to_anilist.entry(id).or_insert(al_id);
-        }
-        tv_with_year.sort_by(|&(a_id, a_year), &(b_id, b_year)| {
-            let a_al = id_to_anilist.get(&a_id).copied().unwrap_or(u32::MAX);
-            let b_al = id_to_anilist.get(&b_id).copied().unwrap_or(u32::MAX);
-            a_al.cmp(&b_al).then(a_year.cmp(&b_year))
-        });
-
-        // Видаляємо записи, де AniList підтверджує що це НЕ TV (наприклад, теізер PV з type=tv на anihub,
-        // але format=ONA на AniList). Так запобігаємо зміщенню back-alignment через фальшиві TV-записи.
-        if let Some(anilist_members) = app.anilist_cache.get(&representative_id).cloned() {
-            tv_with_year.retain(|(id, _)| {
-                // Використовуємо id_to_anilist (охоплює і augment-записи, не лише search_results)
-                let anilist_id = id_to_anilist.get(id).copied();
-                match anilist_id {
-                    Some(al_id) => anilist_members
-                        .iter()
-                        .find(|m| m.anilist_id == al_id)
-                        .map(|m| m.is_tv)
-                        .unwrap_or(false), // відомий anilist_id НЕ знайдено в BFS → видаляємо (ONA/Movie teaser)
-                    None => true, // немає anilist_id → залишаємо
-                }
-            });
-        }
-    }
-    let franchise_tv_ids: Vec<u32> = tv_with_year.into_iter().map(|(id, _)| id).collect();
-
-    let multi = franchise_tv_ids.len() > 1;
-    let mut combined: Vec<AshdiStudio> = Vec::new();
-    let mut anime_ids: Vec<u32> = Vec::new();
-
-    if multi {
-        // Паралельний запит для всіх franchise-членів (JoinSet).
-        // Кожен anime_id → get_episode_sources_for_anime незалежно і одночасно.
-        let mut join_set: tokio::task::JoinSet<(u32, Option<EpisodeSourcesResponse>)> =
-            tokio::task::JoinSet::new();
-        for &anime_id in &franchise_tv_ids {
-            if let Some(cached) = app.sources_cache.get(&anime_id).cloned() {
-                join_set.spawn(async move { (anime_id, Some(cached)) });
-            } else {
-                let client = app.api_client.clone();
-                join_set.spawn(async move {
-                    (
-                        anime_id,
-                        client.get_episode_sources_for_anime(anime_id).await.ok(),
-                    )
-                });
-            }
-        }
-        let mut fetched: Vec<(u32, Option<EpisodeSourcesResponse>)> =
-            Vec::with_capacity(franchise_tv_ids.len());
-        while let Some(Ok(result)) = join_set.join_next().await {
-            fetched.push(result);
-        }
-        // Відновлюємо порядок franchise_tv_ids (JoinSet не гарантує порядок)
-        fetched.sort_by_key(|(id, _)| {
-            franchise_tv_ids
-                .iter()
-                .position(|&x| x == *id)
-                .unwrap_or(usize::MAX)
-        });
-        let mut all: Vec<(u32, AshdiStudio)> = Vec::new();
-        let mut per_member: std::collections::HashMap<u32, Vec<AshdiStudio>> =
-            std::collections::HashMap::new();
-        for (anime_id, sources) in fetched {
-            if let Some(sources) = sources {
-                per_member.insert(anime_id, sources.ashdi.clone());
-                for studio in sources.ashdi {
-                    all.push((anime_id, studio));
-                }
-            }
-        }
-        // Лише члени з реальними даними Ashdi — щоб AniList-доповнення без даних
-        // не зміщували back-alignment offset і не впливали на n_members.
-        let active_franchise_ids: Vec<u32> = franchise_tv_ids
-            .iter()
-            .copied()
-            .filter(|id| per_member.contains_key(id))
-            .collect();
-
-        // Dedup по (season_number, studio_name); зберігаємо entry з найбільшим episodes.len()
-        let mut best: Vec<(u32, AshdiStudio)> = Vec::new();
-        for (aid, studio) in &all {
-            if let Some(pos) = best.iter().position(|(_, s)| {
-                s.season_number == studio.season_number && s.studio_name == studio.studio_name
-            }) {
-                if studio.episodes.len() >= best[pos].1.episodes.len() {
-                    best[pos] = (*aid, studio.clone());
-                }
-            } else {
-                best.push((*aid, studio.clone()));
-            }
-        }
-        best.sort_by(|(_, a), (_, b)| {
-            a.season_number
-                .cmp(&b.season_number)
-                .then(b.episodes_count.cmp(&a.episodes_count))
-        });
-        let unique = best;
-        let unique_season_nums: Vec<u32> = {
-            let mut v: Vec<u32> = Vec::new();
-            for (_, s) in &unique {
-                if !v.contains(&s.season_number) {
-                    v.push(s.season_number);
-                }
-            }
-            v
-        };
-        let n_seasons = unique_season_nums.len();
-        let n_members = active_franchise_ids.len();
-
-        if n_members >= 2 * n_seasons.max(1) {
-            // Per-member режим: кожен anime_id отримує свій sequential сезон-слот.
-            // Ashdi крос-лінкує старі сезони в нові члени → виявляємо дублікати по URL першого
-            // епізоду: якщо всі сезони члена вже claimed попередніми членами — пропускаємо.
-            let mut season_counter = 1u32;
-            let mut claimed_urls: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for &anime_id in &active_franchise_ids {
-                let member_studios = per_member.get(&anime_id).unwrap(); // safe: відфільтровано вище
-                // Сезони в порядку зростання
-                let mut season_nums: Vec<u32> =
-                    member_studios.iter().map(|s| s.season_number).collect();
-                season_nums.sort();
-                season_nums.dedup();
-                // Шукаємо перший сезон, де є хоч одна студія з непривласненим URL першого епізоду
-                let chosen = season_nums
-                    .iter()
-                    .find(|&&s_num| {
-                        member_studios
-                            .iter()
-                            .filter(|s| s.season_number == s_num)
-                            .any(|s| {
-                                s.episodes
-                                    .first()
-                                    .map(|e| !claimed_urls.contains(&e.url))
-                                    .unwrap_or(false)
-                            })
-                    })
-                    .copied();
-                let Some(chosen_s) = chosen else { continue }; // всі сезони — кросс-лінк → пропускаємо
-                for studio in member_studios
-                    .iter()
-                    .filter(|s| s.season_number == chosen_s)
-                {
-                    if let Some(ep) = studio.episodes.first() {
-                        claimed_urls.insert(ep.url.clone());
-                    }
-                    combined.push(AshdiStudio {
-                        season_number: season_counter,
-                        ..studio.clone()
-                    });
-                    anime_ids.push(anime_id);
-                }
-                season_counter += 1;
-            }
-        } else {
-            // Back-align: якщо franchise-членів більше ніж сезонів Ashdi,
-            // вирівнюємо з кінця: SN → active_members[offset + season_pos].
-            let member_offset = n_members.saturating_sub(n_seasons);
-            for (data_aid, studio) in unique {
-                let season_pos = unique_season_nums
-                    .iter()
-                    .position(|&s| s == studio.season_number)
-                    .unwrap_or(0);
-                let new_season = (season_pos + 1) as u32;
-                let owner_id = active_franchise_ids
-                    .get(season_pos + member_offset)
-                    .copied()
-                    .unwrap_or_else(|| active_franchise_ids.last().copied().unwrap_or(data_aid));
-                anime_ids.push(owner_id);
-                combined.push(AshdiStudio {
-                    season_number: new_season,
-                    ..studio
-                });
-            }
-        }
-        // Для "зайвих" сезонів (тих що виходять за межі active_franchise_ids)
-        // намагаємось знайти реальний anihub запис через AniList без dub-фільтру.
-        // Це потрібно коли S4 ще не має плеєрів (has_ukrainian_dub=false) але є на anihub —
-        // щоб показувати правильні метадані в sidebar замість даних S3.
-        app.season_to_metadata_id.clear();
-        if let Some(&last_member_id) = active_franchise_ids.last() {
-            // TV члени франшизи в AniList-порядку (хронологічно)
-            let tv_anilist_ids: Vec<u32> = app
-                .anilist_cache
-                .get(&representative_id)
-                .map(|members| {
-                    members
-                        .iter()
-                        .filter(|m| m.is_tv)
-                        .map(|m| m.anilist_id)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mut checked: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for (studio, &owner_id) in combined.iter().zip(anime_ids.iter()) {
-                let sn = studio.season_number;
-                // Тільки сезони де власник = останній fallback member
-                if owner_id != last_member_id || !checked.insert(sn) {
-                    continue;
-                }
-                let season_idx = (sn as usize).saturating_sub(1); // 0-indexed
-                // Сезон виходить за межі відомих членів — шукаємо реальний entry
-                if season_idx >= active_franchise_ids.len() && season_idx < tv_anilist_ids.len() {
-                    let al_id = tv_anilist_ids[season_idx];
-                    if let Ok(Some(anihub_id)) =
-                        app.api_client.get_anime_by_anilist_id_any(al_id).await
-                    {
-                        if !active_franchise_ids.contains(&anihub_id) {
-                            app.season_to_metadata_id.insert(sn, anihub_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // DEBUG → /tmp/anihub_debug.log
-        debug_log(&format!("[DEBUG] representative_id={representative_id}"));
-        debug_log("[DEBUG] active_franchise_ids (впорядковані):");
-        for &id in &active_franchise_ids {
-            let title = app
-                .search_results
-                .iter()
-                .find(|a| a.id == id)
-                .map(|a| a.title_ukrainian.as_str())
-                .unwrap_or("?");
-            let al = app
-                .search_results
-                .iter()
-                .find(|a| a.id == id)
-                .and_then(|a| a.anilist_id)
-                .or_else(|| app.details_cache.get(&id).and_then(|d| d.anilist_id));
-            debug_log(&format!(
-                "[DEBUG]   id={id}  anilist_id={al:?}  title={title:?}"
-            ));
-        }
-        debug_log(&format!(
-            "[DEBUG] n_members={n_members}  n_seasons={n_seasons}  mode={}",
-            if n_members >= 2 * n_seasons.max(1) {
-                "per-member"
-            } else {
-                "back-align"
-            }
-        ));
-        for (i, (s, id)) in combined.iter().zip(anime_ids.iter()).enumerate() {
-            let first_ep = s
-                .episodes
-                .first()
-                .map(|e| (e.episode_number, e.url.chars().take(60).collect::<String>()))
-                .unwrap_or((0, String::new()));
-            debug_log(&format!(
-                "[DEBUG] combined[{i}] season={} studio={:?} ep={} owner={id}  first_ep#{}  url_prefix={:?}",
-                s.season_number, s.studio_name, s.episodes_count, first_ep.0, first_ep.1
-            ));
-        }
-    } else {
-        if franchise_tv_ids.is_empty() {
-            // Fallback: всі члени групи — OVA/movie/спец → використовуємо representative
-            match app
-                .api_client
-                .get_episode_sources_for_anime(representative_id)
-                .await
-            {
-                Ok(sources) => {
-                    let ids = vec![representative_id; sources.ashdi.len()];
-                    app.combined_sources_cache
-                        .insert(representative_id, (sources.clone(), ids.clone()));
-                    app.studio_anime_ids = ids;
-                    app.current_sources = Some(sources);
-                }
-                Err(e) => app.set_error_status(format!("Помилка джерел: {}", e)),
-            }
-            return;
-        }
-        let anime_id = franchise_tv_ids[0];
-        let sources = if let Some(cached) = app.sources_cache.get(&anime_id).cloned() {
-            Some(cached)
-        } else {
-            let fetched = app
-                .api_client
-                .get_episode_sources_for_anime(anime_id)
-                .await
-                .ok();
-            if let Some(ref s) = fetched {
-                app.sources_cache.insert(anime_id, s.clone());
-            }
-            fetched
-        };
-        if let Some(sources) = sources {
-            for studio in sources.ashdi {
-                anime_ids.push(anime_id);
-                combined.push(studio);
-            }
-        }
-    }
-
-    if !combined.is_empty() {
-        let final_sources = EpisodeSourcesResponse {
-            ashdi: combined,
-            moonanime: Vec::new(),
-        };
-        app.combined_sources_cache
-            .insert(representative_id, (final_sources.clone(), anime_ids.clone()));
-        app.studio_anime_ids = anime_ids;
-        app.current_sources = Some(final_sources);
-    } else {
-        match app
-            .api_client
-            .get_episode_sources_for_anime(representative_id)
-            .await
-        {
-            Ok(sources) => {
-                let ids = vec![representative_id; sources.ashdi.len()];
-                app.combined_sources_cache
-                    .insert(representative_id, (sources.clone(), ids.clone()));
-                app.studio_anime_ids = ids;
-                app.current_sources = Some(sources);
-            }
-            Err(e) => app.set_error_status(format!("Помилка джерел: {}", e)),
-        }
-    }
-}
-
-/// Збагачує список TV-членів через AniList: знаходить нові TV IDs з іншими назвами.
-/// Повертає extra_tv: Vec<(anihub_id, year, anilist_id)>.
-async fn augment_franchise_with_anilist(
-    app: &mut AppState,
-    current_tv_ids: &[u32],
-    representative_id: u32,
-) -> Vec<(u32, u32, u32)> {
-    // Якщо є відомий anilist_id у першого TV-члена — використовуємо ID-based BFS,
-    // він надійніший: обходить граф починаючи з точного запису, а не пошуку за назвою.
-    let first_known_al_id = current_tv_ids
-        .iter()
-        .filter_map(|&id| {
-            app.search_results
-                .iter()
-                .find(|a| a.id == id)
-                .and_then(|a| a.anilist_id)
-        })
-        .next();
-
-    let anilist_members = if let Some(cached) = app.anilist_cache.get(&representative_id) {
-        cached.clone()
-    } else {
-        let members = if let Some(al_id) = first_known_al_id {
-            api::anilist::get_franchise_members_by_id(app.api_client.http_client(), al_id).await
-        } else {
-            let title_original = app
-                .search_results
-                .iter()
-                .find(|a| a.id == representative_id)
-                .and_then(|a| a.title_original.clone())
-                .unwrap_or_default();
-            if title_original.is_empty() {
-                return Vec::new();
-            }
-            api::anilist::get_franchise_members(app.api_client.http_client(), &title_original).await
-        };
-        if !members.is_empty() {
-            app.anilist_cache.insert(representative_id, members.clone());
-        }
-        members
-    };
-
-    if anilist_members.is_empty() {
-        return Vec::new();
-    }
-
-    let mut extra_tv: Vec<(u32, u32, u32)> = Vec::new();
-
-    for member in &anilist_members {
-        if !member.is_tv {
-            continue; // лише справжні TV-серіали; фільми/ONA — окремі записи
-        }
-        let anihub_id = match find_anihub_id(&app.search_results, &app.api_client, member).await {
-            Some(id) => id,
-            None => continue,
-        };
-        if current_tv_ids.contains(&anihub_id) {
-            continue;
-        }
-        let year = app
-            .search_results
-            .iter()
-            .find(|a| a.id == anihub_id)
-            .and_then(|a| a.year)
-            .or_else(|| app.details_cache.get(&anihub_id).and_then(|d| d.year))
-            .unwrap_or(9999);
-        if !extra_tv.iter().any(|(id, _, _)| *id == anihub_id) {
-            extra_tv.push((anihub_id, year, member.anilist_id));
-        }
-    }
-
-    extra_tv
-}
-
-async fn augment_library_franchise_with_anilist(
-    app: &mut AppState,
-    current_tv_ids: &[u32],
-    representative_id: u32,
-) -> Vec<(u32, u32, u32)> {
-    let mut first_known_al_id: Option<u32> = None;
-    let mut fallback_title_original: Option<String> = None;
-
-    for &id in current_tv_ids {
-        let details = if let Some(cached) = app.details_cache.get(&id).cloned() {
-            Some(cached)
-        } else if let Ok(details) = app.api_client.get_anime_details(id).await {
-            app.details_cache.insert(id, details.clone());
-            Some(details)
-        } else {
-            None
-        };
-
-        if first_known_al_id.is_none() {
-            first_known_al_id = details.as_ref().and_then(|d| d.anilist_id);
-        }
-        if fallback_title_original.is_none() {
-            fallback_title_original = details.as_ref().and_then(|d| d.title_original.clone());
-        }
-    }
-
-    let anilist_members = if let Some(cached) = app.anilist_cache.get(&representative_id) {
-        cached.clone()
-    } else {
-        let members = if let Some(al_id) = first_known_al_id {
-            api::anilist::get_franchise_members_by_id(app.api_client.http_client(), al_id).await
-        } else if let Some(title_original) = fallback_title_original {
-            api::anilist::get_franchise_members(app.api_client.http_client(), &title_original).await
-        } else {
-            Vec::new()
-        };
-        if !members.is_empty() {
-            app.anilist_cache.insert(representative_id, members.clone());
-        }
-        members
-    };
-
-    if anilist_members.is_empty() {
-        return Vec::new();
-    }
-
-    let known_ids = current_tv_ids
-        .iter()
-        .copied()
-        .collect::<std::collections::HashSet<_>>();
-    let mut extra_tv: Vec<(u32, u32, u32)> = Vec::new();
-
-    for member in &anilist_members {
-        if !member.is_tv {
-            continue;
-        }
-        if let Ok(Some(anime_id)) = app
-            .api_client
-            .get_anime_by_anilist_id(member.anilist_id)
-            .await
-        {
-            if known_ids.contains(&anime_id) || extra_tv.iter().any(|(id, _, _)| *id == anime_id) {
-                continue;
-            }
-            extra_tv.push((anime_id, 0, member.anilist_id));
-        }
-    }
-
-    extra_tv
-}
-
-/// Шукає anihub ID для AniList-члена франшизи.
-/// Стратегія (у порядку пріоритету):
-///   1. Точний збіг anilist_id у search_results (без HTTP)
-///   2. Прямий API-запит ?anilist_id=X (надійний)
-/// Title-matching навмисно прибрано: може дати хибний збіг (підрядок у тизері тощо).
-async fn find_anihub_id(
-    search_results: &[api::AnimeItem],
-    client: &api::ApiClient,
-    member: &api::anilist::FranchiseMember,
-) -> Option<u32> {
-    // 1. Точний anilist_id серед вже завантажених результатів
-    for item in search_results {
-        if item.anilist_id == Some(member.anilist_id) {
-            return Some(item.id);
-        }
-    }
-    // 2. Прямий API-запит за anilist_id
-    client
-        .get_anime_by_anilist_id(member.anilist_id)
-        .await
-        .ok()
-        .flatten()
-}
 
 /// Python-скрипт для Playwright: відкриває iframe сторінку headless Firefox,
 /// перехоплює перший мережевий запит до `s.moonanime.art/*.m3u8` і виводить URL у stdout.
@@ -2189,7 +1544,7 @@ fn get_first_tv_id(app: &ui::AppState) -> Option<u32> {
 fn get_next_episode(app: &AppState, current: &(u32, String, u32, u32, String)) -> Option<PlayTarget> {
     let (current_anime_id, current_title, current_season, current_episode, current_studio) = current;
     
-    let sources = app.sources_cache.get(current_anime_id).or_else(|| app.current_sources.as_ref())?;
+    let sources = app.sources_cache.get(current_anime_id).or_else(|| app.current_sources.clone())?;
     
     // Check if the current studio data is present
     let mut seasons: Vec<u32> = sources.ashdi.iter().map(|s| s.season_number).collect();

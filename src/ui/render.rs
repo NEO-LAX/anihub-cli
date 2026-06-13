@@ -230,7 +230,7 @@ fn render_sidebar_title_area(
     if let Some(d) = sidebar_details_override(app) {
         lines.push(
             Line::from(Span::styled(
-                d.title_ukrainian.as_str(),
+                d.title_ukrainian.clone(),
                 Style::default()
                     .fg(COLOR_SECONDARY)
                     .add_modifier(Modifier::BOLD),
@@ -239,7 +239,7 @@ fn render_sidebar_title_area(
         );
         if let Some(eng) = &d.title_english {
             lines.push(
-                Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
                     .alignment(Alignment::Center),
             );
         }
@@ -256,7 +256,7 @@ fn render_sidebar_title_area(
             );
             if let Some(eng) = &item.title_english {
                 lines.push(
-                    Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                    Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
                         .alignment(Alignment::Center),
                 );
             }
@@ -287,7 +287,7 @@ fn render_sidebar_details_area(
         if include_title {
             text.push(
                 Line::from(Span::styled(
-                    d.title_ukrainian.as_str(),
+                    d.title_ukrainian.clone(),
                     Style::default()
                         .fg(COLOR_SECONDARY)
                         .add_modifier(Modifier::BOLD),
@@ -296,7 +296,7 @@ fn render_sidebar_details_area(
             );
             if let Some(eng) = &d.title_english {
                 text.push(
-                    Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                    Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
                         .alignment(Alignment::Center),
                 );
             }
@@ -306,7 +306,7 @@ fn render_sidebar_details_area(
         text.push(
             Line::from(vec![
                 Span::styled("Тип: ", Style::default().fg(COLOR_DIM)),
-                Span::styled(d.anime_type.as_str(), Style::default().fg(COLOR_TEXT)),
+                Span::styled(d.anime_type.clone(), Style::default().fg(COLOR_TEXT)),
             ])
             .alignment(Alignment::Center),
         );
@@ -390,7 +390,7 @@ fn render_sidebar_details_area(
                 );
                 if let Some(eng) = &item.title_english {
                     text.push(
-                        Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                        Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
                             .alignment(Alignment::Center),
                     );
                 }
@@ -449,7 +449,7 @@ fn render_sidebar_details_area(
 
             let details = app.details_cache.get(&item.id).or_else(|| {
                 if app.sidebar_anime_idx.is_none() {
-                    app.current_details.as_ref()
+                    app.current_details.clone()
                 } else {
                     None
                 }
@@ -667,7 +667,7 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             }
             if let Some(eng) = &rep.title_english {
                 lines.push(Line::from(Span::styled(
-                    eng.as_str(),
+                    eng.clone(),
                     Style::default().fg(COLOR_DIM),
                 )));
             }
@@ -1060,7 +1060,7 @@ fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) 
         );
         if let Some(eng) = &details.title_english {
             lines.push(
-                Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
                     .alignment(Alignment::Center),
             );
         }
@@ -1106,7 +1106,7 @@ fn render_library_sidebar_details_area(
             );
             if let Some(eng) = &details.title_english {
                 text.push(
-                    Line::from(Span::styled(eng.as_str(), Style::default().fg(COLOR_DIM)))
+                    Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
                         .alignment(Alignment::Center),
                 );
             }
@@ -1526,12 +1526,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 /// Повертає `current_details` якщо поточний сезон належить аніме, якого немає в `search_results`
 /// (наприклад, S4 доданий на anihub але без `has_ukrainian_dub`, тому не потрапив у пошук).
 /// Використовується в sidebar для відображення правильних метаданих замість репрезентанта.
-fn sidebar_details_override(app: &AppState) -> Option<&api::AnimeDetails> {
+fn sidebar_details_override(app: &AppState) -> Option<api::AnimeDetails> {
     // Якщо sidebar_anime_idx встановлений — аніме є в search_results, нічого перевизначати
     if app.sidebar_anime_idx.is_some() {
         return None;
     }
-    let details = app.current_details.as_ref()?;
+    let details = app.current_details.clone()?;
     // ID репрезентанта групи (той, що показується по замовчуванню)
     let rep_id = app
         .selected_result_index
