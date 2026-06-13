@@ -170,24 +170,6 @@ impl ApiClient {
     /// Пошук аніме за AniList ID без фільтру has_ukrainian_dub.
     /// Повертає перший знайдений anihub anime_id або None.
     /// Використовується для отримання метаданих сезонів, які ще не мають плеєрів.
-    pub async fn get_anime_by_anilist_id_any(&self, anilist_id: u32) -> Result<Option<u32>> {
-        let url = format!(
-            "{}/anime/?anilist_id={}&page_size=1",
-            API_BASE_URL, anilist_id
-        );
-        let api_key = self.generate_api_key();
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-Key", api_key)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-        let search_response: AnimeSearchResponse = response.json().await?;
-        Ok(search_response.items.into_iter().next().map(|a| a.id))
-    }
 
     pub async fn fetch_poster(&self, url: &str) -> Result<image::DynamicImage> {
         let bytes = self.client.get(url).send().await?.bytes().await?;
