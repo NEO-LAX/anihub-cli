@@ -1,7 +1,7 @@
 use crate::api::anilist::FranchiseMember;
 use crate::api::{self, AnimeDetails, AnimeItem, ApiClient, AshdiStudio, EpisodeSourcesResponse};
-use crate::storage::{AppHistory, StorageManager, WatchProgress};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crate::storage::{AppHistory, EpisodeWatchedUpdate, StorageManager, WatchProgress};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
@@ -24,6 +24,7 @@ pub enum AppMode {
 }
 
 #[derive(PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum FocusPanel {
     SearchList,
     SeasonList,
@@ -61,6 +62,10 @@ pub struct LibrarySeasonEntry {
     pub season: u32,
     pub episodes: Vec<WatchProgress>,
 }
+
+pub type PrefetchResult = (u32, Option<AnimeDetails>, Option<EpisodeSourcesResponse>);
+pub type CombinedSourcesResult = Option<(EpisodeSourcesResponse, Vec<u32>)>;
+pub type HistoryIndexes = (HashSet<(u32, u32, u32)>, HashMap<(u32, u32, u32), f64>);
 
 pub struct AppState {
     pub mode: AppMode,
@@ -131,8 +136,7 @@ pub struct AppState {
     pub details_cache: moka::sync::Cache<u32, AnimeDetails>,
     pub sources_cache: moka::sync::Cache<u32, EpisodeSourcesResponse>,
     pub prefetching: bool,
-    pub prefetch_rx:
-        Option<mpsc::Receiver<(u32, Option<AnimeDetails>, Option<EpisodeSourcesResponse>)>>,
+    pub prefetch_rx: Option<mpsc::Receiver<PrefetchResult>>,
     pub preload_abort: Option<AbortHandle>,
     pub pending_prefetch_ids: Option<Vec<u32>>,
 
@@ -148,7 +152,7 @@ pub struct AppState {
     /// Заповнюється після першого `load_combined_sources`/`load_library_combined_sources`.
     /// Наступні навігації до тої ж групи використовують кеш і не роблять жодних запитів.
     pub combined_sources_cache: moka::sync::Cache<u32, (EpisodeSourcesResponse, Vec<u32>)>,
-    pub combined_sources_rx: Option<tokio::sync::mpsc::Receiver<Option<(EpisodeSourcesResponse, Vec<u32>)>>>,
+    pub combined_sources_rx: Option<tokio::sync::mpsc::Receiver<CombinedSourcesResult>>,
     /// Канал для отримання AniList-результатів фонового prefetch.
     /// Кожне повідомлення: (representative_id, members).
     pub anilist_prefetch_rx: Option<mpsc::Receiver<(u32, Vec<FranchiseMember>)>>,
@@ -164,7 +168,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(picker: Picker) -> anyhow::Result<Self> {
         let storage = StorageManager::new()?;
-        let history = storage.load_history().unwrap_or_default();
+        let history = storage.load_history()?;
         let (watched_index, progress_index) = Self::build_history_indexes(&history);
 
         Ok(Self {
@@ -248,9 +252,7 @@ impl AppState {
     /// Будує O(1) індекси з AppHistory.
     /// watched_index: (anime_id, season, episode) — переглянуті серії.
     /// progress_index: (anime_id, season, episode) → timestamp — серії в процесі (>= 10s, не watched).
-    pub fn build_history_indexes(
-        history: &AppHistory,
-    ) -> (HashSet<(u32, u32, u32)>, HashMap<(u32, u32, u32), f64>) {
+    pub fn build_history_indexes(history: &AppHistory) -> HistoryIndexes {
         let mut watched = HashSet::new();
         let mut progress = HashMap::new();
         for p in history.progress.values() {
@@ -371,6 +373,12 @@ impl AppState {
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        self.should_quit = true;
+                        return Ok(());
+                    }
                     if self.show_help {
                         self.show_help = false;
                         return Ok(());
@@ -381,11 +389,11 @@ impl AppState {
                     }
                     self.clear_info_status();
 
-                    if self.mode != AppMode::SearchInput {
-                        if key.code == KeyCode::Char('?') || key.code == KeyCode::Char('h') {
-                            self.show_help = true;
-                            return Ok(());
-                        }
+                    if self.mode != AppMode::SearchInput
+                        && (key.code == KeyCode::Char('?') || key.code == KeyCode::Char('h'))
+                    {
+                        self.show_help = true;
+                        return Ok(());
                     }
 
                     match self.mode {
@@ -491,20 +499,23 @@ impl AppState {
                 AppMode::LibrarySeason | AppMode::LibraryDubbing | AppMode::LibraryEpisode => {
                     self.selected_season_num()
                         .and_then(|sn| {
-                            self.studios_for_season(sn)
-                                .iter()
-                                .find_map(|studio| {
-                                    if anime.anime_ids.contains(&studio.id) { // Not quite right, but we need the seasonal ID
-                                         Some(studio.id)
-                                    } else { None }
-                                })
+                            self.studios_for_season(sn).iter().find_map(|studio| {
+                                if anime.anime_ids.contains(&studio.id) {
+                                    // Not quite right, but we need the seasonal ID
+                                    Some(studio.id)
+                                } else {
+                                    None
+                                }
+                            })
                         })
                         .unwrap_or(anime.latest_progress.anime_id)
                 }
-                _ => anime.latest_progress.anime_id
+                _ => anime.latest_progress.anime_id,
             };
-            
-            let slug = self.details_cache.get(&anime_id)
+
+            let slug = self
+                .details_cache
+                .get(&anime_id)
                 .map(|d| d.slug.clone())
                 .unwrap_or_default();
             Some((anime_id, anime.anime_title.clone(), slug))
@@ -514,7 +525,7 @@ impl AppState {
                 FocusPanel::SeasonList | FocusPanel::DubbingList | FocusPanel::EpisodeList => {
                     self.search_selected_season_anime_id()
                 }
-                _ => None
+                _ => None,
             };
 
             if let Some(id) = anime_id {
@@ -544,7 +555,13 @@ impl AppState {
     pub fn open_in_browser(&mut self) {
         if let Some((id, title, _)) = self.get_current_anime_context() {
             let url = format!("https://anihub.in.ua/anime/{}", id);
-            if std::process::Command::new("xdg-open").arg(&url).spawn().is_ok() {
+            let command =
+                crate::platform::browser_open_command(crate::platform::Platform::current(), &url);
+            if std::process::Command::new(command.program)
+                .args(command.args)
+                .spawn()
+                .is_ok()
+            {
                 self.set_info_status(format!("Відкрито в браузері: {}", title));
             } else {
                 self.set_error_status("Не вдалося відкрити браузер");
@@ -597,7 +614,7 @@ impl AppState {
                     let has_seasons = self
                         .current_sources
                         .as_ref()
-                        .map_or(false, |s| !s.ashdi.is_empty());
+                        .is_some_and(|s| !s.ashdi.is_empty());
                     let seasons = self.unique_seasons();
                     if has_seasons && !seasons.is_empty() {
                         self.selected_season_index = Some(0);
@@ -643,7 +660,7 @@ impl AppState {
             FocusPanel::DubbingList => {
                 let has_episodes = self
                     .selected_studio()
-                    .map_or(false, |s| !s.episodes.is_empty());
+                    .is_some_and(|s| !s.episodes.is_empty());
                 if has_episodes {
                     self.selected_episode_index = Some(0);
                     self.episode_list_state.select(Some(0));
@@ -1277,7 +1294,7 @@ impl AppState {
                 match self.storage.delete_anime_progresses(&anime_ids) {
                     Ok(()) => {
                         self.history = self.storage.load_history().unwrap_or_default();
-                self.rebuild_history_indexes();
+                        self.rebuild_history_indexes();
                         self.reload_library_after_mutation();
                         self.set_info_status(format!("Прогрес для \"{}\" видалено", anime_title));
                     }
@@ -1294,16 +1311,13 @@ impl AppState {
     }
 
     fn delete_library_selection(&mut self) {
-        match self.mode {
-            AppMode::Library => {
-                if let Some(anime) = self.library_selected_anime() {
-                    if !anime.anime_ids.is_empty() {
-                        self.pending_delete_confirmation =
-                            Some((anime.anime_ids.clone(), anime.anime_title.clone()));
-                    }
+        if self.mode == AppMode::Library {
+            if let Some(anime) = self.library_selected_anime() {
+                if !anime.anime_ids.is_empty() {
+                    self.pending_delete_confirmation =
+                        Some((anime.anime_ids.clone(), anime.anime_title.clone()));
                 }
             }
-            _ => {}
         }
     }
 
@@ -1328,7 +1342,11 @@ impl AppState {
                 };
 
                 let mut target_episodes = Vec::new();
-                for studio in sources.ashdi.iter().filter(|s| s.season_number == season_num) {
+                for studio in sources
+                    .ashdi
+                    .iter()
+                    .filter(|s| s.season_number == season_num)
+                {
                     for episode in &studio.episodes {
                         target_episodes.push((studio.studio_name.clone(), episode.episode_number));
                     }
@@ -1341,38 +1359,37 @@ impl AppState {
                 }
 
                 let has_any_real_progress = target_episodes.iter().any(|(studio_name, episode)| {
-                    let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, *episode, studio_name);
-                    self.history.progress.get(&key).is_some_and(|p| p.watched || p.timestamp >= 10.0)
+                    let key = crate::storage::StorageManager::make_progress_key(
+                        anime_id,
+                        season_num,
+                        *episode,
+                        studio_name,
+                    );
+                    self.history
+                        .progress
+                        .get(&key)
+                        .is_some_and(|p| p.watched || p.timestamp >= 10.0)
                 });
                 let mark_watched = !has_any_real_progress;
 
-                for (studio_name, episode_number) in &target_episodes {
-                    let result = if mark_watched {
-                        self.storage.set_episode_watched(
-                            anime_id,
-                            &anime_title,
-                            season_num,
-                            *episode_number,
-                            studio_name,
-                            true,
-                        )
-                    } else {
-                        self.storage.set_episode_watched(
-                            anime_id,
-                            &anime_title,
-                            season_num,
-                            *episode_number,
-                            studio_name,
-                            false,
-                        )
-                    };
-                    if let Err(e) = result {
+                let updates = target_episodes
+                    .iter()
+                    .map(|(studio_name, episode_number)| EpisodeWatchedUpdate {
+                        anime_id,
+                        anime_title: anime_title.clone(),
+                        season: season_num,
+                        episode: *episode_number,
+                        studio_name: studio_name.clone(),
+                        watched: mark_watched,
+                    })
+                    .collect::<Vec<_>>();
+                match self.storage.set_episodes_watched(&updates) {
+                    Ok(history) => self.history = history,
+                    Err(e) => {
                         self.set_error_status(format!("Не вдалося оновити сезон: {}", e));
                         return;
                     }
                 }
-
-                self.history = self.storage.load_history().unwrap_or_default();
                 self.rebuild_history_indexes();
                 self.reload_library_after_mutation();
                 self.mode = if matches!(self.mode, AppMode::LibraryDubbing) {
@@ -1403,14 +1420,20 @@ impl AppState {
                     return;
                 };
                 let studio_name = selected_studio.studio_name.clone();
-                let Some(episode_number) = self.selected_episode_index
+                let Some(episode_number) = self
+                    .selected_episode_index
                     .and_then(|ep_idx| selected_studio.episodes.get(ep_idx))
                     .map(|episode| episode.episode_number)
                 else {
                     return;
                 };
 
-                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number, &studio_name);
+                let key = crate::storage::StorageManager::make_progress_key(
+                    anime_id,
+                    season_num,
+                    episode_number,
+                    &studio_name,
+                );
                 let current_progress = self.history.progress.get(&key).cloned();
 
                 let result = match current_progress.as_ref() {
@@ -1423,8 +1446,12 @@ impl AppState {
                         false,
                     ),
                     Some(progress) if progress.timestamp >= 10.0 && progress.timestamp < 1200.0 => {
-                        self.storage
-                            .reset_episode_progress(anime_id, season_num, episode_number, &studio_name)
+                        self.storage.reset_episode_progress(
+                            anime_id,
+                            season_num,
+                            episode_number,
+                            &studio_name,
+                        )
                     }
                     _ => self.storage.set_episode_watched(
                         anime_id,
@@ -1439,7 +1466,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.history = self.storage.load_history().unwrap_or_default();
-                self.rebuild_history_indexes();
+                        self.rebuild_history_indexes();
                         self.reload_library_after_mutation();
                         self.mode = AppMode::LibraryEpisode;
                         let message = match current_progress.as_ref() {
@@ -1522,7 +1549,11 @@ impl AppState {
                     return;
                 };
                 let mut target_episodes = Vec::new();
-                for studio in sources.ashdi.iter().filter(|s| s.season_number == season_num) {
+                for studio in sources
+                    .ashdi
+                    .iter()
+                    .filter(|s| s.season_number == season_num)
+                {
                     for episode in &studio.episodes {
                         target_episodes.push((studio.studio_name.clone(), episode.episode_number));
                     }
@@ -1543,21 +1574,24 @@ impl AppState {
                     })
                 });
 
-                for (studio_name, episode_number) in &target_episodes {
-                    let result = self.storage.set_episode_watched(
+                let updates = target_episodes
+                    .iter()
+                    .map(|(studio_name, episode_number)| EpisodeWatchedUpdate {
                         anime_id,
-                        &anime_title,
-                        season_num,
-                        *episode_number,
-                        studio_name,
-                        !all_watched,
-                    );
-                    if let Err(e) = result {
+                        anime_title: anime_title.clone(),
+                        season: season_num,
+                        episode: *episode_number,
+                        studio_name: studio_name.clone(),
+                        watched: !all_watched,
+                    })
+                    .collect::<Vec<_>>();
+                match self.storage.set_episodes_watched(&updates) {
+                    Ok(history) => self.history = history,
+                    Err(e) => {
                         self.set_error_status(format!("Не вдалося оновити сезон: {}", e));
                         return;
                     }
                 }
-                self.history = self.storage.load_history().unwrap_or_default();
                 self.rebuild_history_indexes();
                 self.set_info_status(if all_watched {
                     format!("Сезон {} позначено як непереглянутий", season_num)
@@ -1573,7 +1607,12 @@ impl AppState {
                 let Some(episode_number) = self.selected_episode_number() else {
                     return;
                 };
-                let key = crate::storage::StorageManager::make_progress_key(anime_id, season_num, episode_number, &studio_name);
+                let key = crate::storage::StorageManager::make_progress_key(
+                    anime_id,
+                    season_num,
+                    episode_number,
+                    &studio_name,
+                );
                 let current_progress = self.history.progress.get(&key).cloned();
                 let result = match current_progress.as_ref() {
                     Some(progress) if progress.watched => self.storage.set_episode_watched(
@@ -1585,8 +1624,12 @@ impl AppState {
                         false,
                     ),
                     Some(progress) if progress.timestamp >= 10.0 && progress.timestamp < 1200.0 => {
-                        self.storage
-                            .reset_episode_progress(anime_id, season_num, episode_number, &studio_name)
+                        self.storage.reset_episode_progress(
+                            anime_id,
+                            season_num,
+                            episode_number,
+                            &studio_name,
+                        )
                     }
                     _ => self.storage.set_episode_watched(
                         anime_id,
@@ -1600,7 +1643,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.history = self.storage.load_history().unwrap_or_default();
-                self.rebuild_history_indexes();
+                        self.rebuild_history_indexes();
                     }
                     Err(e) => self.set_error_status(format!("Не вдалося оновити серію: {}", e)),
                 }
@@ -1631,9 +1674,9 @@ impl AppState {
         self.library_anime_list_state
             .select(self.library_anime_index);
 
-        if self.library_items.is_empty() {
-            self.mode = AppMode::Library;
-        } else if self.mode != AppMode::Library && self.library_selected_anime().is_none() {
+        if self.library_items.is_empty()
+            || (self.mode != AppMode::Library && self.library_selected_anime().is_none())
+        {
             self.mode = AppMode::Library;
         }
 

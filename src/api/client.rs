@@ -1,118 +1,323 @@
-use super::models::{AnimeDetails, AnimeItem, AnimeSearchResponse, EpisodeSourcesResponse};
+#![allow(dead_code)]
+
+use super::models::{
+    AnimeDetails, AnimeItem, AnimeSearchResponse, AshdiEpisode, AshdiStudio, EpisodeSourcesResponse,
+};
 use anyhow::{Context, Result};
-use chrono::Utc;
-use reqwest::{Client, header};
+use chrono::{DateTime, Utc};
+use reqwest::{Client, RequestBuilder, Response, header};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use thiserror::Error;
 
 const API_BASE_URL: &str = "https://api.anihub.in.ua";
 const INTERNAL_API_BASE_URL: &str = "https://anihub.in.ua/api";
+const SEARCH_PAGE_SIZE: u32 = 20;
+const MAX_SEARCH_PAGES: u32 = 100;
+const MAX_CONCURRENT_REQUESTS: usize = 3;
+const MAX_REQUEST_STARTS: usize = 40;
+const REQUEST_WINDOW: Duration = Duration::from_secs(60);
+
+struct RequestGate {
+    concurrency: Arc<tokio::sync::Semaphore>,
+    starts: tokio::sync::Mutex<VecDeque<Instant>>,
+}
+
+impl RequestGate {
+    fn new() -> Self {
+        Self {
+            concurrency: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            starts: tokio::sync::Mutex::new(VecDeque::new()),
+        }
+    }
+
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("AniHub request semaphore is never closed");
+        loop {
+            let delay = {
+                let mut starts = self.starts.lock().await;
+                let now = Instant::now();
+                while starts
+                    .front()
+                    .is_some_and(|started| now.duration_since(*started) >= REQUEST_WINDOW)
+                {
+                    starts.pop_front();
+                }
+                if starts.len() < MAX_REQUEST_STARTS {
+                    starts.push_back(now);
+                    None
+                } else {
+                    starts
+                        .front()
+                        .map(|started| REQUEST_WINDOW.saturating_sub(now.duration_since(*started)))
+                }
+            };
+            match delay {
+                None => return permit,
+                Some(delay) => tokio::time::sleep(delay).await,
+            }
+        }
+    }
+}
+
+/// Errors produced while talking to an AniHub HTTP endpoint.
+///
+/// The worker uses the status and retry-after information to decide whether a
+/// request is safe to retry.  The public API still returns `anyhow::Result`
+/// for compatibility with the existing application code; callers can
+/// downcast an error to this type when they need structured information.
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("{operation}: HTTP status {status}")]
+    Http {
+        operation: String,
+        status: u16,
+        retry_after: Option<Duration>,
+    },
+    #[error("{operation}: request failed: {source}")]
+    Transport {
+        operation: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("{operation}: response JSON could not be parsed: {message}")]
+    Parse { operation: String, message: String },
+    #[error("{operation}: response body could not be decoded: {message}")]
+    Decode { operation: String, message: String },
+}
+
+impl ApiError {
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(*status),
+            Self::Transport { .. } | Self::Parse { .. } | Self::Decode { .. } => None,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            Self::Transport { .. } | Self::Parse { .. } | Self::Decode { .. } => None,
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.status() == Some(404)
+    }
+
+    pub fn is_transient(&self) -> bool {
+        match self.status() {
+            Some(429) | Some(500..=599) => true,
+            None => matches!(self, Self::Transport { .. }),
+            Some(_) => false,
+        }
+    }
+}
+
+/// A single season request that failed while other season requests may have
+/// succeeded.  A failure is retained instead of being silently discarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeasonSourceFailure {
+    pub season: u32,
+    pub message: String,
+}
+
+/// Error returned when at least one of seasons 1..=8 failed.  The partial
+/// response is available to callers that want to display usable results while
+/// still reporting the failed seasons.
+#[derive(Debug)]
+pub struct EpisodeSourcesAggregateError {
+    pub anime_id: u32,
+    pub failures: Vec<SeasonSourceFailure>,
+    pub partial: EpisodeSourcesResponse,
+}
+
+impl fmt::Display for EpisodeSourcesAggregateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let seasons = self
+            .failures
+            .iter()
+            .map(|failure| failure.season.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "failed to load season(s) {seasons} for anime {}",
+            self.anime_id
+        )
+    }
+}
+
+impl std::error::Error for EpisodeSourcesAggregateError {}
 
 #[derive(Clone)]
 pub struct ApiClient {
     client: Client,
+    api_base_url: String,
+    internal_api_base_url: String,
+    request_gate: Arc<RequestGate>,
 }
 
 impl ApiClient {
-    pub fn http_client(&self) -> &reqwest::Client {
+    /// Build a production client using the real AniHub endpoints.
+    pub fn new() -> Result<Self> {
+        Self::with_base_urls(API_BASE_URL, INTERNAL_API_BASE_URL)
+    }
+
+    /// Build a client with injectable public and internal API bases.
+    ///
+    /// This is intentionally a constructor rather than a mutable setter so a
+    /// cloned client cannot accidentally switch endpoints underneath an
+    /// in-flight request.
+    pub fn with_base_urls(
+        api_base_url: impl AsRef<str>,
+        internal_api_base_url: impl AsRef<str>,
+    ) -> Result<Self> {
+        let client = build_http_client().context("Failed to build HTTP client")?;
+        Self::from_client(client, api_base_url, internal_api_base_url)
+    }
+
+    /// Alias useful in tests and by downstream callers that prefer a `new_*`
+    /// constructor name.
+    pub fn new_with_base_urls(
+        api_base_url: impl AsRef<str>,
+        internal_api_base_url: impl AsRef<str>,
+    ) -> Result<Self> {
+        Self::with_base_urls(api_base_url, internal_api_base_url)
+    }
+
+    /// Build a client around an already configured reqwest client.
+    pub fn from_client(
+        client: Client,
+        api_base_url: impl AsRef<str>,
+        internal_api_base_url: impl AsRef<str>,
+    ) -> Result<Self> {
+        Ok(Self {
+            client,
+            api_base_url: normalize_base_url(api_base_url.as_ref())?,
+            internal_api_base_url: normalize_base_url(internal_api_base_url.as_ref())?,
+            request_gate: Arc::new(RequestGate::new()),
+        })
+    }
+
+    pub fn http_client(&self) -> &Client {
         &self.client
     }
 
-    pub fn new() -> Result<Self> {
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-        );
-        headers.insert(
-            header::ACCEPT,
-            header::HeaderValue::from_static("application/json"),
-        );
+    pub fn api_base_url(&self) -> &str {
+        &self.api_base_url
+    }
 
-        let client = Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(6)
-            .build()
-            .context("Failed to build HTTP client")?;
-
-        Ok(Self { client })
+    pub fn internal_api_base_url(&self) -> &str {
+        &self.internal_api_base_url
     }
 
     fn generate_api_key(&self) -> String {
         let date_str = Utc::now().format("%Y-%m-%d").to_string();
-        let key_str = format!("Ukr@in1anAn1me-S3curity-Key-2025_{}", date_str);
+        let key_str = format!("Ukr@in1anAn1me-S3curity-Key-2025_{date_str}");
 
         let mut hasher = Sha256::new();
         hasher.update(key_str.as_bytes());
-        let result = hasher.finalize();
-
-        hex::encode(result)
+        hex::encode(hasher.finalize())
     }
 
-    pub async fn search_anime(&self, query: &str) -> Result<Vec<AnimeItem>> {
-        // anihub search — точний substring match. Якщо запит містить ':', шукаємо лише
-        // за частиною до двокрапки: "Mushoku Tensei: Jobless..." → "Mushoku Tensei".
-        let safe_query = if let Some(p) = query.find(':') {
-            query[..p].trim().replace('?', "")
-        } else {
-            query.replace('?', "")
-        };
-        let url = format!("{}/anime/?search={}", API_BASE_URL, safe_query);
-        let api_key = self.generate_api_key();
+    fn api_url(&self, path: &str) -> String {
+        format!("{}/{}", self.api_base_url, path.trim_start_matches('/'))
+    }
 
-        let response = self
-            .client
-            .get(&url)
-            .header("X-API-Key", api_key)
+    fn internal_api_url(&self, path: &str) -> String {
+        format!(
+            "{}/{}",
+            self.internal_api_base_url,
+            path.trim_start_matches('/')
+        )
+    }
+
+    fn authenticated(&self, request: RequestBuilder) -> RequestBuilder {
+        request.header("X-API-Key", self.generate_api_key())
+    }
+
+    async fn send_request(&self, request: RequestBuilder, operation: &str) -> Result<Response> {
+        let _permit = self.request_gate.acquire().await;
+        request
             .send()
             .await
-            .context("Failed to send search request")?;
+            .map_err(|source| request_error(operation, source))
+    }
 
-        if !response.status().is_success() {
-            anyhow::bail!("API returned error status: {}", response.status());
+    /// Search all reported pages.  Query text is passed to reqwest's query
+    /// serializer as-is, so spaces, punctuation, Unicode, and every other
+    /// user character are encoded exactly once by the HTTP client.
+    pub async fn search_anime(&self, query: &str) -> Result<Vec<AnimeItem>> {
+        let mut page = 1u32;
+        let mut all_items = Vec::new();
+
+        loop {
+            if page > MAX_SEARCH_PAGES {
+                anyhow::bail!(
+                    "AniHub search pagination exceeded hard limit of {MAX_SEARCH_PAGES} pages"
+                );
+            }
+
+            let page_text = page.to_string();
+            let request = self
+                .authenticated(self.client.get(self.api_url("/anime/")))
+                .query(&[
+                    ("search", query),
+                    ("has_ukrainian_dub", "true"),
+                    ("page_size", "20"),
+                    ("page", page_text.as_str()),
+                ]);
+            let response = self
+                .send_request(request, "AniHub search request")
+                .await
+                .with_context(|| format!("Failed to send AniHub search request for page {page}"))?;
+
+            let response = ensure_success(response, "AniHub search")?;
+            let search_response: AnimeSearchResponse = parse_json(response, "AniHub search")
+                .await
+                .with_context(|| {
+                    format!("Failed to parse AniHub search response for page {page}")
+                })?;
+
+            all_items.extend(
+                search_response
+                    .items
+                    .into_iter()
+                    .filter(|item| item.has_ukrainian_dub),
+            );
+
+            let total_pages = search_response.total_pages.max(1);
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
         }
 
-        let search_response: AnimeSearchResponse = response
-            .json()
-            .await
-            .context("Failed to parse search response")?;
-
-        // Filter items to keep only those with Ukrainian dub
-        let filtered_items = search_response
-            .items
-            .into_iter()
-            .filter(|item| item.has_ukrainian_dub)
-            .collect();
-
-        Ok(filtered_items)
+        Ok(deduplicate_anime_by_id(all_items))
     }
 
     pub async fn get_anime_details(&self, anime_id: u32) -> Result<AnimeDetails> {
-        let url = format!("{}/anime/{}/", API_BASE_URL, anime_id);
-        let api_key = self.generate_api_key();
-
+        let request = self.authenticated(
+            self.client
+                .get(self.api_url(&format!("/anime/{anime_id}/"))),
+        );
         let response = self
-            .client
-            .get(&url)
-            .header("X-API-Key", api_key)
-            .send()
+            .send_request(request, "AniHub anime details request")
             .await
             .context("Failed to send anime details request")?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("API returned error status: {}", response.status());
-        }
-
-        let details: AnimeDetails = response
-            .json()
+        let response = ensure_success(response, "AniHub anime details")?;
+        parse_json(response, "AniHub anime details")
             .await
-            .context("Failed to parse anime details response")?;
-
-        Ok(details)
+            .context("Failed to parse anime details response")
     }
 
     pub async fn get_episode_sources(
@@ -120,178 +325,561 @@ impl ApiClient {
         anime_id: u32,
         season: u32,
     ) -> Result<EpisodeSourcesResponse> {
-        let url = format!(
-            "{}/anime/{}/episode-sources?season={}",
-            INTERNAL_API_BASE_URL, anime_id, season
+        let request = self.authenticated(
+            self.client
+                .get(self.internal_api_url(&format!("/anime/{anime_id}/episode-sources")))
+                .query(&[("season", season)]),
         );
-        let api_key = self.generate_api_key();
-
         let response = self
-            .client
-            .get(&url)
-            .header("X-API-Key", api_key)
-            .send()
+            .send_request(request, "AniHub episode sources request")
             .await
-            .context("Failed to send episode sources request")?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("API returned error status: {}", response.status());
-        }
-
-        let sources_response: EpisodeSourcesResponse = response
-            .json()
+            .with_context(|| {
+                format!(
+                    "Failed to send episode sources request for anime {anime_id}, season {season}"
+                )
+            })?;
+        let response = ensure_success(response, "AniHub episode sources")?;
+        parse_json(response, "AniHub episode sources")
             .await
-            .context("Failed to parse episode sources response")?;
-
-        Ok(sources_response)
+            .with_context(|| {
+                format!("Failed to parse episode sources for anime {anime_id}, season {season}")
+            })
     }
 
-    /// Пошук аніме за AniList ID. Повертає anihub anime_id або None.
-    /// Фільтрує тільки ті що мають українське озвучення.
+    /// Look up an AniHub id by AniList id.  Only a successful empty response
+    /// or HTTP 404 is represented as `None`; rate limits, server failures,
+    /// malformed JSON, and all other HTTP errors are returned to the caller.
     pub async fn get_anime_by_anilist_id(&self, anilist_id: u32) -> Result<Option<u32>> {
-        let url = format!(
-            "{}/anime/?anilist_id={}&page_size=1&has_ukrainian_dub=true",
-            API_BASE_URL, anilist_id
-        );
-        let api_key = self.generate_api_key();
+        let request = self
+            .authenticated(self.client.get(self.api_url("/anime/")))
+            .query(&[
+                ("anilist_id", anilist_id.to_string()),
+                ("page_size", SEARCH_PAGE_SIZE.to_string()),
+                ("has_ukrainian_dub", "true".to_string()),
+                ("page", "1".to_string()),
+            ]);
         let response = self
-            .client
-            .get(&url)
-            .header("X-API-Key", api_key)
-            .send()
-            .await?;
-        if !response.status().is_success() {
+            .send_request(request, "AniHub AniList-id lookup")
+            .await
+            .context("Failed to send AniHub AniList-id lookup")?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let search_response: AnimeSearchResponse = response.json().await?;
-        Ok(search_response.items.into_iter().next().map(|a| a.id))
+        let response = ensure_success(response, "AniHub AniList-id lookup")?;
+        let search_response: AnimeSearchResponse = parse_json(response, "AniHub AniList-id lookup")
+            .await
+            .context("Failed to parse AniHub AniList-id lookup response")?;
+        Ok(search_response
+            .items
+            .into_iter()
+            .next()
+            .map(|anime| anime.id))
     }
-
-    /// Пошук аніме за AniList ID без фільтру has_ukrainian_dub.
-    /// Повертає перший знайдений anihub anime_id або None.
-    /// Використовується для отримання метаданих сезонів, які ще не мають плеєрів.
 
     pub async fn fetch_poster(&self, url: &str) -> Result<image::DynamicImage> {
-        let bytes = self.client.get(url).send().await?.bytes().await?;
-        Ok(image::load_from_memory(&bytes)?)
+        let response = self
+            .send_request(self.client.get(url), "AniHub poster request")
+            .await
+            .context("Failed to send poster request")?;
+        let response = ensure_success(response, "AniHub poster")?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|source| request_error("AniHub poster body", source))
+            .context("Failed to read poster response")?;
+        image::load_from_memory(&bytes)
+            .map_err(|source| {
+                anyhow::Error::new(ApiError::Decode {
+                    operation: "AniHub poster".to_string(),
+                    message: source.to_string(),
+                })
+            })
+            .context("Failed to decode poster image")
     }
 
-    /// Завантажує всі доступні сезони і об'єднує студії в один список.
-    /// Ashdi — пріоритет; moonanime — fallback для сезонів без ashdi-даних.
+    /// Load seasons 1..=8 with at most three requests in flight.  Results are
+    /// placed back into season order before they are merged.  A non-404
+    /// failure is returned as an aggregate error even when other seasons
+    /// succeeded, with the usable partial result attached to that error.
     pub async fn get_episode_sources_for_anime(
         &self,
         anime_id: u32,
     ) -> Result<EpisodeSourcesResponse> {
-        let mut all_studios: Vec<super::models::AshdiStudio> = Vec::new();
-
-        // Відстежуємо перший moon iframe URL кожного сезону (без trailing slash).
-        let mut season_first_moon_url: HashMap<u32, String> = HashMap::new();
-
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
         let mut join_set = tokio::task::JoinSet::new();
 
         for season in 1u32..=8 {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let client_clone = self.clone();
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .context("Failed to acquire episode-source concurrency permit")?;
+            let client = self.clone();
             join_set.spawn(async move {
-                let result = client_clone.get_episode_sources(anime_id, season).await;
+                let result = client
+                    .get_episode_sources_if_present(anime_id, season)
+                    .await;
                 drop(permit);
                 (season, result)
             });
         }
 
-        while let Some(Ok((season, result))) = join_set.join_next().await {
+        let mut ordered: BTreeMap<u32, Result<Option<EpisodeSourcesResponse>>> = BTreeMap::new();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((season, result)) => {
+                    ordered.insert(season, result);
+                }
+                Err(error) => {
+                    ordered.insert(
+                        0,
+                        Err(anyhow::anyhow!(
+                            "season task failed while loading anime {anime_id}: {error}"
+                        )),
+                    );
+                }
+            }
+        }
+
+        let mut all_studios = Vec::<AshdiStudio>::new();
+        let mut season_first_moon_url = BTreeMap::<u32, String>::new();
+        let mut failures = Vec::<SeasonSourceFailure>::new();
+
+        for season in 1u32..=8 {
+            let Some(result) = ordered.remove(&season) else {
+                failures.push(SeasonSourceFailure {
+                    season,
+                    message: "season task produced no result".to_string(),
+                });
+                continue;
+            };
+
             match result {
-                Ok(sources) => {
+                Ok(Some(sources)) => {
                     if let Some(first_moon_ep) = sources
                         .moonanime
                         .iter()
-                        .filter_map(|m| m.episodes.first())
+                        .filter_map(|studio| studio.episodes.first())
                         .next()
                     {
-                        let normalized = first_moon_ep
-                            .iframe_url
-                            .trim_end_matches('/')
-                            .to_string();
+                        let normalized = first_moon_ep.iframe_url.trim_end_matches('/');
                         if !normalized.is_empty() {
-                            season_first_moon_url.insert(season, normalized);
+                            season_first_moon_url.insert(season, normalized.to_string());
                         }
                     }
 
                     if !sources.ashdi.is_empty() {
                         all_studios.extend(sources.ashdi);
-                    } else if !sources.moonanime.is_empty() {
-                        for moon in sources.moonanime {
+                    } else {
+                        all_studios.extend(sources.moonanime.into_iter().map(|moon| {
                             let episodes = moon
                                 .episodes
                                 .into_iter()
-                                .map(|ep| super::models::AshdiEpisode {
-                                    episode_number: ep.episode_number,
-                                    display_episode_number: ep.display_episode_number,
-                                    title: ep.title,
-                                    url: ep.iframe_url,
+                                .map(|episode| AshdiEpisode {
+                                    episode_number: episode.episode_number,
+                                    display_episode_number: episode.display_episode_number,
+                                    title: episode.title,
+                                    url: episode.iframe_url,
                                     ashdi_episode_id: String::new(),
                                 })
                                 .collect::<Vec<_>>();
-                            all_studios.push(super::models::AshdiStudio {
+                            AshdiStudio {
                                 id: moon.id,
                                 studio_name: moon.studio_name,
                                 season_number: moon.season_number,
                                 episodes,
                                 episodes_count: moon.episodes_count,
+                            }
+                        }));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(SeasonSourceFailure {
+                    season,
+                    message: format_error_chain(&error),
+                }),
+            }
+        }
+
+        // A task panic is exceptional, but retain it as a visible failure
+        // rather than letting the ordered loop silently ignore map entry 0.
+        if let Some(Err(error)) = ordered.remove(&0) {
+            failures.push(SeasonSourceFailure {
+                season: 0,
+                message: format_error_chain(&error),
+            });
+        }
+
+        if let Some(s1_url) = season_first_moon_url.get(&1).cloned() {
+            let franchise_season = season_first_moon_url
+                .iter()
+                .filter(|(season, url)| **season > 1 && **url == s1_url)
+                .map(|(season, _)| *season)
+                .max();
+
+            if let Some(franchise_season) = franchise_season {
+                for studio in &mut all_studios {
+                    if studio.season_number == 1 {
+                        studio.season_number = franchise_season;
+                    }
+                }
+                deduplicate_studios(&mut all_studios);
+            }
+        }
+
+        all_studios.sort_by(|left, right| {
+            left.season_number
+                .cmp(&right.season_number)
+                .then_with(|| left.studio_name.cmp(&right.studio_name))
+                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| right.episodes.len().cmp(&left.episodes.len()))
+        });
+
+        let partial = EpisodeSourcesResponse {
+            ashdi: all_studios,
+            moonanime: Vec::new(),
+        };
+
+        if !failures.is_empty() {
+            return Err(anyhow::Error::new(EpisodeSourcesAggregateError {
+                anime_id,
+                failures,
+                partial,
+            })
+            .context(format!(
+                "AniHub episode-source aggregation for anime {anime_id} had partial failures"
+            )));
+        }
+
+        if partial.ashdi.is_empty() {
+            anyhow::bail!("No episode sources found for anime {anime_id}");
+        }
+
+        Ok(partial)
+    }
+
+    async fn get_episode_sources_if_present(
+        &self,
+        anime_id: u32,
+        season: u32,
+    ) -> Result<Option<EpisodeSourcesResponse>> {
+        let request = self.authenticated(
+            self.client
+                .get(self.internal_api_url(&format!("/anime/{anime_id}/episode-sources")))
+                .query(&[("season", season)]),
+        );
+        let response = self
+            .send_request(request, "AniHub episode sources request")
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to send episode sources request for anime {anime_id}, season {season}"
+                )
+            })?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = ensure_success(response, "AniHub episode sources")?;
+        let sources: EpisodeSourcesResponse = parse_json(response, "AniHub episode sources")
+            .await
+            .with_context(|| {
+                format!("Failed to parse episode sources for anime {anime_id}, season {season}")
+            })?;
+        if sources.ashdi.is_empty() && sources.moonanime.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sources))
+        }
+    }
+}
+
+fn build_http_client() -> Result<Client> {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_static(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ),
+    );
+    headers.insert(
+        header::ACCEPT,
+        header::HeaderValue::from_static("application/json"),
+    );
+
+    Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(6)
+        .build()
+        .context("Failed to build HTTP client")
+}
+
+fn normalize_base_url(url: &str) -> Result<String> {
+    let normalized = url.trim_end_matches('/');
+    if normalized.is_empty() {
+        anyhow::bail!("API base URL must not be empty");
+    }
+    Ok(normalized.to_string())
+}
+
+fn request_error(operation: &str, source: reqwest::Error) -> anyhow::Error {
+    anyhow::Error::new(ApiError::Transport {
+        operation: operation.to_string(),
+        source,
+    })
+}
+
+fn ensure_success(response: Response, operation: &str) -> Result<Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    let retry_after = parse_retry_after(response.headers());
+    Err(anyhow::Error::new(ApiError::Http {
+        operation: operation.to_string(),
+        status: response.status().as_u16(),
+        retry_after,
+    }))
+}
+
+async fn parse_json<T: serde::de::DeserializeOwned>(
+    response: Response,
+    operation: &str,
+) -> Result<T> {
+    response.json::<T>().await.map_err(|source| {
+        anyhow::Error::new(ApiError::Parse {
+            operation: operation.to_string(),
+            message: source.to_string(),
+        })
+    })
+}
+
+pub(crate) fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let date = DateTime::parse_from_rfc2822(value).ok()?;
+    let until = date.with_timezone(&Utc);
+    (until - Utc::now()).to_std().ok()
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+fn deduplicate_anime_by_id(items: Vec<AnimeItem>) -> Vec<AnimeItem> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(item.id))
+        .collect()
+}
+
+fn deduplicate_studios(studios: &mut Vec<AshdiStudio>) {
+    let mut deduplicated = Vec::with_capacity(studios.len());
+    for studio in studios.drain(..) {
+        if let Some(position) = deduplicated.iter().position(|existing: &AshdiStudio| {
+            existing.season_number == studio.season_number
+                && existing.studio_name == studio.studio_name
+        }) {
+            let existing = &deduplicated[position];
+            let replace = studio.episodes.len() > existing.episodes.len()
+                || (studio.episodes.len() == existing.episodes.len() && studio.id < existing.id);
+            if replace {
+                deduplicated[position] = studio;
+            }
+        } else {
+            deduplicated.push(studio);
+        }
+    }
+    *studios = deduplicated;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct MockServer {
+        address: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        shutdown: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    }
+
+    impl MockServer {
+        async fn start<F>(handler: F) -> Self
+        where
+            F: Fn(String, String) -> (u16, String) + Send + Sync + 'static,
+        {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            let requests_for_task = requests.clone();
+            let handler = Arc::new(handler);
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accepted = listener.accept() => {
+                            let Ok((mut stream, _)) = accepted else { break };
+                            let requests = requests_for_task.clone();
+                            let handler = handler.clone();
+                            tokio::spawn(async move {
+                                let mut buffer = vec![0u8; 16 * 1024];
+                                let count = stream.read(&mut buffer).await.unwrap_or(0);
+                                let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                                let first_line = request.lines().next().unwrap_or_default().to_string();
+                                let mut parts = first_line.split_whitespace();
+                                let _method = parts.next().unwrap_or_default().to_string();
+                                let path = parts.next().unwrap_or_default().to_string();
+                                requests.lock().await.push(path.clone());
+                                let (status, body) = handler(first_line, path);
+                                let status_text = if status == 200 { "OK" } else { "ERR" };
+                                let response = format!(
+                                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(), body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
                             });
                         }
                     }
                 }
-                Err(_) => {}
+            });
+
+            Self {
+                address,
+                requests,
+                shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
             }
         }
 
-        if all_studios.is_empty() {
-            anyhow::bail!("No episode sources found for anime {}", anime_id);
+        async fn requests(&self) -> Vec<String> {
+            self.requests.lock().await.clone()
         }
 
-        // Виявляємо standalone-vs-franchise дублікати:
-        // якщо moon URL сезону 1 збігається з moon URL сезону N (N>1), то S1 — це "власна сторінка"
-        // того ж контенту що й S-N. Перейменовуємо S1-студії у правильний сезон S-N.
-        if let Some(s1_url) = season_first_moon_url.get(&1).cloned() {
-            let franchise_season = season_first_moon_url
-                .iter()
-                .filter(|(s, _)| **s > 1)
-                .filter(|(_, url)| url.as_str() == s1_url.as_str())
-                .map(|(s, _)| *s)
-                .max();
-
-            if let Some(fs) = franchise_season {
-                for s in all_studios.iter_mut() {
-                    if s.season_number == 1 {
-                        s.season_number = fs;
-                    }
-                }
-                // Після перейменування можуть бути дублікати (season_number, studio_name).
-                // Зберігаємо запис з більшою кількістю епізодів.
-                let mut deduped: Vec<super::models::AshdiStudio> = Vec::new();
-                for studio in all_studios {
-                    if let Some(pos) = deduped.iter().position(|s| {
-                        s.season_number == studio.season_number
-                            && s.studio_name == studio.studio_name
-                    }) {
-                        if studio.episodes.len() > deduped[pos].episodes.len() {
-                            deduped[pos] = studio;
-                        }
-                    } else {
-                        deduped.push(studio);
-                    }
-                }
-                all_studios = deduped;
+        async fn stop(&self) {
+            if let Some(sender) = self.shutdown.lock().await.take() {
+                let _ = sender.send(());
             }
         }
+    }
 
-        all_studios.sort_by(|a, b| a.season_number.cmp(&b.season_number));
+    fn item(id: u32, title: &str) -> AnimeItem {
+        AnimeItem {
+            id,
+            anilist_id: None,
+            slug: format!("slug-{id}"),
+            title_ukrainian: title.to_string(),
+            title_original: None,
+            title_english: None,
+            status: "FINISHED".to_string(),
+            anime_type: "TV".to_string(),
+            year: Some(2024),
+            has_ukrainian_dub: true,
+        }
+    }
 
-        Ok(EpisodeSourcesResponse {
-            ashdi: all_studios,
-            moonanime: Vec::new(),
+    fn page(items: Vec<AnimeItem>, page: u32, total_pages: u32) -> String {
+        serde_json::to_string(&AnimeSearchResponse {
+            total: items.len() as u32,
+            page,
+            page_size: 20,
+            total_pages,
+            items,
         })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_encodes_all_characters_and_follows_pages_deterministically() {
+        let server = MockServer::start(|_, path| {
+            let url = reqwest::Url::parse(&format!("http://localhost{path}"))
+                .expect("mock request path must form a valid URL");
+            let params = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            assert_eq!(
+                params.get("search"),
+                Some(&"Mushoku Tensei: S?2 + Україна".to_string())
+            );
+            assert_eq!(params.get("has_ukrainian_dub"), Some(&"true".to_string()));
+            assert_eq!(params.get("page_size"), Some(&"20".to_string()));
+            match params.get("page").map(String::as_str) {
+                Some("1") => (200, page(vec![item(1, "one"), item(2, "two")], 1, 2)),
+                Some("2") => (
+                    200,
+                    page(vec![item(2, "duplicate"), item(3, "three")], 2, 2),
+                ),
+                _ => (500, "{}".to_string()),
+            }
+        })
+        .await;
+
+        let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
+        let result = client
+            .search_anime("Mushoku Tensei: S?2 + Україна")
+            .await
+            .unwrap();
+        assert_eq!(
+            result.iter().map(|anime| anime.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("page=1"));
+        assert!(requests[1].contains("page=2"));
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn lookup_distinguishes_404_from_rate_limit_and_server_error() {
+        let server = MockServer::start(|_, path| {
+            if path.contains("anilist_id=404") {
+                return (404, "{}".to_string());
+            }
+            if path.contains("anilist_id=429") {
+                return (429, "{}".to_string());
+            }
+            if path.contains("anilist_id=500") {
+                return (500, "{}".to_string());
+            }
+            (200, page(Vec::new(), 1, 1))
+        })
+        .await;
+        let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
+
+        assert_eq!(client.get_anime_by_anilist_id(404).await.unwrap(), None);
+        let rate_limit = client.get_anime_by_anilist_id(429).await.unwrap_err();
+        let server_error = client.get_anime_by_anilist_id(500).await.unwrap_err();
+        assert_eq!(
+            rate_limit
+                .downcast_ref::<ApiError>()
+                .and_then(ApiError::status),
+            Some(429)
+        );
+        assert_eq!(
+            server_error
+                .downcast_ref::<ApiError>()
+                .and_then(ApiError::status),
+            Some(500)
+        );
+        server.stop().await;
     }
 }

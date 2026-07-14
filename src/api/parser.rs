@@ -5,11 +5,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 // Ashdi: file:'https://...m3u8' або file:"..."
-static RE_ASHDI_M3U8: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"file\s*:\s*['"](https?://[^'"]+\.m3u8)['"]"#).unwrap()
-});
-
-
+static RE_ASHDI_M3U8: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"file\s*:\s*['"](https?://[^'"]+\.m3u8)['"]"#).unwrap());
 
 pub struct AshdiParser {
     client: Client,
@@ -54,4 +51,3 @@ impl AshdiParser {
         anyhow::bail!("Could not find m3u8 link in the ashdi page")
     }
 }
-

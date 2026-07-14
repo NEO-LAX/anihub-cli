@@ -24,14 +24,14 @@ pub struct AnimeItem {
     pub has_ukrainian_dub: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct EpisodeSourcesResponse {
     pub ashdi: Vec<AshdiStudio>,
     #[serde(default)]
     pub moonanime: Vec<MoonAnimeStudio>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct MoonAnimeStudio {
     pub id: u32,
     pub studio_name: String,
@@ -40,7 +40,7 @@ pub struct MoonAnimeStudio {
     pub episodes_count: u32,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct MoonAnimeEpisode {
     pub episode_number: u32,
     pub display_episode_number: Option<f32>,
@@ -50,7 +50,7 @@ pub struct MoonAnimeEpisode {
     pub poster_url: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct AshdiStudio {
     pub id: u32,
     pub studio_name: String,
@@ -59,7 +59,7 @@ pub struct AshdiStudio {
     pub episodes_count: u32,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct AshdiEpisode {
     pub episode_number: u32,
     pub display_episode_number: Option<f32>,

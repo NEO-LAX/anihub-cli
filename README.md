@@ -1,90 +1,150 @@
-# 🎬 AniHub CLI
+# AniHub CLI
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
+AniHub CLI is an unofficial Rust terminal client for browsing and watching anime from [AniHub](https://anihub.in.ua).
 
-@unofficial Terminal client for watching anime via [AniHub](https://anihub.in.ua). Built with Rust for speed and simplicity.
+![AniHub CLI demo](assets/demo.gif)
 
-## 📺 Preview
+## Supported functionality
 
-![AniHub CLI Demo](assets/demo.gif)
+- Search AniHub by title. Results are limited to entries that currently have Ukrainian dubbing in the AniHub API.
+- Browse anime details, posters, seasons, dubbing options, and episodes.
+- Group related seasons and films deterministically and cache loaded metadata for repeated navigation.
+- Keep the interface responsive while search, posters, episode sources, and stream resolution run in bounded background workers.
+- Play Ashdi streams with `mpv` and use the MoonAnime fallback through Python Playwright and headless Firefox.
+- Save watch progress, bookmarks, and watched state in a local library, with resume support.
+- Render posters in terminals supported by `ratatui-image` and provide a Ukrainian interface.
 
----
+The application depends on the live AniHub/API and streaming pages. Search and stream availability can change when those services change.
 
-## ✨ Features
-- **Browse** the full AniHub catalog, genres, and characters.
-- **Instant Navigation:** Advanced caching and background prefetching for zero-latency browsing.
-- **Smart Flow:** Automatically skips season selection for movies and single-season entries.
-- **Rich Metadata:** View release years and detailed information instantly.
-- **Terminal Image Support:** Supports Kitty, WezTerm, and Windows Terminal.
-- **Smooth Playback:** Powered by `mpv`, `yt-dlp`, and Playwright for complex stream extraction.
-- **History & Progress:** O(1) history indexing ensures fast resume even with large libraries.
-- **Ukrainian Interface** support.
+## Installation
 
----
-
-## Quick Installation preview
-![Interface Preview](assets/script-screenshot.png)
-
-
-## 🚀 Quick Installation (Linux & macOS)
-
-Run the following command to install the latest version automatically:
+The installer supports Linux x86_64 and macOS x86_64/arm64. It downloads the matching release binary, verifies it against `SHA256SUMS`, and installs it to `~/.local/bin` by default.
 
 ```bash
-curl -fsSL "[https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh?t=$(date](https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh?t=$(date) +%s)" | bash
+curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- install
 ```
 
-*After installation, restart your terminal or run `source ~/.bashrc` (or `source ~/.zshrc`).*
+Run the installer non-interactively with `install` or `uninstall`:
 
-**Launch the app:**
 ```bash
+curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- uninstall
+```
+
+To install into another directory, set `ANIHUB_INSTALL_DIR` before running the script. The installer never removes the history directory when uninstalling.
+
+After installation, make sure the install directory is in `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 anihub-cli
 ```
 
----
+To make this permanent, add the export to `~/.profile` for bash or `~/.zprofile` for zsh, then open a new shell.
 
-## 🪟 Windows Installation
+### Release binaries
 
-1. Download `anihub-cli-windows.exe` from the [Latest Release](https://github.com/NEO-LAX/anihub-cli/releases/latest).
-2. Rename it to `anihub-cli.exe` (optional).
-3. Add the folder containing the `.exe` to your system **PATH**.
-4. Ensure you have `mpv` and `yt-dlp` installed.
+| Platform | Release asset |
+| --- | --- |
+| Linux x86_64 | `anihub-cli-x86_64-unknown-linux-gnu` |
+| macOS Intel | `anihub-cli-x86_64-apple-darwin` |
+| macOS Apple silicon | `anihub-cli-aarch64-apple-darwin` |
+| Windows x86_64 | `anihub-cli-x86_64-pc-windows-msvc.exe` |
 
-> **Recommendation:** Use [Windows Terminal](https://aka.ms/terminal) for the best experience.
+Windows users can download the Windows asset from the [latest release](https://github.com/NEO-LAX/anihub-cli/releases/latest), put it in a directory on `PATH`, and launch it from Windows Terminal or another capable terminal. The installer script itself is for Linux and macOS.
 
----
+## Runtime dependencies
 
-## 🛠 Dependencies
+### `mpv`
 
-To play all sources (including MoonAnime), you need:
-- **[mpv](https://mpv.io/)** (Media player)
-- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** (Stream handler)
-- **[Playwright](https://playwright.dev/python/)** (Required for MoonAnime stream extraction)
+`mpv` is required for episode playback. AniHub CLI starts the `mpv` executable directly, so it must be available in `PATH`.
 
-### Install commands:
+Examples:
 
-| OS | Command |
-| :--- | :--- |
-| **Arch Linux** | `sudo pacman -S mpv yt-dlp python-playwright && playwright install firefox` |
-| **Ubuntu/Debian** | `sudo apt update && sudo apt install mpv yt-dlp python3-pip && pip install playwright && playwright install firefox` |
-| **macOS** | `brew install mpv yt-dlp playwright && playwright install firefox` |
-| **Windows** | `scoop install mpv yt-dlp && pip install playwright && playwright install firefox` |
+```bash
+# Debian/Ubuntu
+sudo apt update && sudo apt install mpv
 
----
+# macOS with Homebrew
+brew install mpv
+```
 
-## 🏗 Build from Source
+### Python Playwright and Firefox
 
-1. **Install Rust:** [rustup.rs](https://rustup.rs/)
-2. **Clone and build:**
-   ```bash
-   git clone [https://github.com/NEO-LAX/anihub-cli.git](https://github.com/NEO-LAX/anihub-cli.git)
-   cd anihub-cli
-   cargo build --release
-   ```
-The binary will be located at `target/release/anihub-cli`.
+Python is only needed for the MoonAnime extraction fallback. The binary tries `python3` and then `python` on Linux/macOS, and `py -3` and then `python` on Windows. Set `ANIHUB_PYTHON` to use a specific interpreter. It imports the Python `playwright` package and launches Playwright's Firefox browser in headless mode.
 
----
+```bash
+python3 -m pip install --user playwright
+python3 -m playwright install firefox
+```
 
-## 📄 License
-This project is licensed under the **MIT License**.
+If the system Python refuses a user install, use a virtual environment and put its `bin` directory first in `PATH` before launching AniHub CLI:
+
+```bash
+python3 -m venv "$HOME/.local/share/anihub-cli-python"
+"$HOME/.local/share/anihub-cli-python/bin/python" -m pip install playwright
+"$HOME/.local/share/anihub-cli-python/bin/python" -m playwright install firefox
+export PATH="$HOME/.local/share/anihub-cli-python/bin:$PATH"
+```
+
+The installer and application accept `ANIHUB_PYTHON` to select the interpreter used for Playwright/Firefox, for example:
+
+```bash
+ANIHUB_PYTHON="$HOME/.local/share/anihub-cli-python/bin/python" bash install.sh install
+```
+
+No separate command-line stream extractor is required: Ashdi page parsing is implemented in Rust.
+
+## Basic controls
+
+Press `?` or `h` outside search input to open the built-in help. The main controls include `/` for search, `Enter` and arrow keys for navigation, `l` for the library, `c` to continue watching, `b` for bookmarks, `x` to toggle watched state, and `q` to save final playback progress, stop owned processes, and quit.
+
+## History and recovery
+
+Progress and bookmarks are stored as `history.json` under the application data directory. The current paths are:
+
+| Platform | History file |
+| --- | --- |
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/anihub-cli/history.json` |
+| macOS | `$HOME/Library/Application Support/com.shadowgarden.anihub-cli/history.json` |
+| Windows | `%LOCALAPPDATA%\\shadowgarden\\anihub-cli\\data\\history.json` |
+
+The installer only replaces the executable; uninstall leaves this data in place. Back it up before manual recovery:
+
+```bash
+cp "/path/to/history.json" "/path/to/history.json.backup"
+```
+
+Writes are atomic and the previous valid file is retained as `history.json.bak`. If the primary JSON is damaged, the application preserves it with a `.corrupt-*` suffix and restores the valid backup automatically. If both files are damaged, startup reports an error instead of silently replacing the library. For manual recovery, quit the application and restore a known-good copy:
+
+```bash
+mv "/path/to/history.json" "/path/to/history.json.corrupt"
+cp "/path/to/history.json.bak" "/path/to/history.json"
+```
+
+If no valid backup exists, keep the corrupt files for manual JSON recovery before creating a new history file.
+
+## Troubleshooting
+
+- `anihub-cli: command not found`: add `~/.local/bin` (or your `ANIHUB_INSTALL_DIR`) to `PATH`, then start a new shell.
+- Playback reports that `mpv` cannot start: install `mpv` and confirm `command -v mpv` prints its path.
+- MoonAnime does not extract a stream: check `command -v python3`, then run `python3 -c 'from playwright.async_api import async_playwright'` and `python3 -m playwright install firefox`.
+- The installer reports an unsupported platform: release installation currently supports only Linux x86_64 and macOS x86_64/arm64. Windows uses the downloadable release asset.
+- Search returns no entries: verify network access and remember that the client filters API results to entries with Ukrainian dubbing.
+- Images are missing: use a terminal with image protocol support or continue using the text interface; playback and history do not depend on poster rendering.
+- A source page or API is unavailable: the client cannot repair upstream outages or changes to AniHub, AniList, Ashdi, or MoonAnime.
+
+## Build from source
+
+Install Rust with [rustup](https://rustup.rs/), then clone and build:
+
+```bash
+git clone https://github.com/NEO-LAX/anihub-cli.git
+cd anihub-cli
+cargo build --locked --release
+```
+
+The binary is written to `target/release/anihub-cli` (or `anihub-cli.exe` on Windows).
+
+## License
+
+AniHub CLI is released under the [MIT License](LICENSE).

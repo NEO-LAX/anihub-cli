@@ -347,8 +347,8 @@ fn render_sidebar_details_area(
             );
         }
 
-        let has_extra = d.genres.as_ref().map_or(false, |g| !g.is_empty())
-            || d.dubbing_studios.as_ref().map_or(false, |s| !s.is_empty());
+        let has_extra = d.genres.as_ref().is_some_and(|g| !g.is_empty())
+            || d.dubbing_studios.as_ref().is_some_and(|s| !s.is_empty());
         if has_extra {
             text.push(mk_sep());
         }
@@ -480,8 +480,8 @@ fn render_sidebar_details_area(
                     );
                 }
 
-                let has_extra = d.genres.as_ref().map_or(false, |g| !g.is_empty())
-                    || d.dubbing_studios.as_ref().map_or(false, |s| !s.is_empty());
+                let has_extra = d.genres.as_ref().is_some_and(|g| !g.is_empty())
+                    || d.dubbing_studios.as_ref().is_some_and(|s| !s.is_empty());
                 if has_extra {
                     text.push(mk_sep());
                 }
@@ -569,7 +569,12 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
 
     f.render_widget(
         Paragraph::new(state)
-            .style(Style::default().fg(COLOR_SECONDARY).bg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(COLOR_SECONDARY)
+                    .bg(COLOR_BG_DARK)
+                    .add_modifier(Modifier::BOLD),
+            )
             .alignment(Alignment::Center),
         chunks[1],
     );
@@ -685,13 +690,27 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
     // Визначаємо індекси чанків з урахуванням single_season
     // single_season: [SearchList, DubbingList, EpisodeList?]
     // normal:        [SearchList, SeasonList?, DubbingList?, EpisodeList?]
-    let season_chunk_idx: Option<usize> = if single_season { None } else if chunk_count >= 2 { Some(1) } else { None };
+    let season_chunk_idx: Option<usize> = if single_season {
+        None
+    } else if chunk_count >= 2 {
+        Some(1)
+    } else {
+        None
+    };
     let dubbing_chunk_idx: Option<usize> = if single_season {
         if chunk_count >= 2 { Some(1) } else { None }
-    } else if chunk_count >= 3 { Some(2) } else { None };
+    } else if chunk_count >= 3 {
+        Some(2)
+    } else {
+        None
+    };
     let episode_chunk_idx: Option<usize> = if single_season {
         if chunk_count >= 3 { Some(2) } else { None }
-    } else if chunk_count >= 4 { Some(3) } else { None };
+    } else if chunk_count >= 4 {
+        Some(3)
+    } else {
+        None
+    };
 
     if let Some(idx) = season_chunk_idx {
         let seasons = app.unique_seasons();
@@ -925,7 +944,11 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         .iter()
         .map(|item| {
             let mut marker = String::new();
-            if app.history.bookmarks.contains(&item.latest_progress.anime_id) {
+            if app
+                .history
+                .bookmarks
+                .contains(&item.latest_progress.anime_id)
+            {
                 marker.push('★');
             }
             if library_anime_is_complete(item) {
@@ -965,11 +988,14 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 } else {
                     format!("Сезон {}{}", season_num, year_str)
                 };
-                let marker = app
+                let marker = if app
                     .library_selected_anime_id()
                     .is_some_and(|anime_id| season_is_complete(app, anime_id, season_num))
-                    .then_some("✓")
-                    .unwrap_or("");
+                {
+                    "✓"
+                } else {
+                    ""
+                };
                 ListItem::new(with_right_marker(
                     &label,
                     marker,
@@ -1016,17 +1042,13 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     }) {
                         label.push_str(&format!(" · ⏱ {}", format_elapsed_timestamp(t)));
                     }
-                    let marker = anime_id
-                        .is_some_and(|id| {
-                            episode_is_watched(
-                                app,
-                                id,
-                                studio.season_number,
-                                episode.episode_number,
-                            )
-                        })
-                        .then_some("✓")
-                        .unwrap_or("");
+                    let marker = if anime_id.is_some_and(|id| {
+                        episode_is_watched(app, id, studio.season_number, episode.episode_number)
+                    }) {
+                        "✓"
+                    } else {
+                        ""
+                    };
                     ListItem::new(with_right_marker(
                         &label,
                         marker,
@@ -1158,11 +1180,11 @@ fn render_library_sidebar_details_area(
             );
         }
 
-        let has_extra = details.genres.as_ref().map_or(false, |g| !g.is_empty())
+        let has_extra = details.genres.as_ref().is_some_and(|g| !g.is_empty())
             || details
                 .dubbing_studios
                 .as_ref()
-                .map_or(false, |s| !s.is_empty());
+                .is_some_and(|s| !s.is_empty());
         if has_extra {
             text.push(mk_sep());
         }
@@ -1284,7 +1306,7 @@ fn franchise_is_complete(app: &AppState, group: &[usize]) -> bool {
         })
 }
 
-fn season_marker_for_search<'a>(app: &'a AppState, season_num: u32) -> Option<&'a str> {
+fn season_marker_for_search(app: &AppState, season_num: u32) -> Option<&str> {
     let anime_id = app
         .current_sources
         .as_ref()
@@ -1375,8 +1397,7 @@ fn season_year(app: &AppState, season_num: u32) -> Option<u32> {
         .position(|s| s.season_number == season_num)?;
     let anime_id = app.studio_anime_ids.get(studio_idx).copied()?;
     // Спочатку details_cache, потім season_to_metadata_id
-    let year = app
-        .details_cache
+    app.details_cache
         .get(&anime_id)
         .and_then(|d| d.year)
         .or_else(|| {
@@ -1384,12 +1405,12 @@ fn season_year(app: &AppState, season_num: u32) -> Option<u32> {
                 .iter()
                 .find(|a| a.id == anime_id)
                 .and_then(|a| a.year)
-        });
-    year
+        })
 }
 
 fn episode_is_watched(app: &AppState, anime_id: u32, season_num: u32, episode_num: u32) -> bool {
-    app.watched_index.contains(&(anime_id, season_num, episode_num))
+    app.watched_index
+        .contains(&(anime_id, season_num, episode_num))
 }
 
 fn episode_progress_timestamp(
@@ -1398,7 +1419,9 @@ fn episode_progress_timestamp(
     season_num: u32,
     episode_num: u32,
 ) -> Option<f64> {
-    app.progress_index.get(&(anime_id, season_num, episode_num)).copied()
+    app.progress_index
+        .get(&(anime_id, season_num, episode_num))
+        .copied()
 }
 
 fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -> List<'a> {
@@ -1447,13 +1470,15 @@ fn render_help_popup(f: &mut Frame) {
     let block = Block::default()
         .title(Span::styled(
             title,
-            Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLOR_PRIMARY)
+                .add_modifier(Modifier::BOLD),
         ))
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_PRIMARY))
         .bg(COLOR_BG_DARK);
-    
+
     let area = centered_rect(65, 55, f.area());
     f.render_widget(Clear, area);
     let inner_area = block.inner(area);
@@ -1461,28 +1486,43 @@ fn render_help_popup(f: &mut Frame) {
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .margin(1)
         .split(inner_area);
 
     let left_col = vec![
-        Line::from(vec![Span::styled(" Глобальні ", Style::default().bg(COLOR_SECONDARY).fg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(
+            " Глобальні ",
+            Style::default()
+                .bg(COLOR_SECONDARY)
+                .fg(COLOR_BG_DARK)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  /      — Пошук"),
         Line::from("  l      — Бібліотека"),
         Line::from("  ? / h  — Довідка"),
         Line::from("  q      — Вийти"),
         Line::from(""),
-        Line::from(vec![Span::styled(" Навігація ", Style::default().bg(COLOR_SECONDARY).fg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(
+            " Навігація ",
+            Style::default()
+                .bg(COLOR_SECONDARY)
+                .fg(COLOR_BG_DARK)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  ↑ / ↓  — Список"),
         Line::from("  → / ↵  — Вперед"),
         Line::from("  ← / Esc— Назад"),
     ];
 
     let right_col = vec![
-        Line::from(vec![Span::styled(" Дії з аніме ", Style::default().bg(COLOR_SECONDARY).fg(COLOR_BG_DARK).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(
+            " Дії з аніме ",
+            Style::default()
+                .bg(COLOR_SECONDARY)
+                .fg(COLOR_BG_DARK)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  Enter  — Play (MPV)"),
         Line::from("  c      — Resume (Last)"),
         Line::from("  x      — Watched Toggle"),
@@ -1497,8 +1537,11 @@ fn render_help_popup(f: &mut Frame) {
     // Footer hint centered at the bottom of the popup
     let footer_area = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
     f.render_widget(
-        Paragraph::new(Span::styled(" Натисніть будь-яку клавішу щоб закрити ", Style::default().fg(COLOR_DIM)))
-            .alignment(Alignment::Center),
+        Paragraph::new(Span::styled(
+            " Натисніть будь-яку клавішу щоб закрити ",
+            Style::default().fg(COLOR_DIM),
+        ))
+        .alignment(Alignment::Center),
         footer_area,
     );
 }

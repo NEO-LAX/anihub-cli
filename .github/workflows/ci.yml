@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+  shell:
+    name: Shell checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+
+      - name: Check Bash syntax
+        run: bash -n install.sh tests/install/test_install.sh
+
+      - name: Run ShellCheck
+        run: shellcheck --severity=warning install.sh tests/install/test_install.sh
+
+      - name: Run installer tests
+        run: bash tests/install/test_install.sh

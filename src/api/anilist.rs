@@ -1,12 +1,20 @@
-use anyhow::Result;
+#![allow(dead_code)]
+
+use super::client::{ApiError, parse_retry_after};
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 const ANILIST_URL: &str = "https://graphql.anilist.co";
+const MAX_RELATION_DEPTH: u8 = 3;
+const ANILIST_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Член франшизи, знайдений через AniList.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FranchiseMember {
     pub anilist_id: u32,
     pub is_tv: bool,
@@ -21,12 +29,23 @@ struct Req {
 #[derive(Deserialize)]
 struct Resp {
     data: Option<RespData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
 }
 
 #[derive(Deserialize)]
 struct RespData {
     #[serde(rename = "Media")]
     media: Option<Media>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlError {
+    message: String,
+    #[serde(default)]
+    path: Vec<serde_json::Value>,
+    #[serde(default)]
+    extensions: serde_json::Value,
 }
 
 #[derive(Deserialize, Clone)]
@@ -59,98 +78,302 @@ struct Node {
 const SEARCH_Q: &str = "query($s:String){Media(search:$s,type:ANIME){id format relations{edges{relationType(version:2)node{id type format}}}}}";
 const ID_Q: &str = "query($i:Int){Media(id:$i,type:ANIME){id format relations{edges{relationType(version:2)node{id type format}}}}}";
 
-async fn gql(client: &Client, query: &'static str, vars: serde_json::Value) -> Result<Media> {
-    let res: Resp = client
-        .post(ANILIST_URL)
-        .json(&Req {
-            query,
-            variables: vars,
+/// Injectable AniList GraphQL client.  Its request gate guarantees one
+/// request at a time and at least 200 ms between starts by default; the
+/// resource worker adds the same policy at its scheduling boundary.
+#[derive(Clone)]
+pub struct AniListClient {
+    client: Client,
+    base_url: String,
+    min_request_interval: Duration,
+    last_request_start: Arc<Mutex<Option<Instant>>>,
+}
+
+impl AniListClient {
+    pub fn new() -> Result<Self> {
+        let client = Client::builder()
+            .user_agent("anihub-cli/0.3")
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .context("Failed to build AniList HTTP client")?;
+        Self::from_client(client, ANILIST_URL)
+    }
+
+    pub fn with_base_url(base_url: impl AsRef<str>) -> Result<Self> {
+        let client = Client::builder()
+            .user_agent("anihub-cli/0.3")
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .context("Failed to build AniList HTTP client")?;
+        Self::from_client(client, base_url)
+    }
+
+    pub fn from_client(client: Client, base_url: impl AsRef<str>) -> Result<Self> {
+        let base_url = base_url.as_ref().trim_end_matches('/');
+        if base_url.is_empty() {
+            anyhow::bail!("AniList base URL must not be empty");
+        }
+        Ok(Self {
+            client,
+            base_url: base_url.to_string(),
+            min_request_interval: ANILIST_MIN_INTERVAL,
+            last_request_start: Arc::new(Mutex::new(None)),
         })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    res.data
-        .and_then(|d| d.media)
-        .ok_or_else(|| anyhow::anyhow!("AniList: no result"))
+    }
+
+    pub fn with_min_request_interval(mut self, interval: Duration) -> Self {
+        self.min_request_interval = interval;
+        self
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
+
+    pub async fn get_franchise_members(
+        &self,
+        title_original: &str,
+    ) -> Result<Vec<FranchiseMember>> {
+        let root = self
+            .gql(SEARCH_Q, serde_json::json!({ "s": title_original }))
+            .await
+            .context("AniList title search failed")?;
+        bfs_from_root(self, root).await
+    }
+
+    pub async fn get_franchise_members_by_id(
+        &self,
+        anilist_id: u32,
+    ) -> Result<Vec<FranchiseMember>> {
+        let root = self
+            .gql(ID_Q, serde_json::json!({ "i": anilist_id }))
+            .await
+            .with_context(|| format!("AniList id lookup failed for {anilist_id}"))?;
+        bfs_from_root(self, root).await
+    }
+
+    async fn gql(&self, query: &'static str, vars: serde_json::Value) -> Result<Media> {
+        self.wait_for_request_slot().await;
+        let response = self
+            .client
+            .post(&self.base_url)
+            .json(&Req {
+                query,
+                variables: vars,
+            })
+            .send()
+            .await
+            .map_err(|source| {
+                anyhow::Error::new(ApiError::Transport {
+                    operation: "AniList GraphQL request".to_string(),
+                    source,
+                })
+            })
+            .context("AniList GraphQL request failed")?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::Error::new(ApiError::Http {
+                operation: "AniList GraphQL request".to_string(),
+                status: response.status().as_u16(),
+                retry_after: parse_retry_after(response.headers()),
+            }));
+        }
+
+        let response: Resp = response.json().await.map_err(|source| {
+            anyhow::Error::new(ApiError::Parse {
+                operation: "AniList GraphQL response".to_string(),
+                message: source.to_string(),
+            })
+        })?;
+
+        if !response.errors.is_empty() {
+            let messages = response
+                .errors
+                .iter()
+                .map(format_graphql_error)
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!("AniList GraphQL errors: {messages}");
+        }
+
+        response
+            .data
+            .and_then(|data| data.media)
+            .ok_or_else(|| anyhow::anyhow!("AniList: response contained no Media result"))
+    }
+
+    async fn wait_for_request_slot(&self) {
+        let mut last_request_start = self.last_request_start.lock().await;
+        if let Some(last_start) = *last_request_start {
+            let elapsed = last_start.elapsed();
+            if elapsed < self.min_request_interval {
+                tokio::time::sleep(self.min_request_interval - elapsed).await;
+            }
+        }
+        *last_request_start = Some(Instant::now());
+    }
 }
 
-/// Знаходить усі TV/MOVIE аніме у франшизі через BFS по AniList відносинам.
-/// Глибина BFS ≤ 2; затримка 150 мс між запитами.
-/// При будь-якій помилці повертає порожній Vec (graceful fallback).
+/// Fallible API used by the redesigned resource layer.
+pub async fn get_franchise_members_result(
+    client: &Client,
+    title_original: &str,
+) -> Result<Vec<FranchiseMember>> {
+    AniListClient::from_client(client.clone(), ANILIST_URL)?
+        .get_franchise_members(title_original)
+        .await
+}
+
+/// Compatibility wrapper.  Existing UI code treats AniList as an optional
+/// enrichment, so it retains the old empty-vector fallback.  New code should
+/// use `AniListClient` or the fallible `_result` functions to surface errors.
 pub async fn get_franchise_members(client: &Client, title_original: &str) -> Vec<FranchiseMember> {
-    match get_inner(client, title_original).await {
-        Ok(m) => m,
-        Err(_) => Vec::new(),
-    }
+    get_franchise_members_result(client, title_original)
+        .await
+        .unwrap_or_default()
 }
 
-/// Публічна функція для BFS починаючи з відомого AniList ID (надійніше ніж пошук за назвою).
+pub async fn get_franchise_members_by_id_result(
+    client: &Client,
+    anilist_id: u32,
+) -> Result<Vec<FranchiseMember>> {
+    AniListClient::from_client(client.clone(), ANILIST_URL)?
+        .get_franchise_members_by_id(anilist_id)
+        .await
+}
+
+/// Compatibility wrapper for the old optional-enrichment call sites.
 pub async fn get_franchise_members_by_id(client: &Client, anilist_id: u32) -> Vec<FranchiseMember> {
-    match get_inner_by_id(client, anilist_id).await {
-        Ok(m) => m,
-        Err(_) => Vec::new(),
-    }
+    get_franchise_members_by_id_result(client, anilist_id)
+        .await
+        .unwrap_or_default()
 }
 
-async fn get_inner(client: &Client, title_original: &str) -> Result<Vec<FranchiseMember>> {
-    let root = gql(client, SEARCH_Q, serde_json::json!({ "s": title_original })).await?;
-    bfs_from_root(client, root).await
-}
-
-async fn get_inner_by_id(client: &Client, anilist_id: u32) -> Result<Vec<FranchiseMember>> {
-    let root = gql(client, ID_Q, serde_json::json!({ "i": anilist_id })).await?;
-    bfs_from_root(client, root).await
-}
-
-/// BFS по графу AniList. Глибина ≤ 3 — достатньо щоб знайти фільми/сезони
-/// які є SEQUEL сезону 3 (S1→S2→S3→Фільм = глибина 3 від S1).
-async fn bfs_from_root(client: &Client, root: Media) -> Result<Vec<FranchiseMember>> {
-    let mut members: Vec<FranchiseMember> = Vec::new();
-    let mut visited: HashSet<u32> = HashSet::new();
-    let mut queue: VecDeque<(Media, u8)> = VecDeque::new();
+async fn bfs_from_root(client: &AniListClient, root: Media) -> Result<Vec<FranchiseMember>> {
+    let mut members = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::<(Media, u8)>::new();
 
     visited.insert(root.id);
     queue.push_back((root, 0));
 
     while let Some((media, depth)) = queue.pop_front() {
-        let fmt = media.format.as_deref().unwrap_or("");
-        if matches!(fmt, "TV" | "MOVIE" | "ONA") {
+        let format = media.format.as_deref().unwrap_or("");
+        if matches!(format, "TV" | "MOVIE" | "ONA") {
             members.push(FranchiseMember {
                 anilist_id: media.id,
-                is_tv: fmt == "TV",
+                is_tv: format == "TV",
             });
         }
 
-        if depth >= 3 {
+        if depth >= MAX_RELATION_DEPTH {
             continue;
         }
 
-        let edges = match &media.relations {
-            Some(r) => r.edges.clone(),
-            None => continue,
-        };
+        let mut edges = media
+            .relations
+            .map(|relations| relations.edges)
+            .unwrap_or_default();
+        edges.sort_by(|left, right| {
+            left.node
+                .id
+                .cmp(&right.node.id)
+                .then_with(|| left.relation_type.cmp(&right.relation_type))
+        });
 
         for edge in edges {
             if edge.node.media_type != "ANIME" || visited.contains(&edge.node.id) {
                 continue;
             }
-            let rel = edge.relation_type.as_str();
-            if !matches!(rel, "SEQUEL" | "PREQUEL" | "PARENT" | "SUMMARY") {
+            if !matches!(
+                edge.relation_type.as_str(),
+                "SEQUEL" | "PREQUEL" | "PARENT" | "SUMMARY"
+            ) {
                 continue;
             }
-            let nf = edge.node.format.as_deref().unwrap_or("");
-            if !matches!(nf, "TV" | "MOVIE" | "ONA") {
+            let node_format = edge.node.format.as_deref().unwrap_or("");
+            if !matches!(node_format, "TV" | "MOVIE" | "ONA") {
                 continue;
             }
+
             visited.insert(edge.node.id);
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            if let Ok(full) = gql(client, ID_Q, serde_json::json!({ "i": edge.node.id })).await {
-                queue.push_back((full, depth + 1));
-            }
+            let full = client
+                .gql(ID_Q, serde_json::json!({ "i": edge.node.id }))
+                .await
+                .with_context(|| format!("AniList relation lookup failed for {}", edge.node.id))?;
+            queue.push_back((full, depth + 1));
         }
     }
 
+    members.sort_by_key(|member| member.anilist_id);
+    members.dedup_by_key(|member| member.anilist_id);
     Ok(members)
+}
+
+fn format_graphql_error(error: &GraphQlError) -> String {
+    let path = if error.path.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " at {}",
+            serde_json::to_string(&error.path).unwrap_or_default()
+        )
+    };
+    let extensions = if error.extensions.is_null() {
+        String::new()
+    } else {
+        format!(" ({})", error.extensions)
+    };
+    format!("{}{}{}", error.message, path, extensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn server(body: &'static str) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((mut stream, _)) = accepted {
+                        let mut request = [0u8; 4096];
+                        let _ = stream.read(&mut request).await;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                }
+                _ = &mut rx => {}
+            }
+        });
+        (address, tx)
+    }
+
+    #[tokio::test]
+    async fn graphql_top_level_errors_are_not_treated_as_empty_data() {
+        let (url, shutdown) = server(
+            r#"{"errors":[{"message":"rate limited","extensions":{"code":"RATE_LIMITED"}}]}"#,
+        )
+        .await;
+        let client = AniListClient::with_base_url(url)
+            .unwrap()
+            .with_min_request_interval(Duration::ZERO);
+        let error = client.get_franchise_members_by_id(1).await.unwrap_err();
+        assert!(format!("{error:#}").contains("AniList GraphQL errors"));
+        let _ = shutdown.send(());
+    }
 }
