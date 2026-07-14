@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppMode {
     Normal,
     SearchInput,
@@ -23,7 +23,7 @@ pub enum AppMode {
     LibraryEpisode,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub enum FocusPanel {
     SearchList,
@@ -45,6 +45,55 @@ pub enum ContinueRequest {
         anime_ids: Vec<u32>,
         in_library: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LibraryFilter {
+    Continue,
+    Bookmarks,
+    Completed,
+    All,
+}
+
+impl LibraryFilter {
+    pub const ALL: [Self; 4] = [Self::Continue, Self::Bookmarks, Self::Completed, Self::All];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "Продовжити",
+            Self::Bookmarks => "Закладки",
+            Self::Completed => "Завершені",
+            Self::All => "Усі",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Continue => Self::Bookmarks,
+            Self::Bookmarks => Self::Completed,
+            Self::Completed => Self::All,
+            Self::All => Self::Continue,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Continue => Self::All,
+            Self::Bookmarks => Self::Continue,
+            Self::Completed => Self::Bookmarks,
+            Self::All => Self::Completed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NowPlaying {
+    pub anime_title: String,
+    pub season: u32,
+    pub episode: u32,
+    pub studio_name: String,
+    pub position: f64,
+    pub duration: f64,
 }
 
 #[derive(Clone)]
@@ -71,6 +120,9 @@ pub struct AppState {
     pub mode: AppMode,
     pub focus: FocusPanel,
     pub search_query: String,
+    pub last_search_query: String,
+    /// Cursor position in Unicode scalar values, not bytes.
+    pub search_cursor: usize,
 
     pub search_results: Vec<AnimeItem>,
     pub franchise_groups: Vec<Vec<usize>>,
@@ -98,6 +150,8 @@ pub struct AppState {
     pub episode_list_state: ListState,
 
     pub library_items: Vec<LibraryAnimeEntry>,
+    pub library_all_items: Vec<LibraryAnimeEntry>,
+    pub library_filter: LibraryFilter,
     pub library_anime_index: Option<usize>,
     pub library_season_index: Option<usize>,
     pub library_episode_index: Option<usize>,
@@ -111,6 +165,7 @@ pub struct AppState {
     pub storage: StorageManager,
     pub history: AppHistory,
     pub loading: bool,
+    pub activity_message: Option<String>,
     pub play_episode: bool,
     pub continue_request: Option<ContinueRequest>,
     pub status_message: Option<(String, StatusKind)>,
@@ -119,6 +174,7 @@ pub struct AppState {
 
     // Стан відтворення
     pub is_playing: bool,
+    pub now_playing: Option<NowPlaying>,
     pub mpv_player: crate::player::MpvPlayer,
     pub mpv_child: Option<Child>,
     pub mpv_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::player::MpvEvent>>,
@@ -175,6 +231,8 @@ impl AppState {
             mode: AppMode::SearchInput,
             focus: FocusPanel::SearchList,
             search_query: String::new(),
+            last_search_query: String::new(),
+            search_cursor: 0,
 
             search_results: Vec::new(),
             franchise_groups: Vec::new(),
@@ -196,6 +254,8 @@ impl AppState {
             episode_list_state: ListState::default(),
 
             library_items: Vec::new(),
+            library_all_items: Vec::new(),
+            library_filter: LibraryFilter::Continue,
             library_anime_index: None,
             library_season_index: None,
             library_episode_index: None,
@@ -209,6 +269,7 @@ impl AppState {
             storage,
             history,
             loading: false,
+            activity_message: None,
             play_episode: false,
             continue_request: None,
             status_message: None,
@@ -216,6 +277,7 @@ impl AppState {
             show_help: false,
 
             is_playing: false,
+            now_playing: None,
             mpv_player: crate::player::MpvPlayer::new()?,
             mpv_child: None,
             mpv_rx: None,
@@ -379,6 +441,12 @@ impl AppState {
                         self.should_quit = true;
                         return Ok(());
                     }
+                    if matches!(self.status_message, Some((_, StatusKind::Error))) {
+                        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                            self.clear_status();
+                        }
+                        return Ok(());
+                    }
                     if self.show_help {
                         self.show_help = false;
                         return Ok(());
@@ -396,6 +464,12 @@ impl AppState {
                         return Ok(());
                     }
 
+                    if self.mode != AppMode::SearchInput
+                        && self.handle_list_navigation_key(key.code)
+                    {
+                        return Ok(());
+                    }
+
                     match self.mode {
                         AppMode::Normal => match key.code {
                             KeyCode::Char('q') => self.should_quit = true,
@@ -407,7 +481,9 @@ impl AppState {
                             KeyCode::Esc => self.handle_esc(),
                             KeyCode::Char('/') => {
                                 self.mode = AppMode::SearchInput;
-                                self.search_query.clear();
+                                self.search_query.clone_from(&self.last_search_query);
+                                self.search_cursor = self.search_query.chars().count();
+                                self.clear_activity();
                             }
                             KeyCode::Right => self.move_focus_right(),
                             KeyCode::Left => self.move_focus_left(),
@@ -419,16 +495,32 @@ impl AppState {
                         AppMode::SearchInput => match key.code {
                             KeyCode::Enter => {
                                 self.mode = AppMode::Normal;
-                                if !self.search_query.is_empty() {
+                                let query = self.search_query.trim().to_string();
+                                if !query.is_empty() {
+                                    self.last_search_query.clone_from(&query);
+                                    self.search_query = query;
+                                    self.search_cursor = self.search_query.chars().count();
                                     self.loading = true;
+                                    self.activity_message = Some("Пошук аніме…".to_string());
                                 }
                             }
-                            KeyCode::Char(c) => self.search_query.push(c),
-                            KeyCode::Backspace => {
-                                self.search_query.pop();
+                            KeyCode::Char(c) => self.insert_search_char(c),
+                            KeyCode::Backspace => self.backspace_search_char(),
+                            KeyCode::Delete => self.delete_search_char(),
+                            KeyCode::Left => {
+                                self.search_cursor = self.search_cursor.saturating_sub(1);
                             }
+                            KeyCode::Right => {
+                                self.search_cursor =
+                                    (self.search_cursor + 1).min(self.search_query.chars().count());
+                            }
+                            KeyCode::Home => self.search_cursor = 0,
+                            KeyCode::End => self.search_cursor = self.search_query.chars().count(),
                             KeyCode::Esc => {
                                 self.mode = AppMode::Normal;
+                                self.search_query.clear();
+                                self.search_cursor = 0;
+                                self.clear_activity();
                             }
                             _ => {}
                         },
@@ -439,6 +531,12 @@ impl AppState {
                             KeyCode::Char('b') => self.toggle_bookmark(),
                             KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Tab => self.cycle_library_filter(false),
+                            KeyCode::BackTab => self.cycle_library_filter(true),
+                            KeyCode::Char('1') => self.set_library_filter(LibraryFilter::Continue),
+                            KeyCode::Char('2') => self.set_library_filter(LibraryFilter::Bookmarks),
+                            KeyCode::Char('3') => self.set_library_filter(LibraryFilter::Completed),
+                            KeyCode::Char('4') => self.set_library_filter(LibraryFilter::All),
                             KeyCode::Left => {}
                             KeyCode::Esc => self.reset_to_home(),
                             KeyCode::Up => self.move_library_up(),
@@ -452,6 +550,8 @@ impl AppState {
                             KeyCode::Char('b') => self.toggle_bookmark(),
                             KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Tab => self.cycle_library_filter(false),
+                            KeyCode::BackTab => self.cycle_library_filter(true),
                             KeyCode::Left => self.leave_library_level(),
                             KeyCode::Esc => self.leave_library_level(),
                             KeyCode::Up => self.move_library_up(),
@@ -465,6 +565,8 @@ impl AppState {
                             KeyCode::Char('b') => self.toggle_bookmark(),
                             KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Tab => self.cycle_library_filter(false),
+                            KeyCode::BackTab => self.cycle_library_filter(true),
                             KeyCode::Left => self.leave_library_level(),
                             KeyCode::Esc => self.leave_library_level(),
                             KeyCode::Up => self.move_library_up(),
@@ -478,6 +580,8 @@ impl AppState {
                             KeyCode::Char('b') => self.toggle_bookmark(),
                             KeyCode::Char('o') => self.open_in_browser(),
                             KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Tab => self.cycle_library_filter(false),
+                            KeyCode::BackTab => self.cycle_library_filter(true),
                             KeyCode::Left => self.leave_library_level(),
                             KeyCode::Esc => self.leave_library_level(),
                             KeyCode::Up => self.move_library_up(),
@@ -490,6 +594,189 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    fn insert_search_char(&mut self, character: char) {
+        let byte_index = byte_index_for_char(&self.search_query, self.search_cursor);
+        self.search_query.insert(byte_index, character);
+        self.search_cursor += 1;
+    }
+
+    fn backspace_search_char(&mut self) {
+        if self.search_cursor == 0 {
+            return;
+        }
+        let start = byte_index_for_char(&self.search_query, self.search_cursor - 1);
+        let end = byte_index_for_char(&self.search_query, self.search_cursor);
+        self.search_query.replace_range(start..end, "");
+        self.search_cursor -= 1;
+    }
+
+    fn delete_search_char(&mut self) {
+        let char_count = self.search_query.chars().count();
+        if self.search_cursor >= char_count {
+            return;
+        }
+        let start = byte_index_for_char(&self.search_query, self.search_cursor);
+        let end = byte_index_for_char(&self.search_query, self.search_cursor + 1);
+        self.search_query.replace_range(start..end, "");
+    }
+
+    fn handle_list_navigation_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.move_active_selection(true),
+            KeyCode::Up | KeyCode::Char('k') => self.move_active_selection(false),
+            KeyCode::PageDown => self.move_active_page(true),
+            KeyCode::PageUp => self.move_active_page(false),
+            KeyCode::Home => self.jump_active_selection(false),
+            KeyCode::End => self.jump_active_selection(true),
+            _ => return false,
+        }
+        true
+    }
+
+    fn move_active_selection(&mut self, down: bool) {
+        if self.is_library_mode() {
+            if down {
+                self.move_library_down();
+            } else {
+                self.move_library_up();
+            }
+        } else if down {
+            self.move_selection_down();
+        } else {
+            self.move_selection_up();
+        }
+    }
+
+    fn move_active_page(&mut self, down: bool) {
+        for _ in 0..10 {
+            let (selected, total) = self.active_list_position();
+            if total == 0 || (down && selected + 1 >= total) || (!down && selected == 0) {
+                break;
+            }
+            self.move_active_selection(down);
+        }
+    }
+
+    fn jump_active_selection(&mut self, to_end: bool) {
+        loop {
+            let (selected, total) = self.active_list_position();
+            if total == 0 || (!to_end && selected == 0) || (to_end && selected + 1 >= total) {
+                break;
+            }
+            self.move_active_selection(to_end);
+        }
+    }
+
+    pub fn active_list_position(&self) -> (usize, usize) {
+        if self.is_library_mode() {
+            return match self.mode {
+                AppMode::Library => (
+                    self.library_anime_list_state.selected().unwrap_or(0),
+                    self.library_items.len(),
+                ),
+                AppMode::LibrarySeason => (
+                    self.season_list_state.selected().unwrap_or(0),
+                    self.library_season_numbers().len(),
+                ),
+                AppMode::LibraryDubbing => {
+                    let total = self
+                        .selected_season_num()
+                        .map_or(0, |season| self.studios_for_season(season).len());
+                    (self.dubbing_list_state.selected().unwrap_or(0), total)
+                }
+                AppMode::LibraryEpisode => (
+                    self.episode_list_state.selected().unwrap_or(0),
+                    self.selected_studio()
+                        .map_or(0, |studio| studio.episodes.len()),
+                ),
+                _ => (0, 0),
+            };
+        }
+
+        match self.focus {
+            FocusPanel::SearchList => (
+                self.result_list_state.selected().unwrap_or(0),
+                self.franchise_groups.len(),
+            ),
+            FocusPanel::SeasonList => (
+                self.season_list_state.selected().unwrap_or(0),
+                self.unique_seasons().len(),
+            ),
+            FocusPanel::DubbingList => {
+                let total = self
+                    .selected_season_num()
+                    .map_or(0, |season| self.studios_for_season(season).len());
+                (self.dubbing_list_state.selected().unwrap_or(0), total)
+            }
+            FocusPanel::EpisodeList => (
+                self.episode_list_state.selected().unwrap_or(0),
+                self.selected_studio()
+                    .map_or(0, |studio| studio.episodes.len()),
+            ),
+        }
+    }
+
+    fn cycle_library_filter(&mut self, backwards: bool) {
+        let filter = if backwards {
+            self.library_filter.previous()
+        } else {
+            self.library_filter.next()
+        };
+        self.set_library_filter(filter);
+    }
+
+    fn set_library_filter(&mut self, filter: LibraryFilter) {
+        self.library_filter = filter;
+        self.mode = AppMode::Library;
+        self.apply_library_filter();
+    }
+
+    fn apply_library_filter(&mut self) {
+        let selected_ids = self
+            .library_selected_anime()
+            .map(|anime| anime.anime_ids.clone());
+        self.library_items = self
+            .library_all_items
+            .iter()
+            .filter(|anime| match self.library_filter {
+                LibraryFilter::Continue => {
+                    !anime.seasons.is_empty() && !anime_is_fully_watched(anime)
+                }
+                LibraryFilter::Bookmarks => anime
+                    .anime_ids
+                    .iter()
+                    .any(|anime_id| self.history.bookmarks.contains(anime_id)),
+                LibraryFilter::Completed => anime_is_fully_watched(anime),
+                LibraryFilter::All => true,
+            })
+            .cloned()
+            .collect();
+        self.library_anime_index = selected_ids
+            .and_then(|ids| {
+                self.library_items
+                    .iter()
+                    .position(|anime| anime.anime_ids.iter().any(|id| ids.contains(id)))
+            })
+            .or_else(|| (!self.library_items.is_empty()).then_some(0));
+        self.library_anime_list_state
+            .select(self.library_anime_index);
+        self.library_season_index = None;
+        self.library_episode_index = None;
+        self.season_list_state.select(None);
+        self.dubbing_list_state.select(None);
+        self.episode_list_state.select(None);
+        self.pending_delete_confirmation = None;
+        if self.library_items.is_empty() {
+            self.current_sources = None;
+            self.current_details = None;
+            self.current_poster = None;
+            self.loading = false;
+            self.activity_message = None;
+        } else {
+            self.prepare_library_anime_selection();
+        }
     }
 
     fn get_current_anime_context(&self) -> Option<(u32, String, String)> {
@@ -549,6 +836,9 @@ impl AppState {
                 Err(e) => self.set_error_status(format!("Помилка закладок: {}", e)),
             }
             self.history = self.storage.load_history().unwrap_or_default();
+            if self.is_library_mode() {
+                self.reload_library_after_mutation();
+            }
         }
     }
 
@@ -870,6 +1160,7 @@ impl AppState {
 
     fn reset_downstream(&mut self) {
         self.loading = true;
+        self.activity_message = Some("Завантаження вибраного аніме…".to_string());
         self.current_sources = None;
         self.current_details = None;
         self.current_poster = None;
@@ -889,26 +1180,30 @@ impl AppState {
             abort.abort();
         }
 
-        self.mode = AppMode::SearchInput;
+        self.mode = if self.search_results.is_empty() {
+            AppMode::SearchInput
+        } else {
+            AppMode::Normal
+        };
         self.focus = FocusPanel::SearchList;
         self.search_query.clear();
-        self.search_results.clear();
-        self.franchise_groups.clear();
-        self.selected_group_index = None;
-        self.selected_result_index = None;
+        self.search_cursor = 0;
         self.current_sources = None;
         self.current_details = None;
         self.studio_anime_ids.clear();
         self.sidebar_anime_idx = None;
         self.season_to_metadata_id.clear();
-        self.result_list_state.select(None);
+        self.result_list_state.select(self.selected_group_index);
         self.selected_season_index = None;
         self.season_list_state.select(None);
         self.selected_dubbing_index = None;
         self.dubbing_list_state.select(None);
         self.selected_episode_index = None;
         self.episode_list_state.select(None);
-        self.loading = false;
+        self.loading = self.selected_result_index.is_some();
+        self.activity_message = self
+            .loading
+            .then(|| "Завантаження вибраного аніме…".to_string());
         self.prefetching = false;
         self.prefetch_rx = None;
         self.anilist_prefetch_rx = None;
@@ -916,6 +1211,7 @@ impl AppState {
         self.current_poster = None;
         self.poster_fetch_pending = None;
         self.library_items.clear();
+        self.library_all_items.clear();
         self.library_anime_index = None;
         self.library_season_index = None;
         self.library_episode_index = None;
@@ -926,8 +1222,13 @@ impl AppState {
     }
 
     fn open_global_search(&mut self) {
-        self.reset_to_home();
         self.mode = AppMode::SearchInput;
+        self.focus = FocusPanel::SearchList;
+        self.search_query.clone_from(&self.last_search_query);
+        self.search_cursor = self.search_query.chars().count();
+        self.pending_delete_confirmation = None;
+        self.clear_activity();
+        self.clear_status();
     }
 
     pub fn open_library(&mut self) {
@@ -935,17 +1236,10 @@ impl AppState {
             return;
         }
 
-        self.library_items = build_library_items(&self.history);
-        self.library_anime_index = (!self.library_items.is_empty()).then_some(0);
-        self.library_season_index = None;
-        self.library_episode_index = None;
-        self.library_anime_list_state
-            .select(self.library_anime_index);
-        self.library_season_list_state.select(None);
-        self.library_episode_list_state.select(None);
+        self.library_all_items = build_library_items(&self.history, &self.details_cache);
+        self.library_items.clear();
         self.mode = AppMode::Library;
-        self.pending_delete_confirmation = None;
-        self.prepare_library_anime_selection();
+        self.apply_library_filter();
         self.pending_prefetch_ids = Some(
             self.library_items
                 .iter()
@@ -953,8 +1247,8 @@ impl AppState {
                 .collect(),
         );
 
-        if self.library_items.is_empty() {
-            self.set_info_status("Бібліотека порожня");
+        if self.library_all_items.is_empty() {
+            self.set_info_status("Бібліотека й закладки порожні");
         }
     }
 
@@ -1008,6 +1302,7 @@ impl AppState {
         self.studio_anime_ids.clear();
         self.sync_library_sidebar_selection();
         self.loading = true;
+        self.activity_message = Some("Завантаження бібліотеки…".to_string());
     }
 
     fn leave_library_level(&mut self) {
@@ -1219,8 +1514,34 @@ impl AppState {
     }
 
     pub fn set_error_status(&mut self, message: impl Into<String>) {
+        self.activity_message = None;
         self.status_message = Some((message.into(), StatusKind::Error));
         self.status_expires_at = None;
+    }
+
+    pub fn set_activity(&mut self, message: impl Into<String>) {
+        self.loading = true;
+        self.activity_message = Some(message.into());
+    }
+
+    pub fn clear_activity(&mut self) {
+        self.loading = false;
+        self.activity_message = None;
+    }
+
+    pub fn prepare_playback(&mut self, target: &crate::playback::PlayTarget) {
+        self.set_activity(format!(
+            "Підготовка потоку · S{}E{}…",
+            target.season, target.episode
+        ));
+        self.now_playing = Some(NowPlaying {
+            anime_title: target.anime_title.clone(),
+            season: target.season,
+            episode: target.episode,
+            studio_name: target.studio_name.clone(),
+            position: target.start_time.unwrap_or(0.0),
+            duration: 0.0,
+        });
     }
 
     pub fn clear_status(&mut self) {
@@ -1661,7 +1982,8 @@ impl AppState {
         let prev_episode = self.selected_episode_index;
         let prev_mode = self.mode;
 
-        self.library_items = build_library_items(&self.history);
+        self.library_all_items = build_library_items(&self.history, &self.details_cache);
+        self.apply_library_filter();
 
         self.library_anime_index = prev_anime_title
             .clone()
@@ -1712,7 +2034,16 @@ impl AppState {
             self.episode_list_state.select(self.selected_episode_index);
         }
 
-        self.mode = prev_mode;
+        self.mode = match prev_mode {
+            AppMode::LibraryEpisode if self.selected_studio().is_some() => AppMode::LibraryEpisode,
+            AppMode::LibraryDubbing if self.selected_season_num().is_some() => {
+                AppMode::LibraryDubbing
+            }
+            AppMode::LibrarySeason if self.library_selected_anime().is_some() => {
+                AppMode::LibrarySeason
+            }
+            _ => AppMode::Library,
+        };
         self.sync_library_sidebar_selection();
     }
 
@@ -1735,6 +2066,7 @@ impl AppState {
 
         if self.current_details.as_ref().map(|details| details.id) != Some(anime_id) {
             self.loading = true;
+            self.activity_message = Some("Завантаження метаданих…".to_string());
         }
     }
 
@@ -1779,6 +2111,7 @@ impl AppState {
         self.current_details = self.details_cache.get(&anime_id);
         if self.current_details.is_none() {
             self.loading = true;
+            self.activity_message = Some("Завантаження метаданих сезону…".to_string());
         }
         if let Some(img) = self.poster_cache.get(&anime_id) {
             self.current_poster = Some(self.picker.new_resize_protocol((*img).clone()));
@@ -1807,7 +2140,10 @@ impl AppState {
     }
 }
 
-fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
+fn build_library_items(
+    history: &AppHistory,
+    details_cache: &moka::sync::Cache<u32, AnimeDetails>,
+) -> Vec<LibraryAnimeEntry> {
     let mut per_anime: HashMap<String, Vec<WatchProgress>> = HashMap::new();
     for progress in history.progress.values() {
         per_anime
@@ -1862,6 +2198,38 @@ fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
         })
         .collect();
 
+    let known_ids = items
+        .iter()
+        .flat_map(|item| item.anime_ids.iter().copied())
+        .collect::<HashSet<_>>();
+    for anime_id in history
+        .bookmarks
+        .iter()
+        .copied()
+        .filter(|anime_id| !known_ids.contains(anime_id))
+    {
+        let anime_title = details_cache
+            .get(&anime_id)
+            .map(|details| details.title_ukrainian)
+            .unwrap_or_else(|| format!("Закладка #{}", anime_id));
+        items.push(LibraryAnimeEntry {
+            anime_ids: vec![anime_id],
+            anime_title: anime_title.clone(),
+            latest_progress: WatchProgress {
+                anime_id,
+                anime_title,
+                season: 1,
+                episode: 1,
+                studio_name: String::new(),
+                timestamp: 0.0,
+                duration: 0.0,
+                watched: false,
+                updated_at: 0,
+            },
+            seasons: Vec::new(),
+        });
+    }
+
     items.sort_by(|a, b| {
         b.latest_progress
             .updated_at
@@ -1870,10 +2238,69 @@ fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
     items
 }
 
+fn byte_index_for_char(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte_index, _)| byte_index)
+}
+
 fn anime_is_fully_watched(anime: &LibraryAnimeEntry) -> bool {
     !anime.seasons.is_empty()
         && anime
             .seasons
             .iter()
             .all(|season| season.episodes.iter().all(|episode| episode.watched))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_search_cursor_maps_to_byte_boundaries() {
+        let text = "Наруто";
+        assert_eq!(byte_index_for_char(text, 0), 0);
+        assert_eq!(byte_index_for_char(text, 1), "Н".len());
+        assert_eq!(byte_index_for_char(text, text.chars().count()), text.len());
+    }
+
+    #[test]
+    fn bookmark_without_progress_is_visible_in_library() {
+        let mut history = AppHistory::default();
+        history.bookmarks.push(42);
+        let details_cache = moka::sync::Cache::builder().max_capacity(4).build();
+
+        let items = build_library_items(&history, &details_cache);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].anime_ids, vec![42]);
+        assert_eq!(items[0].anime_title, "Закладка #42");
+        assert!(items[0].seasons.is_empty());
+    }
+
+    #[test]
+    fn progress_and_bookmark_for_same_id_do_not_duplicate_library_item() {
+        let mut history = AppHistory::default();
+        history.bookmarks.push(7);
+        history.progress.insert(
+            StorageManager::make_progress_key(7, 1, 2, "Studio"),
+            WatchProgress {
+                anime_id: 7,
+                anime_title: "Тест".to_string(),
+                season: 1,
+                episode: 2,
+                studio_name: "Studio".to_string(),
+                timestamp: 120.0,
+                duration: 1400.0,
+                watched: false,
+                updated_at: 1,
+            },
+        );
+        let details_cache = moka::sync::Cache::builder().max_capacity(4).build();
+
+        let items = build_library_items(&history, &details_cache);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].anime_title, "Тест");
+    }
 }

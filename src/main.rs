@@ -148,7 +148,7 @@ impl ResourceCoordinator {
             in_library,
         });
         self.context = None;
-        app.loading = true;
+        app.set_activity("Підготовка продовження перегляду…");
         self.sync(app).await;
     }
 
@@ -163,7 +163,7 @@ impl ResourceCoordinator {
             return;
         };
         let Some(resolved) = resolve_continue_target(&pending.progress, &sources) else {
-            app.loading = false;
+            app.clear_activity();
             app.set_info_status("Усі серії переглянуто");
             self.pending_continue = None;
             return;
@@ -197,7 +197,7 @@ impl ResourceCoordinator {
         let queue = build_playback_queue(app, &target);
         self.ready_playback = Some((target, queue));
         self.pending_continue = None;
-        app.loading = false;
+        app.clear_activity();
     }
 
     fn take_ready_playback(&mut self) -> Option<(PlayTarget, Vec<PlayTarget>)> {
@@ -207,7 +207,7 @@ impl ResourceCoordinator {
     async fn start_context(&mut self, app: &mut AppState, context: ResourceContext) {
         match context {
             ResourceContext::Search(query) => {
-                app.loading = true;
+                app.set_activity("Пошук аніме…");
                 if self
                     .runtime
                     .handle
@@ -215,7 +215,7 @@ impl ResourceCoordinator {
                     .await
                     .is_err()
                 {
-                    app.loading = false;
+                    app.clear_activity();
                     app.set_error_status("Сервіс завантаження недоступний");
                 }
             }
@@ -224,7 +224,7 @@ impl ResourceCoordinator {
                 anime_ids,
                 details_id,
             } => {
-                app.loading = true;
+                app.set_activity("Завантаження метаданих і серій…");
                 if let Some(details) = app.details_cache.get(&details_id) {
                     app.current_details = Some(details);
                 } else {
@@ -239,7 +239,7 @@ impl ResourceCoordinator {
                 {
                     app.current_sources = Some(sources);
                     app.studio_anime_ids = owners;
-                    app.loading = false;
+                    app.clear_activity();
                     return;
                 }
 
@@ -343,11 +343,22 @@ impl ResourceCoordinator {
                 apply_search_results(app, api::deduplicate_anime(results));
             }
             (ResourceKey::Search(_), Err(error)) => {
-                app.loading = false;
+                app.clear_activity();
                 app.set_error_status(format!("Помилка пошуку: {error}"));
             }
             (ResourceKey::Details(anime_id), Ok(ResourceValue::Details(details))) => {
                 app.details_cache.insert(anime_id, details.clone());
+                for item in app
+                    .library_all_items
+                    .iter_mut()
+                    .chain(app.library_items.iter_mut())
+                    .filter(|item| item.anime_ids.contains(&anime_id))
+                {
+                    if item.anime_title.starts_with("Закладка #") {
+                        item.anime_title.clone_from(&details.title_ukrainian);
+                        item.latest_progress.anime_title = details.title_ukrainian.clone();
+                    }
+                }
                 let is_current = matches!(
                     self.context,
                     Some(ResourceContext::Content { details_id, .. }) if details_id == anime_id
@@ -392,11 +403,11 @@ impl ResourceCoordinator {
                     .insert(representative_id, (sources.clone(), owners.clone()));
                 app.current_sources = Some(sources);
                 app.studio_anime_ids = owners;
-                app.loading = false;
+                app.clear_activity();
                 self.combined = None;
             }
             (ResourceKey::Combined { .. }, Err(error)) => {
-                app.loading = false;
+                app.clear_activity();
                 app.set_error_status(format!("Помилка об’єднання серій: {error}"));
                 self.combined = None;
             }
@@ -437,7 +448,7 @@ impl ResourceCoordinator {
             .await
             .is_err()
         {
-            app.loading = false;
+            app.clear_activity();
             app.set_error_status("Сервіс об’єднання серій недоступний");
         }
     }
@@ -530,6 +541,7 @@ async fn main() -> Result<()> {
         resources.drain(&mut app).await;
         resources.sync(&mut app).await;
         if let Some((target, queue)) = resources.take_ready_playback() {
+            app.prepare_playback(&target);
             if let Err(error) = playback.play(target, queue).await {
                 app.set_error_status(format!("Помилка відтворення: {error}"));
             }
@@ -542,6 +554,7 @@ async fn main() -> Result<()> {
             app.play_episode = false;
             if let Some(target) = selected_play_target(&app) {
                 let queue = build_playback_queue(&app, &target);
+                app.prepare_playback(&target);
                 if let Err(error) = playback.play(target, queue).await {
                     app.set_error_status(format!("Помилка відтворення: {error}"));
                 }
@@ -576,11 +589,29 @@ fn persist_playback_event(
     event: PlaybackEvent,
 ) {
     match event {
-        PlaybackEvent::SessionStarted { session_id, .. } => {
+        PlaybackEvent::SessionStarted { session_id, target } => {
             app.is_playing = true;
+            app.clear_activity();
+            app.now_playing = Some(ui::app::NowPlaying {
+                anime_title: target.anime_title,
+                season: target.season,
+                episode: target.episode,
+                studio_name: target.studio_name,
+                position: target.start_time.unwrap_or(0.0),
+                duration: 0.0,
+            });
             persisted_positions.entry(session_id).or_insert(0.0);
         }
         PlaybackEvent::ProgressSnapshot(snapshot) => {
+            if let Some(now_playing) = app.now_playing.as_mut() {
+                if now_playing.season == snapshot.identity.season
+                    && now_playing.episode == snapshot.identity.episode
+                    && now_playing.studio_name == snapshot.identity.studio_name
+                {
+                    now_playing.position = snapshot.position;
+                    now_playing.duration = snapshot.duration;
+                }
+            }
             let last = persisted_positions
                 .get(&snapshot.session_id)
                 .copied()
@@ -607,6 +638,10 @@ fn persist_playback_event(
             }
         }
         PlaybackEvent::MarkWatched(mark) => {
+            if let Some(now_playing) = app.now_playing.as_mut() {
+                now_playing.position = mark.position;
+                now_playing.duration = mark.duration;
+            }
             if let Err(error) = app.storage.set_episode_watched(
                 mark.identity.anime_id,
                 &mark.identity.anime_title,
@@ -625,8 +660,12 @@ fn persist_playback_event(
         PlaybackEvent::SessionStopped { session_id } => {
             persisted_positions.remove(&session_id);
             app.is_playing = false;
+            app.now_playing = None;
+            app.clear_activity();
         }
         PlaybackEvent::Error { message, .. } => {
+            app.now_playing = None;
+            app.clear_activity();
             app.set_error_status(format!("Помилка відтворення: {message}"));
         }
         PlaybackEvent::EndFile { .. } => {}
@@ -737,6 +776,7 @@ fn apply_search_results(app: &mut AppState, results: Vec<api::AnimeItem>) {
     app.search_results = results;
     app.franchise_groups = api::group_into_franchises(&app.search_results);
     app.search_query.clear();
+    app.search_cursor = 0;
 
     app.focus = FocusPanel::SearchList;
     app.current_sources = None;
@@ -756,8 +796,9 @@ fn apply_search_results(app: &mut AppState, results: Vec<api::AnimeItem>) {
         app.selected_group_index = Some(0);
         let rep = api::representative_idx(&app.search_results, &app.franchise_groups[0]);
         app.selected_result_index = Some(rep);
-        app.loading = true;
+        app.set_activity("Завантаження вибраного аніме…");
     } else {
+        app.clear_activity();
         app.result_list_state.select(None);
         app.selected_group_index = None;
         app.selected_result_index = None;
