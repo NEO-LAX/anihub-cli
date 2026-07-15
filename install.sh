@@ -3,8 +3,14 @@ set -euo pipefail
 
 BINARY_NAME="anihub-cli"
 REPO_URL="${ANIHUB_REPO_URL:-https://github.com/NEO-LAX/anihub-cli}"
-RELEASE_BASE_URL="${ANIHUB_RELEASE_BASE_URL:-${REPO_URL}/releases/latest/download}"
-RELEASE_BASE_URL="${RELEASE_BASE_URL%/}"
+# Prefer a specific tag when set, e.g. ANIHUB_RELEASE_TAG=v0.6.0
+if [[ -n "${ANIHUB_RELEASE_BASE_URL:-}" ]]; then
+    RELEASE_BASE_URL="${ANIHUB_RELEASE_BASE_URL%/}"
+elif [[ -n "${ANIHUB_RELEASE_TAG:-}" ]]; then
+    RELEASE_BASE_URL="${REPO_URL}/releases/download/${ANIHUB_RELEASE_TAG}"
+else
+    RELEASE_BASE_URL="${REPO_URL}/releases/latest/download"
+fi
 INSTALL_DIR="${ANIHUB_INSTALL_DIR:-${HOME}/.local/bin}"
 INSTALL_PATH="${INSTALL_DIR}/${BINARY_NAME}"
 
@@ -181,10 +187,19 @@ path_guidance() {
 
 verify_and_migrate_data() {
     local candidate_binary="$1"
+    local migrate_log
+    migrate_log="$(mktemp "${TMPDIR:-/tmp}/anihub-migrate.XXXXXX")"
     info "Validating and migrating local history and settings..."
-    if ! "${candidate_binary}" --migrate-data; then
+    if ! "${candidate_binary}" --migrate-data >"${migrate_log}" 2>&1; then
+        cat "${migrate_log}" >&2 || true
+        if grep -Eqi "unsupported history schema version|unknown argument|невідомі аргументи|--migrate-data" "${migrate_log}" 2>/dev/null; then
+            fail "data migration failed: the downloaded release is too old for your local data (need anihub-cli >= 0.6.0 with schema v2). Either publish/tag a new GitHub release and re-run, or install from this repo: cargo build --release && install -Dm755 target/release/anihub-cli \"${INSTALL_PATH}\". Your data was not replaced."
+        fi
         fail "data migration failed. The installed binary was not replaced and existing data was preserved"
     fi
+    # Surface migrate success details (paths / counts).
+    cat "${migrate_log}" || true
+    rm -f "${migrate_log}"
     success "Local data is ready for the new version."
 }
 
