@@ -6,14 +6,13 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 
 ## What's new in v0.6.0
 
-- Persistent General/About settings for playback, resume, watched threshold, startup, library defaults, posters, and custom `mpv` launch options.
-- An in-app GitHub release check that reports newer versions and opens the release page only after user action.
-- A responsive terminal layout that gives the active panel more space and hides the poster sidebar in narrow terminals.
-- A two-line contextual footer with relevant shortcuts, loading activity, selection position, version, and current playback progress.
-- Editable Unicode search with cursor movement, `Home`/`End`, `Delete`, and automatic restoration of the previous query.
-- A status-based library for Watching, Planned, Completed, On Hold, Dropped, and All.
-- Faster long-list navigation with `j`/`k`, `Page Up`/`Page Down`, and `Home`/`End`.
-- Centered empty states, modal errors, and a fully Ukrainian in-app help screen.
+- Persistent **Settings** (General / About): autoplay, resume, watched threshold slider, startup screen, library filter, posters, custom `mpv` path/args.
+- In-app **GitHub update check** with a confirmation popup (never installs automatically).
+- Interactive **installer menu** (Install / Update / Uninstall, optional data purge) plus `--migrate-data` validation on update.
+- Library and history use stable `history.json` with automatic import from older formats.
+- Conservative AniHub search (one page, tight title match); local library filter via `/`.
+- Polished TUI: tabs, centered dialogs, status editor, contextual footer with `anihub-cli` branding.
+- `Esc` steps back through panels; on the search root it clears the result list to a clean home.
 
 ## Supported functionality
 
@@ -32,6 +31,8 @@ The application depends on the live AniHub/API and streaming pages. Search and s
 ## Installation
 
 The installer supports Linux x86_64 and macOS x86_64/arm64. It downloads the matching release binary, verifies it against `SHA256SUMS`, validates/migrates local data, and installs it to `~/.local/bin` by default. Run it without an action to open the arrow-key menu; it shows **Install** for a fresh setup and **Update / Uninstall** when the binary already exists.
+
+![AniHub CLI installer](assets/installer.png)
 
 ```bash
 curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash
