@@ -590,7 +590,6 @@ fn persist_playback_event(
 ) {
     match event {
         PlaybackEvent::SessionStarted { session_id, target } => {
-            app.is_playing = true;
             app.clear_activity();
             app.now_playing = Some(ui::app::NowPlaying {
                 anime_title: target.anime_title,
@@ -659,7 +658,6 @@ fn persist_playback_event(
         }
         PlaybackEvent::SessionStopped { session_id } => {
             persisted_positions.remove(&session_id);
-            app.is_playing = false;
             app.now_playing = None;
             app.clear_activity();
         }
@@ -670,31 +668,6 @@ fn persist_playback_event(
         }
         PlaybackEvent::EndFile { .. } => {}
     }
-}
-
-pub async fn get_or_fetch_details(app: &mut AppState, anime_id: u32) -> Option<api::AnimeDetails> {
-    if let Some(details) = app.details_cache.get(&anime_id) {
-        return Some(details);
-    }
-    let details = app.api_client.get_anime_details(anime_id).await.ok()?;
-    app.details_cache.insert(anime_id, details.clone());
-    Some(details)
-}
-
-pub async fn get_or_fetch_sources(
-    app: &mut AppState,
-    anime_id: u32,
-) -> Option<EpisodeSourcesResponse> {
-    if let Some(sources) = app.sources_cache.get(&anime_id) {
-        return Some(sources);
-    }
-    let sources = app
-        .api_client
-        .get_episode_sources_for_anime(anime_id)
-        .await
-        .ok()?;
-    app.sources_cache.insert(anime_id, sources.clone());
-    Some(sources)
 }
 
 pub fn apply_continue_context(

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::debug_log;
 use crate::platform;
 use crate::player::TaskCancellation;
@@ -26,7 +24,6 @@ pub struct MoonAnimeProcess {
     script_path: PathBuf,
     diagnostics: Option<JoinHandle<String>>,
     reaped: bool,
-    released: bool,
 }
 
 pub struct MoonAnimeResolution {
@@ -35,10 +32,6 @@ pub struct MoonAnimeResolution {
 }
 
 impl MoonAnimeProcess {
-    pub fn is_reaped(&self) -> bool {
-        self.reaped
-    }
-
     /// Gracefully closes the Python server, then uses bounded forced cleanup.
     pub async fn shutdown(mut self) -> String {
         let diagnostics = self.shutdown_child().await;
@@ -85,30 +78,10 @@ impl MoonAnimeProcess {
             .and_then(Result::ok)
             .unwrap_or_default()
     }
-
-    /// Compatibility bridge for the old AppState field. The supervisor uses
-    /// `shutdown` and never releases this ownership.
-    pub fn into_compat_child(mut self) -> Option<Child> {
-        self.released = true;
-        if let Some(task) = self.diagnostics.take() {
-            task.abort();
-        }
-        self.cleanup_script_if_reaped();
-        self.child.take()
-    }
-
-    fn cleanup_script_if_reaped(&self) {
-        if self.reaped {
-            self.cleanup_script();
-        }
-    }
 }
 
 impl Drop for MoonAnimeProcess {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
         if let Some(mut child) = self.child.take() {
             let _ = child.stdin.take();
             if !self.reaped {
@@ -419,7 +392,6 @@ pub async fn resolve_moonanime_stream(
                 script_path,
                 diagnostics: None,
                 reaped: true,
-                released: false,
             }),
         });
     }
@@ -432,20 +404,8 @@ pub async fn resolve_moonanime_stream(
             script_path,
             diagnostics,
             reaped: false,
-            released: false,
         }),
     })
-}
-
-/// Compatibility wrapper retained for the current AppState. New code should
-/// use `resolve_moonanime_stream` so the proxy remains supervisor-owned.
-pub async fn try_moonanime_stream(iframe_url: &str) -> Option<(String, tokio::process::Child)> {
-    let cancellation = TaskCancellation::new();
-    let resolution = resolve_moonanime_stream(iframe_url, 0, &cancellation)
-        .await
-        .ok()?;
-    let process = resolution.process?;
-    Some((resolution.url, process.into_compat_child()?))
 }
 
 #[cfg(test)]

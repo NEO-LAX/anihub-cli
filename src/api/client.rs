@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::models::{
     AnimeDetails, AnimeItem, AnimeSearchResponse, AshdiEpisode, AshdiStudio, EpisodeSourcesResponse,
 };
@@ -112,14 +110,6 @@ impl ApiError {
     pub fn is_not_found(&self) -> bool {
         self.status() == Some(404)
     }
-
-    pub fn is_transient(&self) -> bool {
-        match self.status() {
-            Some(429) | Some(500..=599) => true,
-            None => matches!(self, Self::Transport { .. }),
-            Some(_) => false,
-        }
-    }
 }
 
 /// A single season request that failed while other season requests may have
@@ -130,14 +120,11 @@ pub struct SeasonSourceFailure {
     pub message: String,
 }
 
-/// Error returned when at least one of seasons 1..=8 failed.  The partial
-/// response is available to callers that want to display usable results while
-/// still reporting the failed seasons.
+/// Error returned when at least one of seasons 1..=8 failed.
 #[derive(Debug)]
 pub struct EpisodeSourcesAggregateError {
     pub anime_id: u32,
     pub failures: Vec<SeasonSourceFailure>,
-    pub partial: EpisodeSourcesResponse,
 }
 
 impl fmt::Display for EpisodeSourcesAggregateError {
@@ -545,7 +532,6 @@ impl ApiClient {
             return Err(anyhow::Error::new(EpisodeSourcesAggregateError {
                 anime_id,
                 failures,
-                partial,
             })
             .context(format!(
                 "AniHub episode-source aggregation for anime {anime_id} had partial failures"

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Actor-owned resource loading.
 //!
 //! The UI can submit requests without owning semaphores, caches, or retry
@@ -35,10 +33,6 @@ pub struct RequestId(pub u64);
 impl RequestId {
     pub const fn new(value: u64) -> Self {
         Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
     }
 }
 
@@ -150,13 +144,6 @@ pub enum LoadError {
 }
 
 impl LoadError {
-    pub fn status(&self) -> Option<u16> {
-        match self {
-            Self::Http { status, .. } => Some(*status),
-            _ => None,
-        }
-    }
-
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Http { retry_after, .. } => *retry_after,
@@ -311,57 +298,8 @@ impl ResourceHandle {
             .map_err(|_| ResourceCommandError::Closed)
     }
 
-    pub fn prefetch(&self) -> PrefetchHandle {
-        PrefetchHandle::new(self.clone())
-    }
-
     fn allocate_request_id(&self) -> RequestId {
         RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-/// Prefetch surface intentionally contains only metadata and poster methods.
-/// There is no bulk episode-source method on this type.
-#[derive(Clone)]
-pub struct PrefetchHandle {
-    resources: ResourceHandle,
-}
-
-impl PrefetchHandle {
-    pub fn new(resources: ResourceHandle) -> Self {
-        Self { resources }
-    }
-
-    pub async fn metadata(
-        &self,
-        generation: ViewGeneration,
-        anime_ids: impl IntoIterator<Item = u32>,
-    ) -> Result<Vec<RequestId>, ResourceCommandError> {
-        let mut request_ids = Vec::new();
-        for anime_id in anime_ids {
-            request_ids.push(
-                self.resources
-                    .load(generation, ResourceKey::Details(anime_id))
-                    .await?,
-            );
-        }
-        Ok(request_ids)
-    }
-
-    pub async fn posters(
-        &self,
-        generation: ViewGeneration,
-        urls: impl IntoIterator<Item = String>,
-    ) -> Result<Vec<RequestId>, ResourceCommandError> {
-        let mut request_ids = Vec::new();
-        for url in urls {
-            request_ids.push(
-                self.resources
-                    .load(generation, ResourceKey::Poster(url))
-                    .await?,
-            );
-        }
-        Ok(request_ids)
     }
 }
 
@@ -382,10 +320,6 @@ impl ResourceWorkerRuntime {
 pub struct ResourceWorker;
 
 impl ResourceWorker {
-    pub fn start(api_client: ApiClient, config: ResourceWorkerConfig) -> ResourceWorkerRuntime {
-        Self::spawn_with_config(api_client, config)
-    }
-
     pub fn spawn(api_client: ApiClient) -> ResourceWorkerRuntime {
         Self::spawn_with_config(api_client, ResourceWorkerConfig::default())
     }

@@ -1,4 +1,4 @@
-#![allow(dead_code, clippy::items_after_test_module)]
+#![allow(clippy::items_after_test_module)]
 
 use super::models::{AnimeItem, AshdiStudio, EpisodeSourcesResponse};
 use std::collections::{HashMap, HashSet};
@@ -13,19 +13,12 @@ pub struct OwnedSource {
     pub source: AshdiStudio,
 }
 
-/// Descriptive alias for callers that work specifically with Ashdi sources.
-pub type OwnedAshdiStudio = OwnedSource;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CombinedEpisodeSources {
     pub ashdi: Vec<OwnedSource>,
 }
 
 impl CombinedEpisodeSources {
-    pub fn is_empty(&self) -> bool {
-        self.ashdi.is_empty()
-    }
-
     /// Convert to the old response plus parallel owner ids for compatibility
     /// with the pre-redesign UI.
     pub fn into_legacy(self) -> (EpisodeSourcesResponse, Vec<u32>) {
@@ -274,16 +267,6 @@ pub fn combine_franchise_sources(
             .then_with(|| left.source.id.cmp(&right.source.id))
     });
     CombinedEpisodeSources { ashdi: combined }
-}
-
-/// Compatibility wrapper for code that still expects the old response and
-/// parallel owner-id vector.
-pub fn combine_franchise_sources_legacy(
-    franchise_order: &[u32],
-    results: &[(u32, EpisodeSourcesResponse)],
-) -> Option<(EpisodeSourcesResponse, Vec<u32>)> {
-    let combined = combine_franchise_sources(franchise_order, results);
-    (!combined.is_empty()).then(|| combined.into_legacy())
 }
 
 fn studio_cmp(left: &AshdiStudio, right: &AshdiStudio) -> std::cmp::Ordering {

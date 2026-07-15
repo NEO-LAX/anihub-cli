@@ -1,16 +1,9 @@
-#![allow(dead_code, clippy::wrong_self_convention)]
-
 use crate::api;
 use crate::api::EpisodeSourcesResponse;
-use crate::moonanime::try_moonanime_stream;
 use crate::moonanime::{MoonAnimeProcess, resolve_moonanime_stream};
 use crate::player::{EndFileReason, MpvMonitorEvent, MpvSession, TaskCancellation};
 use crate::storage;
-use crate::ui::{AppState, ContinueRequest};
-use crate::{
-    apply_continue_context, apply_library_continue_context, get_or_fetch_details,
-    get_or_fetch_sources,
-};
+use crate::ui::AppState;
 use anyhow::{Result, anyhow};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,104 +118,6 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
     })
 }
 
-pub async fn prepare_continue_playback(
-    app: &mut AppState,
-    request: ContinueRequest,
-) -> Option<(PlayTarget, Vec<PlayTarget>)> {
-    let continue_in_library = matches!(
-        &request,
-        ContinueRequest::Group {
-            in_library: true,
-            ..
-        }
-    );
-    let progress = match request {
-        ContinueRequest::Latest => match app.storage.latest_progress() {
-            Ok(Some(progress)) => progress,
-            Ok(None) => {
-                app.set_info_status("Немає збереженого прогресу");
-                return None;
-            }
-            Err(e) => {
-                app.set_error_status(format!("Не вдалося прочитати історію: {}", e));
-                return None;
-            }
-        },
-        ContinueRequest::Group {
-            anime_ids,
-            in_library: _,
-        } => match app
-            .history
-            .progress
-            .values()
-            .filter(|progress| anime_ids.contains(&progress.anime_id))
-            .max_by_key(|progress| progress.updated_at)
-            .cloned()
-        {
-            Some(progress) => progress,
-            None => {
-                app.set_info_status("Немає збереженого прогресу");
-                return None;
-            }
-        },
-    };
-
-    let details = match get_or_fetch_details(app, progress.anime_id).await {
-        Some(details) => details,
-        None => {
-            app.set_error_status("Не вдалося завантажити дані аніме");
-            return None;
-        }
-    };
-    let sources = match get_or_fetch_sources(app, progress.anime_id).await {
-        Some(sources) => sources,
-        None => {
-            app.set_error_status("Не вдалося завантажити серії");
-            return None;
-        }
-    };
-
-    let resolved = match resolve_continue_target(&progress, &sources) {
-        Some(target) => target,
-        None => {
-            app.set_info_status("Усі серії переглянуто");
-            return None;
-        }
-    };
-
-    if continue_in_library {
-        apply_library_continue_context(app, &progress, &details, &sources, &resolved);
-    } else {
-        apply_continue_context(app, &details, &sources, &resolved);
-    }
-
-    let player_title = format!(
-        "{} ({})",
-        details.title_ukrainian,
-        details.year.unwrap_or(0)
-    );
-    let is_moonanime = resolved.url.starts_with("https://moonanime.art");
-    let target = PlayTarget {
-        anime_id: progress.anime_id,
-        anime_title: progress.anime_title.clone(),
-        player_title,
-        season: resolved.season,
-        episode: resolved.episode,
-        episode_title: format!("Серія {}", resolved.episode),
-        stream_page_url: resolved.url,
-        start_time: resolved.start_time,
-        studio_name: resolved.studio_name,
-        referrer: if is_moonanime {
-            "https://moonanime.art/".to_string()
-        } else {
-            "https://ashdi.vip/".to_string()
-        },
-    };
-
-    let queue = build_playback_queue(app, &target);
-    Some((target, queue))
-}
-
 /// Build a deterministic queue after the selected target. The supervisor
 /// resolves each stream only when it becomes current, so MoonAnime proxies
 /// and Ashdi requests are never eagerly spawned for the whole season.
@@ -257,157 +152,6 @@ pub fn build_playback_queue(app: &AppState, target: &PlayTarget) -> Vec<PlayTarg
         queue.push(next);
     }
     queue
-}
-
-pub async fn play_target(app: &mut AppState, target: PlayTarget) {
-    // Якщо щось уже грає — зберігаємо прогрес поточної серії
-    if app.is_playing {
-        if let Some((anime_id, title, season, episode, studio_name)) = &app.pending_progress {
-            if let Ok(new_history) = app.storage.update_progress(
-                *anime_id,
-                title,
-                *season,
-                *episode,
-                studio_name,
-                app.mpv_last_time,
-                app.mpv_last_duration,
-            ) {
-                app.history = new_history;
-                app.rebuild_history_indexes();
-            }
-        }
-    }
-
-    let m3u8 = if target.stream_page_url.starts_with("https://moonanime.art") {
-        // Resolve the replacement first. The old proxy remains usable until
-        // the new stream has produced a valid URL.
-        match try_moonanime_stream(&target.stream_page_url).await {
-            Some((url, proxy_child)) => {
-                if let Some(mut old) = app.moonanime_proxy.take() {
-                    let _ = old.kill().await;
-                    let _ = old.wait().await;
-                }
-                app.moonanime_proxy = Some(proxy_child);
-                url
-            }
-            None => {
-                let command = crate::platform::browser_open_command(
-                    crate::platform::Platform::current(),
-                    &target.stream_page_url,
-                );
-                std::process::Command::new(command.program)
-                    .args(command.args)
-                    .spawn()
-                    .ok();
-                app.set_info_status("MoonAnime відкрито у браузері");
-                return;
-            }
-        }
-    } else {
-        let parser = match api::AshdiParser::new() {
-            Ok(p) => p,
-            Err(e) => {
-                app.set_error_status(format!("Помилка парсера: {}", e));
-                return;
-            }
-        };
-        match parser.extract_m3u8(&target.stream_page_url).await {
-            Ok(u) => u,
-            Err(e) => {
-                app.set_error_status(format!("Помилка парсингу: {}", e));
-                return;
-            }
-        }
-    };
-
-    // Якщо MPV уже запущено — використовуємо IPC
-    if app.is_playing && app.mpv_child.is_some() {
-        let title = format!("{} - {}", target.player_title, target.episode_title);
-        let res = async {
-            app.mpv_player
-                .send_command(serde_json::json!(["loadfile", m3u8]))
-                .await?;
-            app.mpv_player
-                .send_command(serde_json::json!([
-                    "set_property",
-                    "force-media-title",
-                    title
-                ]))
-                .await?;
-            if let Some(t) = target.start_time {
-                if t > 0.0 {
-                    app.mpv_player
-                        .send_command(serde_json::json!(["set_property", "time-pos", t]))
-                        .await?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-
-        if res.is_ok() {
-            app.pending_progress = Some((
-                target.anime_id,
-                target.anime_title.clone(),
-                target.season,
-                target.episode,
-                target.studio_name.clone(),
-            ));
-            app.mpv_playlist.clear();
-            app.mpv_playlist.push((
-                target.anime_id,
-                target.anime_title.clone(),
-                target.season,
-                target.episode,
-                target.studio_name.clone(),
-            ));
-            app.mpv_last_time = 0.0;
-            app.mpv_last_duration = 0.0;
-
-            return;
-        }
-        // Якщо IPC не спрацював (наприклад, mpv "завис") — йдемо далі до перезапуску
-    }
-
-    // Запуск нового процесу MPV
-    match app
-        .mpv_player
-        .start(
-            &m3u8,
-            target.start_time,
-            &target.player_title,
-            &target.episode_title,
-            &target.referrer,
-        )
-        .await
-    {
-        Ok((child, rx, monitor)) => {
-            app.mpv_child = Some(child);
-            app.mpv_rx = Some(rx);
-            app.mpv_monitor = Some(monitor);
-            app.pending_progress = Some((
-                target.anime_id,
-                target.anime_title.clone(),
-                target.season,
-                target.episode,
-                target.studio_name.clone(),
-            ));
-            app.is_playing = true;
-            app.mpv_playlist.clear();
-            app.mpv_playlist.push((
-                target.anime_id,
-                target.anime_title.clone(),
-                target.season,
-                target.episode,
-                target.studio_name.clone(),
-            ));
-            app.mpv_last_time = 0.0;
-            app.mpv_last_duration = 0.0;
-        }
-        Err(e) => {
-            app.set_error_status(format!("Помилка відтворення: {}", e));
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -506,47 +250,6 @@ pub fn resolve_continue_target(
         start_time: Some(0.0),
         studio_name: next_studio_data.1.studio_name.clone(),
     })
-}
-
-pub async fn check_playback_finished(app: &mut AppState) {
-    let finished = if let Some(child) = &mut app.mpv_child {
-        match child.try_wait() {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(_) => true,
-        }
-    } else {
-        false
-    };
-
-    if finished {
-        app.mpv_child = None;
-        let stopped_time = app.mpv_last_time;
-        let duration = app.mpv_last_duration;
-        app.mpv_rx = None;
-        let _ = app.mpv_monitor.take(); // Abort/Clean up the monitor task
-
-        if let Some((anime_id, title, season, episode, studio_name)) = app.pending_progress.take() {
-            if let Ok(new_history) = app.storage.update_progress(
-                anime_id,
-                &title,
-                season,
-                episode,
-                &studio_name,
-                stopped_time,
-                duration,
-            ) {
-                app.history = new_history;
-                app.rebuild_history_indexes();
-            }
-        }
-        app.is_playing = false;
-        app.mpv_player.cleanup();
-        // Зупиняємо MoonAnime proxy якщо він ще живий
-        if let Some(mut proxy) = app.moonanime_proxy.take() {
-            let _ = proxy.kill().await;
-        }
-    }
 }
 
 pub fn get_next_episode(
@@ -675,10 +378,6 @@ impl PlaybackSessionId {
         Self(NEXT_PLAYBACK_SESSION_ID.fetch_add(1, Ordering::Relaxed))
     }
 
-    pub const fn from_raw(value: u64) -> Self {
-        Self(value)
-    }
-
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -750,7 +449,6 @@ pub enum PlaybackCommand {
         target: PlayTarget,
         queue: Vec<PlayTarget>,
     },
-    Stop,
     Shutdown,
 }
 
@@ -796,10 +494,6 @@ impl PlaybackSupervisor {
         self.command(PlaybackCommand::Play { target, queue }).await
     }
 
-    pub async fn stop(&self) -> Result<()> {
-        self.command(PlaybackCommand::Stop).await
-    }
-
     pub async fn shutdown(&mut self) -> Result<()> {
         if self.actor.is_none() {
             return Ok(());
@@ -815,10 +509,6 @@ impl PlaybackSupervisor {
 
     pub fn try_recv_event(&mut self) -> Option<PlaybackEvent> {
         self.events.try_recv().ok()
-    }
-
-    pub async fn recv_event(&mut self) -> Option<PlaybackEvent> {
-        self.events.recv().await
     }
 
     pub fn drain_events(&mut self) -> Vec<PlaybackEvent> {
@@ -956,11 +646,6 @@ impl PlaybackActor {
                     }
                 };
                 self.begin_resolution(purpose).await;
-                Ok(())
-            }
-            PlaybackCommand::Stop => {
-                self.cancel_pending().await;
-                self.stop_active(true).await;
                 Ok(())
             }
             PlaybackCommand::Shutdown => {

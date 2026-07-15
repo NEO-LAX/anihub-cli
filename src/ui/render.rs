@@ -584,8 +584,6 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
                     "▶ {} · S{}E{} · {}{}",
                     now.anime_title, now.season, now.episode, now.studio_name, progress
                 )
-            } else if app.prefetching {
-                "⟳ Кешування метаданих…".to_string()
             } else {
                 String::new()
             }
@@ -1603,7 +1601,6 @@ fn season_year(app: &AppState, season_num: u32) -> Option<u32> {
         .iter()
         .position(|s| s.season_number == season_num)?;
     let anime_id = app.studio_anime_ids.get(studio_idx).copied()?;
-    // Спочатку details_cache, потім season_to_metadata_id
     app.details_cache
         .get(&anime_id)
         .and_then(|d| d.year)

@@ -1,4 +1,3 @@
-pub mod anilist;
 pub mod client;
 pub mod grouper;
 pub mod models;

@@ -1,12 +1,10 @@
-#![allow(dead_code, clippy::wrong_self_convention)]
-
 use crate::platform;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -95,8 +93,6 @@ impl IpcEndpoint {
 
 #[derive(Debug, Clone)]
 pub struct MpvCommandResponse {
-    pub request_id: u64,
-    pub error: String,
     pub data: Option<Value>,
 }
 
@@ -112,22 +108,11 @@ pub struct MpvIpc {
 }
 
 impl MpvIpc {
-    pub fn new(endpoint: IpcEndpoint) -> Self {
-        Self {
-            endpoint,
-            request_ids: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
     fn with_request_ids(endpoint: IpcEndpoint, request_ids: Arc<AtomicU64>) -> Self {
         Self {
             endpoint,
             request_ids,
         }
-    }
-
-    pub fn endpoint(&self) -> &IpcEndpoint {
-        &self.endpoint
     }
 
     pub async fn send_command(&self, command: Value) -> Result<MpvCommandResponse> {
@@ -185,8 +170,6 @@ impl MpvIpc {
             }
 
             return Ok(MpvCommandResponse {
-                request_id,
-                error: error.to_string(),
                 data: value.get("data").cloned(),
             });
         }
@@ -549,14 +532,12 @@ pub struct MpvShutdownSnapshot {
 }
 
 pub struct MpvSession {
-    pub(crate) id: u64,
     pub(crate) endpoint: IpcEndpoint,
     pub(crate) ipc: MpvIpc,
     pub(crate) child: Option<Child>,
     pub(crate) monitor_rx: Option<UnboundedReceiver<MpvMonitorEvent>>,
     pub(crate) monitor: Option<JoinHandle<()>>,
     pub(crate) monitor_cancel: TaskCancellation,
-    released: bool,
 }
 
 pub fn build_mpv_args(
@@ -625,23 +606,13 @@ impl MpvSession {
         ));
 
         Ok(Self {
-            id,
             endpoint,
             ipc,
             child: Some(child),
             monitor_rx: Some(monitor_rx),
             monitor: Some(monitor),
             monitor_cancel: cancel,
-            released: false,
         })
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn endpoint(&self) -> &IpcEndpoint {
-        &self.endpoint
     }
 
     pub fn try_recv_event(&mut self) -> Result<Option<MpvMonitorEvent>> {
@@ -751,43 +722,10 @@ impl MpvSession {
         }
         final_position
     }
-
-    /// Compatibility conversion for the untouched UI loop. The authoritative
-    /// supervisor uses typed events directly and never uses this bridge.
-    pub(crate) fn into_legacy(&mut self) -> (Child, UnboundedReceiver<MpvEvent>, JoinHandle<()>) {
-        self.released = true;
-        let child = self.child.take().expect("mpv child already consumed");
-        let endpoint = self.endpoint.clone();
-        let monitor_rx = self
-            .monitor_rx
-            .take()
-            .expect("mpv monitor already consumed");
-        let monitor = self.monitor.take();
-        let monitor_cancel = self.monitor_cancel.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let bridge = tokio::spawn(async move {
-            let mut typed_rx = monitor_rx;
-            while let Some(event) = typed_rx.recv().await {
-                if let Some(event) = legacy_event(event) {
-                    let _ = tx.send(event);
-                }
-            }
-            monitor_cancel.cancel();
-            if let Some(monitor) = monitor {
-                monitor.abort();
-                let _ = monitor.await;
-            }
-            endpoint.cleanup();
-        });
-        (child, rx, bridge)
-    }
 }
 
 impl Drop for MpvSession {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
         self.monitor_cancel.cancel();
         if let Some(monitor) = self.monitor.take() {
             monitor.abort();
@@ -799,142 +737,6 @@ impl Drop for MpvSession {
             let _ = child.start_kill();
         }
         self.endpoint.cleanup();
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum MpvEvent {
-    Progress(f64, f64),
-    PlaylistPos(usize),
-    FileStarted,
-    FileLoaded,
-    EndFile,
-}
-
-fn legacy_event(event: MpvMonitorEvent) -> Option<MpvEvent> {
-    match event {
-        MpvMonitorEvent::Progress { time_pos, duration } => Some(MpvEvent::Progress(
-            time_pos.unwrap_or(0.0),
-            duration.unwrap_or(0.0),
-        )),
-        // Position zero is an initialization notification, not a progress
-        // transition. Suppressing it protects the compatibility UI from
-        // persisting/resetting the new episode at time zero.
-        MpvMonitorEvent::PlaylistPosition {
-            position: Some(position),
-            ..
-        } if position > 0 => Some(MpvEvent::PlaylistPos(position)),
-        MpvMonitorEvent::FileStarted { .. } => Some(MpvEvent::FileStarted),
-        // The new supervisor applies PlayTarget.start_time in the load command;
-        // do not expose file-loaded as a cue for a detached resume task.
-        MpvMonitorEvent::FileLoaded { .. }
-        | MpvMonitorEvent::PlaylistPosition { .. }
-        | MpvMonitorEvent::MonitorFailed(_)
-        | MpvMonitorEvent::Closed => None,
-        MpvMonitorEvent::EndFile(_) => Some(MpvEvent::EndFile),
-    }
-}
-
-pub struct MpvPlayer {
-    shared: Arc<Mutex<LegacyEndpoint>>,
-    bound_session_id: Option<u64>,
-}
-
-struct LegacyEndpoint {
-    session_id: u64,
-    endpoint: IpcEndpoint,
-    request_ids: Arc<AtomicU64>,
-}
-
-impl Clone for MpvPlayer {
-    fn clone(&self) -> Self {
-        let bound_session_id = self
-            .shared
-            .lock()
-            .ok()
-            .map(|state| state.session_id)
-            .or(self.bound_session_id);
-        Self {
-            shared: self.shared.clone(),
-            bound_session_id,
-        }
-    }
-}
-
-impl MpvPlayer {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            shared: Arc::new(Mutex::new(LegacyEndpoint {
-                session_id: 0,
-                endpoint: IpcEndpoint::for_session(0),
-                request_ids: Arc::new(AtomicU64::new(1)),
-            })),
-            bound_session_id: None,
-        })
-    }
-
-    pub async fn send_command(&self, command: Value) -> Result<()> {
-        let (session_id, endpoint, request_ids) = {
-            let state = self
-                .shared
-                .lock()
-                .map_err(|_| anyhow!("mpv endpoint state poisoned"))?;
-            if state.session_id == 0 {
-                bail!("no active mpv session");
-            }
-            if let Some(bound) = self.bound_session_id {
-                if bound != state.session_id {
-                    bail!("stale IPC command for session {bound}");
-                }
-            }
-            (
-                state.session_id,
-                state.endpoint.clone(),
-                state.request_ids.clone(),
-            )
-        };
-        let _ = session_id;
-        MpvIpc::with_request_ids(endpoint, request_ids)
-            .send_command(command)
-            .await
-            .map(|_| ())
-    }
-
-    pub async fn start(
-        &self,
-        media_url: &str,
-        start_time: Option<f64>,
-        anime_title: &str,
-        episode_title: &str,
-        referrer: &str,
-    ) -> Result<(Child, UnboundedReceiver<MpvEvent>, JoinHandle<()>)> {
-        let session_id = NEXT_ENDPOINT_ID.fetch_add(1, Ordering::Relaxed);
-        let session = MpvSession::spawn(
-            session_id,
-            media_url,
-            start_time,
-            anime_title,
-            episode_title,
-            referrer,
-        )
-        .await?;
-        let endpoint = session.endpoint.clone();
-        let request_ids = session.ipc.request_ids.clone();
-        let mut session = session;
-        let result = session.into_legacy();
-        if let Ok(mut state) = self.shared.lock() {
-            state.session_id = session_id;
-            state.endpoint = endpoint;
-            state.request_ids = request_ids;
-        }
-        Ok(result)
-    }
-
-    pub fn cleanup(&self) {
-        if let Ok(mut state) = self.shared.lock() {
-            state.endpoint.cleanup();
-            state.session_id = 0;
-        }
     }
 }
 
@@ -964,15 +766,6 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--idle=yes"));
         assert!(args.iter().any(|arg| arg == "--keep-open=no"));
         assert!(args.iter().any(|arg| arg == "--start=42"));
-    }
-
-    #[test]
-    fn initial_playlist_position_is_not_a_legacy_transition() {
-        let event = legacy_event(MpvMonitorEvent::PlaylistPosition {
-            position: Some(0),
-            entry_id: Some(12),
-        });
-        assert!(event.is_none());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use crate::api::anilist::FranchiseMember;
 use crate::api::{self, AnimeDetails, AnimeItem, ApiClient, AshdiStudio, EpisodeSourcesResponse};
 use crate::storage::{AppHistory, EpisodeWatchedUpdate, StorageManager, WatchProgress};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -8,10 +7,6 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use tokio::process::Child;
-use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
-use tokio::task::JoinHandle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppMode {
@@ -112,8 +107,6 @@ pub struct LibrarySeasonEntry {
     pub episodes: Vec<WatchProgress>,
 }
 
-pub type PrefetchResult = (u32, Option<AnimeDetails>, Option<EpisodeSourcesResponse>);
-pub type CombinedSourcesResult = Option<(EpisodeSourcesResponse, Vec<u32>)>;
 pub type HistoryIndexes = (HashSet<(u32, u32, u32)>, HashMap<(u32, u32, u32), f64>);
 
 pub struct AppState {
@@ -140,10 +133,9 @@ pub struct AppState {
     // Який search_result показувати в сайдбарі (None = selected_result_index)
     pub sidebar_anime_idx: Option<usize>,
     // season_number → anihub_id для відображення метаданих у sidebar.
-    // Використовується коли реальний власник сезону (studio_anime_ids) не є "правильним"
-    // entry на anihub (напр. S4 завантажується з-під S3 ashdi, але на anihub є окремий запис S4).
-    pub season_to_metadata_id: std::collections::HashMap<u32, u32>,
-
+    // Залишається окремим від studio_anime_ids для сезонів, джерело яких
+    // належить іншому AniHub-запису.
+    pub season_to_metadata_id: HashMap<u32, u32>,
     pub result_list_state: ListState,
     pub season_list_state: ListState,
     pub dubbing_list_state: ListState,
@@ -172,29 +164,11 @@ pub struct AppState {
     pub status_expires_at: Option<Instant>,
     pub show_help: bool,
 
-    // Стан відтворення
-    pub is_playing: bool,
     pub now_playing: Option<NowPlaying>,
-    pub mpv_player: crate::player::MpvPlayer,
-    pub mpv_child: Option<Child>,
-    pub mpv_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::player::MpvEvent>>,
-    pub mpv_monitor: Option<JoinHandle<()>>,
-    pub pending_progress: Option<(u32, String, u32, u32, String)>,
-    pub mpv_playlist: Vec<(u32, String, u32, u32, String)>,
-    pub mpv_last_time: f64,
-    pub mpv_last_duration: f64,
-    /// Proxy-процес для MoonAnime HLS (Python + Playwright Firefox).
-    /// Живе поки mpv грає; вбивається при завершенні відтворення.
-    pub moonanime_proxy: Option<Child>,
 
-    // Кеші та prefetch
-    pub search_cache: moka::sync::Cache<String, Vec<AnimeItem>>,
+    // Кеші ресурсів
     pub details_cache: moka::sync::Cache<u32, AnimeDetails>,
     pub sources_cache: moka::sync::Cache<u32, EpisodeSourcesResponse>,
-    pub prefetching: bool,
-    pub prefetch_rx: Option<mpsc::Receiver<PrefetchResult>>,
-    pub preload_abort: Option<AbortHandle>,
-    pub pending_prefetch_ids: Option<Vec<u32>>,
 
     // Обкладинка
     pub picker: Picker,
@@ -202,16 +176,10 @@ pub struct AppState {
     pub poster_cache: moka::sync::Cache<u32, std::sync::Arc<DynamicImage>>,
     pub poster_fetch_pending: Option<u32>,
 
-    // AniList — кеш членів франшизи (ключ: representative_id)
-    pub anilist_cache: moka::sync::Cache<u32, Vec<FranchiseMember>>,
     /// Результат combine-логіки по representative_id → (EpisodeSourcesResponse, studio_anime_ids).
     /// Заповнюється після першого `load_combined_sources`/`load_library_combined_sources`.
     /// Наступні навігації до тої ж групи використовують кеш і не роблять жодних запитів.
     pub combined_sources_cache: moka::sync::Cache<u32, (EpisodeSourcesResponse, Vec<u32>)>,
-    pub combined_sources_rx: Option<tokio::sync::mpsc::Receiver<CombinedSourcesResult>>,
-    /// Канал для отримання AniList-результатів фонового prefetch.
-    /// Кожне повідомлення: (representative_id, members).
-    pub anilist_prefetch_rx: Option<mpsc::Receiver<(u32, Vec<FranchiseMember>)>>,
 
     // O(1) індекси для перевірки переглянутих серій під час рендеру.
     // Ребілдяться щоразу коли змінюється `history`.
@@ -246,8 +214,7 @@ impl AppState {
 
             studio_anime_ids: Vec::new(),
             sidebar_anime_idx: None,
-            season_to_metadata_id: std::collections::HashMap::new(),
-
+            season_to_metadata_id: HashMap::new(),
             result_list_state: ListState::default(),
             season_list_state: ListState::default(),
             dubbing_list_state: ListState::default(),
@@ -276,35 +243,17 @@ impl AppState {
             status_expires_at: None,
             show_help: false,
 
-            is_playing: false,
             now_playing: None,
-            mpv_player: crate::player::MpvPlayer::new()?,
-            mpv_child: None,
-            mpv_rx: None,
-            mpv_monitor: None,
-            pending_progress: None,
-            mpv_playlist: Vec::new(),
-            mpv_last_time: 0.0,
-            mpv_last_duration: 0.0,
-            moonanime_proxy: None,
 
-            search_cache: moka::sync::Cache::builder().max_capacity(50).build(),
             details_cache: moka::sync::Cache::builder().max_capacity(100).build(),
             sources_cache: moka::sync::Cache::builder().max_capacity(100).build(),
-            prefetching: false,
-            prefetch_rx: None,
-            preload_abort: None,
-            pending_prefetch_ids: None,
 
             picker,
             current_poster: None,
             poster_cache: moka::sync::Cache::builder().max_capacity(30).build(),
             poster_fetch_pending: None,
 
-            anilist_cache: moka::sync::Cache::builder().max_capacity(100).build(),
             combined_sources_cache: moka::sync::Cache::builder().max_capacity(100).build(),
-            combined_sources_rx: None,
-            anilist_prefetch_rx: None,
 
             watched_index,
             progress_index,
@@ -1176,10 +1125,6 @@ impl AppState {
     }
 
     fn reset_to_home(&mut self) {
-        if let Some(abort) = self.preload_abort.take() {
-            abort.abort();
-        }
-
         self.mode = if self.search_results.is_empty() {
             AppMode::SearchInput
         } else {
@@ -1204,9 +1149,6 @@ impl AppState {
         self.activity_message = self
             .loading
             .then(|| "Завантаження вибраного аніме…".to_string());
-        self.prefetching = false;
-        self.prefetch_rx = None;
-        self.anilist_prefetch_rx = None;
         self.clear_status();
         self.current_poster = None;
         self.poster_fetch_pending = None;
@@ -1240,13 +1182,6 @@ impl AppState {
         self.library_items.clear();
         self.mode = AppMode::Library;
         self.apply_library_filter();
-        self.pending_prefetch_ids = Some(
-            self.library_items
-                .iter()
-                .map(|item| item.latest_progress.anime_id)
-                .collect(),
-        );
-
         if self.library_all_items.is_empty() {
             self.set_info_status("Бібліотека й закладки порожні");
         }
@@ -2090,8 +2025,6 @@ impl AppState {
             Some(id) => id,
             None => return,
         };
-        // Якщо є окремий anihub-запис для цього сезону (напр. S4 без dub, але є entry),
-        // використовуємо його для sidebar. Інакше — власник з studio_anime_ids.
         let anime_id = self
             .season_to_metadata_id
             .get(&season_num)
