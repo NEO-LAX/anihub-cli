@@ -2242,16 +2242,19 @@ impl AppState {
                 self.collapse_search_drilldown();
             }
             FocusPanel::SearchList => {
-                // Residual drill-down (sources/selection) left from a previous
-                // open → collapse back to the franchise list without wiping results.
+                // Residual drill-down left open → collapse first, keep results.
                 if self.selected_release_index.is_some()
                     || self.selected_season_index.is_some()
                     || self.selected_dubbing_index.is_some()
                     || self.current_sources.is_some()
                 {
                     self.collapse_search_drilldown();
+                    return;
                 }
-                // Already at a clean search root: keep results. Use `/` for a new query.
+                // Already fully out of seasons/episodes: Esc clears the list.
+                if !self.search_results.is_empty() || !self.last_search_query.is_empty() {
+                    self.clear_search_session();
+                }
             }
         }
     }
@@ -2269,11 +2272,44 @@ impl AppState {
         self.current_sources = None;
         self.current_sources_key = None;
         self.studio_anime_ids.clear();
-        // Keep details/poster for the highlighted franchise when possible.
         if let Some(index) = self.selected_group_index {
             self.result_list_state.select(Some(index));
         }
         self.restore_representative_poster();
+    }
+
+    /// Empty search tab → "press / to search" home.
+    fn clear_search_session(&mut self) {
+        self.mode = AppMode::Normal;
+        self.focus = FocusPanel::SearchList;
+        self.search_query.clear();
+        self.last_search_query.clear();
+        self.search_cursor = 0;
+        self.search_results.clear();
+        self.franchise_groups.clear();
+        self.franchise_catalogs.clear();
+        self.anilist_media.clear();
+        self.selected_group_index = None;
+        self.selected_result_index = None;
+        self.result_list_state.select(None);
+        self.selected_release_index = None;
+        self.selected_season_index = None;
+        self.selected_dubbing_index = None;
+        self.selected_episode_index = None;
+        self.season_list_state.select(None);
+        self.dubbing_list_state.select(None);
+        self.episode_list_state.select(None);
+        self.current_sources = None;
+        self.current_sources_key = None;
+        self.current_details = None;
+        self.current_poster = None;
+        self.poster_fetch_pending = None;
+        self.studio_anime_ids.clear();
+        self.sidebar_anime_idx = None;
+        self.sidebar_subject_id = None;
+        self.loading = false;
+        self.clear_activity();
+        self.clear_status();
     }
 
     fn handle_enter(&mut self) {
