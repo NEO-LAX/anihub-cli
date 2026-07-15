@@ -108,6 +108,7 @@ pub struct LibrarySeasonEntry {
 }
 
 pub type HistoryIndexes = (HashSet<(u32, u32, u32)>, HashMap<(u32, u32, u32), f64>);
+pub type CombinedSourcesCacheKey = (u32, Vec<u32>);
 
 pub struct AppState {
     pub mode: AppMode,
@@ -176,10 +177,11 @@ pub struct AppState {
     pub poster_cache: moka::sync::Cache<u32, std::sync::Arc<DynamicImage>>,
     pub poster_fetch_pending: Option<u32>,
 
-    /// Результат combine-логіки по representative_id → (EpisodeSourcesResponse, studio_anime_ids).
-    /// Заповнюється після першого `load_combined_sources`/`load_library_combined_sources`.
-    /// Наступні навігації до тої ж групи використовують кеш і не роблять жодних запитів.
-    pub combined_sources_cache: moka::sync::Cache<u32, (EpisodeSourcesResponse, Vec<u32>)>,
+    /// Combined episode sources keyed by the representative and the exact
+    /// AniHub ids included in the view. Preview and fully opened views must
+    /// not reuse one another's incomplete aggregate.
+    pub combined_sources_cache:
+        moka::sync::Cache<CombinedSourcesCacheKey, (EpisodeSourcesResponse, Vec<u32>)>,
 
     // O(1) індекси для перевірки переглянутих серій під час рендеру.
     // Ребілдяться щоразу коли змінюється `history`.

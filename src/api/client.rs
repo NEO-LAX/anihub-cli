@@ -5,8 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{Client, RequestBuilder, Response, header};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -111,39 +110,6 @@ impl ApiError {
         self.status() == Some(404)
     }
 }
-
-/// A single season request that failed while other season requests may have
-/// succeeded.  A failure is retained instead of being silently discarded.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeasonSourceFailure {
-    pub season: u32,
-    pub message: String,
-}
-
-/// Error returned when at least one of seasons 1..=8 failed.
-#[derive(Debug)]
-pub struct EpisodeSourcesAggregateError {
-    pub anime_id: u32,
-    pub failures: Vec<SeasonSourceFailure>,
-}
-
-impl fmt::Display for EpisodeSourcesAggregateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let seasons = self
-            .failures
-            .iter()
-            .map(|failure| failure.season.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        write!(
-            f,
-            "failed to load season(s) {seasons} for anime {}",
-            self.anime_id
-        )
-    }
-}
-
-impl std::error::Error for EpisodeSourcesAggregateError {}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -385,137 +351,46 @@ impl ApiClient {
             .context("Failed to decode poster image")
     }
 
-    /// Load seasons 1..=8 with at most three requests in flight.  Results are
-    /// placed back into season order before they are merged.  A non-404
-    /// failure is returned as an aggregate error even when other seasons
-    /// succeeded, with the usable partial result attached to that error.
-    pub async fn get_episode_sources_for_anime(
-        &self,
-        anime_id: u32,
-    ) -> Result<EpisodeSourcesResponse> {
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for season in 1u32..=8 {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("Failed to acquire episode-source concurrency permit")?;
-            let client = self.clone();
-            join_set.spawn(async move {
-                let result = client
-                    .get_episode_sources_if_present(anime_id, season)
-                    .await;
-                drop(permit);
-                (season, result)
-            });
-        }
-
-        let mut ordered: BTreeMap<u32, Result<Option<EpisodeSourcesResponse>>> = BTreeMap::new();
-        while let Some(joined) = join_set.join_next().await {
-            match joined {
-                Ok((season, result)) => {
-                    ordered.insert(season, result);
-                }
-                Err(error) => {
-                    ordered.insert(
-                        0,
-                        Err(anyhow::anyhow!(
-                            "season task failed while loading anime {anime_id}: {error}"
-                        )),
-                    );
-                }
-            }
-        }
-
-        let mut all_studios = Vec::<AshdiStudio>::new();
-        let mut season_first_moon_url = BTreeMap::<u32, String>::new();
-        let mut failures = Vec::<SeasonSourceFailure>::new();
-
-        for season in 1u32..=8 {
-            let Some(result) = ordered.remove(&season) else {
-                failures.push(SeasonSourceFailure {
-                    season,
-                    message: "season task produced no result".to_string(),
-                });
-                continue;
-            };
-
-            match result {
-                Ok(Some(sources)) => {
-                    if let Some(first_moon_ep) = sources
-                        .moonanime
-                        .iter()
-                        .filter_map(|studio| studio.episodes.first())
-                        .next()
-                    {
-                        let normalized = first_moon_ep.iframe_url.trim_end_matches('/');
-                        if !normalized.is_empty() {
-                            season_first_moon_url.insert(season, normalized.to_string());
-                        }
+    /// Load the first season attached to one AniHub catalog entry.
+    ///
+    /// Franchise seasons are represented by separate AniHub ids and are
+    /// requested by the coordinator only after the user opens the title.
+    pub async fn get_first_season_sources(&self, anime_id: u32) -> Result<EpisodeSourcesResponse> {
+        let sources = self.get_episode_sources(anime_id, 1).await?;
+        let mut studios = if !sources.ashdi.is_empty() {
+            sources.ashdi
+        } else {
+            sources
+                .moonanime
+                .into_iter()
+                .map(|moon| {
+                    let episodes = moon
+                        .episodes
+                        .into_iter()
+                        .map(|episode| AshdiEpisode {
+                            episode_number: episode.episode_number,
+                            display_episode_number: episode.display_episode_number,
+                            title: episode.title,
+                            url: episode.iframe_url,
+                            ashdi_episode_id: String::new(),
+                        })
+                        .collect::<Vec<_>>();
+                    AshdiStudio {
+                        id: moon.id,
+                        studio_name: moon.studio_name,
+                        season_number: moon.season_number,
+                        episodes,
+                        episodes_count: moon.episodes_count,
                     }
+                })
+                .collect::<Vec<_>>()
+        };
 
-                    if !sources.ashdi.is_empty() {
-                        all_studios.extend(sources.ashdi);
-                    } else {
-                        all_studios.extend(sources.moonanime.into_iter().map(|moon| {
-                            let episodes = moon
-                                .episodes
-                                .into_iter()
-                                .map(|episode| AshdiEpisode {
-                                    episode_number: episode.episode_number,
-                                    display_episode_number: episode.display_episode_number,
-                                    title: episode.title,
-                                    url: episode.iframe_url,
-                                    ashdi_episode_id: String::new(),
-                                })
-                                .collect::<Vec<_>>();
-                            AshdiStudio {
-                                id: moon.id,
-                                studio_name: moon.studio_name,
-                                season_number: moon.season_number,
-                                episodes,
-                                episodes_count: moon.episodes_count,
-                            }
-                        }));
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => failures.push(SeasonSourceFailure {
-                    season,
-                    message: format_error_chain(&error),
-                }),
-            }
+        if studios.is_empty() {
+            anyhow::bail!("No episode sources found for anime {anime_id} season 1");
         }
 
-        // A task panic is exceptional, but retain it as a visible failure
-        // rather than letting the ordered loop silently ignore map entry 0.
-        if let Some(Err(error)) = ordered.remove(&0) {
-            failures.push(SeasonSourceFailure {
-                season: 0,
-                message: format_error_chain(&error),
-            });
-        }
-
-        if let Some(s1_url) = season_first_moon_url.get(&1).cloned() {
-            let franchise_season = season_first_moon_url
-                .iter()
-                .filter(|(season, url)| **season > 1 && **url == s1_url)
-                .map(|(season, _)| *season)
-                .max();
-
-            if let Some(franchise_season) = franchise_season {
-                for studio in &mut all_studios {
-                    if studio.season_number == 1 {
-                        studio.season_number = franchise_season;
-                    }
-                }
-                deduplicate_studios(&mut all_studios);
-            }
-        }
-
-        all_studios.sort_by(|left, right| {
+        studios.sort_by(|left, right| {
             left.season_number
                 .cmp(&right.season_number)
                 .then_with(|| left.studio_name.cmp(&right.studio_name))
@@ -523,61 +398,10 @@ impl ApiClient {
                 .then_with(|| right.episodes.len().cmp(&left.episodes.len()))
         });
 
-        let partial = EpisodeSourcesResponse {
-            ashdi: all_studios,
+        Ok(EpisodeSourcesResponse {
+            ashdi: studios,
             moonanime: Vec::new(),
-        };
-
-        if !failures.is_empty() {
-            return Err(anyhow::Error::new(EpisodeSourcesAggregateError {
-                anime_id,
-                failures,
-            })
-            .context(format!(
-                "AniHub episode-source aggregation for anime {anime_id} had partial failures"
-            )));
-        }
-
-        if partial.ashdi.is_empty() {
-            anyhow::bail!("No episode sources found for anime {anime_id}");
-        }
-
-        Ok(partial)
-    }
-
-    async fn get_episode_sources_if_present(
-        &self,
-        anime_id: u32,
-        season: u32,
-    ) -> Result<Option<EpisodeSourcesResponse>> {
-        let request = self.authenticated(
-            self.client
-                .get(self.internal_api_url(&format!("/anime/{anime_id}/episode-sources")))
-                .query(&[("season", season)]),
-        );
-        let response = self
-            .send_request(request, "AniHub episode sources request")
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to send episode sources request for anime {anime_id}, season {season}"
-                )
-            })?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let response = ensure_success(response, "AniHub episode sources")?;
-        let sources: EpisodeSourcesResponse = parse_json(response, "AniHub episode sources")
-            .await
-            .with_context(|| {
-                format!("Failed to parse episode sources for anime {anime_id}, season {season}")
-            })?;
-        if sources.ashdi.is_empty() && sources.moonanime.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(sources))
-        }
+        })
     }
 }
 
@@ -655,40 +479,12 @@ pub(crate) fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration>
     (until - Utc::now()).to_std().ok()
 }
 
-fn format_error_chain(error: &anyhow::Error) -> String {
-    error
-        .chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(": ")
-}
-
 fn deduplicate_anime_by_id(items: Vec<AnimeItem>) -> Vec<AnimeItem> {
     let mut seen = std::collections::HashSet::new();
     items
         .into_iter()
         .filter(|item| seen.insert(item.id))
         .collect()
-}
-
-fn deduplicate_studios(studios: &mut Vec<AshdiStudio>) {
-    let mut deduplicated = Vec::with_capacity(studios.len());
-    for studio in studios.drain(..) {
-        if let Some(position) = deduplicated.iter().position(|existing: &AshdiStudio| {
-            existing.season_number == studio.season_number
-                && existing.studio_name == studio.studio_name
-        }) {
-            let existing = &deduplicated[position];
-            let replace = studio.episodes.len() > existing.episodes.len()
-                || (studio.episodes.len() == existing.episodes.len() && studio.id < existing.id);
-            if replace {
-                deduplicated[position] = studio;
-            }
-        } else {
-            deduplicated.push(studio);
-        }
-    }
-    *studios = deduplicated;
 }
 
 #[cfg(test)]
@@ -866,6 +662,51 @@ mod tests {
                 .and_then(ApiError::status),
             Some(500)
         );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn first_season_loader_makes_one_request_and_normalizes_moonanime() {
+        let server = MockServer::start(|_, path| {
+            let url = reqwest::Url::parse(&format!("http://localhost{path}"))
+                .expect("mock request path must form a valid URL");
+            let params = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            assert_eq!(params.get("season"), Some(&"1".to_string()));
+            (
+                200,
+                serde_json::json!({
+                    "ashdi": [],
+                    "moonanime": [{
+                        "id": 17,
+                        "studio_name": "Moon Studio",
+                        "season_number": 1,
+                        "episodes_count": 1,
+                        "episodes": [{
+                            "episode_number": 1,
+                            "display_episode_number": 1.0,
+                            "title": "Episode 1",
+                            "iframe_url": "https://moonanime.art/episode/1",
+                            "poster_url": ""
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+        })
+        .await;
+
+        let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
+        let sources = client.get_first_season_sources(42).await.unwrap();
+
+        assert_eq!(server.requests().await.len(), 1);
+        assert_eq!(sources.ashdi.len(), 1);
+        assert_eq!(sources.ashdi[0].season_number, 1);
+        assert_eq!(sources.ashdi[0].episodes.len(), 1);
+        assert_eq!(
+            sources.ashdi[0].episodes[0].url,
+            "https://moonanime.art/episode/1"
+        );
+        assert!(sources.moonanime.is_empty());
         server.stop().await;
     }
 }

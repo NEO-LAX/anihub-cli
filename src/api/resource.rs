@@ -766,7 +766,7 @@ async fn load_once(api_client: &ApiClient, work: &Work) -> Result<ResourceValue,
             .map(ResourceValue::Details)
             .map_err(classify_error),
         ResourceKey::Sources(anime_id) => api_client
-            .get_episode_sources_for_anime(*anime_id)
+            .get_first_season_sources(*anime_id)
             .await
             .map(ResourceValue::Sources)
             .map_err(classify_error),

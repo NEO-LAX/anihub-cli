@@ -35,12 +35,19 @@ use std::io::stdout;
 use ui::{AppMode, AppState, FocusPanel};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceLoadScope {
+    Preview,
+    Full,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ResourceContext {
     Search(String),
     Content {
         representative_id: u32,
         anime_ids: Vec<u32>,
         details_id: u32,
+        source_scope: SourceLoadScope,
     },
 }
 
@@ -111,6 +118,7 @@ impl ResourceCoordinator {
                 representative_id: pending.progress.anime_id,
                 anime_ids: vec![pending.progress.anime_id],
                 details_id: pending.progress.anime_id,
+                source_scope: SourceLoadScope::Full,
             });
         }
         desired_resource_context(app)
@@ -162,6 +170,7 @@ impl ResourceCoordinator {
         let Some(sources) = app.sources_cache.get(&pending.progress.anime_id) else {
             return;
         };
+        let sources = align_single_season_sources(sources, pending.progress.season);
         let Some(resolved) = resolve_continue_target(&pending.progress, &sources) else {
             app.clear_activity();
             app.set_info_status("Усі серії переглянуто");
@@ -223,8 +232,12 @@ impl ResourceCoordinator {
                 representative_id,
                 anime_ids,
                 details_id,
+                source_scope,
             } => {
-                app.set_activity("Завантаження метаданих і серій…");
+                app.set_activity(match source_scope {
+                    SourceLoadScope::Preview => "Завантаження першого сезону…",
+                    SourceLoadScope::Full => "Завантаження всіх сезонів…",
+                });
                 if let Some(details) = app.details_cache.get(&details_id) {
                     app.current_details = Some(details);
                 } else {
@@ -235,7 +248,8 @@ impl ResourceCoordinator {
                         .await;
                 }
 
-                if let Some((sources, owners)) = app.combined_sources_cache.get(&representative_id)
+                let combined_cache_key = (representative_id, anime_ids.clone());
+                if let Some((sources, owners)) = app.combined_sources_cache.get(&combined_cache_key)
                 {
                     app.current_sources = Some(sources);
                     app.studio_anime_ids = owners;
@@ -391,7 +405,8 @@ impl ResourceCoordinator {
             }
             (
                 ResourceKey::Combined {
-                    representative_id, ..
+                    representative_id,
+                    franchise_order,
                 },
                 Ok(ResourceValue::Combined(value)),
             ) => {
@@ -399,8 +414,10 @@ impl ResourceCoordinator {
                 if sources.ashdi.is_empty() {
                     app.set_info_status("Джерела серій відсутні");
                 }
-                app.combined_sources_cache
-                    .insert(representative_id, (sources.clone(), owners.clone()));
+                app.combined_sources_cache.insert(
+                    (representative_id, franchise_order),
+                    (sources.clone(), owners.clone()),
+                );
                 app.current_sources = Some(sources);
                 app.studio_anime_ids = owners;
                 app.clear_activity();
@@ -469,6 +486,7 @@ fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
             representative_id: anime.latest_progress.anime_id,
             anime_ids: anime.anime_ids.clone(),
             details_id,
+            source_scope: SourceLoadScope::Full,
         });
     }
     if app.mode == AppMode::Normal {
@@ -486,13 +504,48 @@ fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
         if anime_ids.is_empty() {
             anime_ids.push(item.id);
         }
+        let source_scope = if app.focus == FocusPanel::SearchList {
+            SourceLoadScope::Preview
+        } else {
+            SourceLoadScope::Full
+        };
+        let anime_ids = source_ids_for_scope(anime_ids, &source_scope);
         return Some(ResourceContext::Content {
             representative_id: item.id,
             anime_ids,
             details_id: item.id,
+            source_scope,
         });
     }
     None
+}
+
+fn source_ids_for_scope(mut anime_ids: Vec<u32>, scope: &SourceLoadScope) -> Vec<u32> {
+    if matches!(scope, SourceLoadScope::Preview) {
+        anime_ids.truncate(1);
+    }
+    anime_ids
+}
+
+fn align_single_season_sources(
+    mut sources: EpisodeSourcesResponse,
+    expected_season: u32,
+) -> EpisodeSourcesResponse {
+    let seasons = sources
+        .ashdi
+        .iter()
+        .map(|studio| studio.season_number)
+        .chain(sources.moonanime.iter().map(|studio| studio.season_number))
+        .collect::<HashSet<_>>();
+    if seasons.len() == 1 && !seasons.contains(&expected_season) {
+        for studio in &mut sources.ashdi {
+            studio.season_number = expected_season;
+        }
+        for studio in &mut sources.moonanime {
+            studio.season_number = expected_season;
+        }
+    }
+    sources
 }
 
 struct TerminalRestore {
@@ -776,5 +829,50 @@ fn apply_search_results(app: &mut AppState, results: Vec<api::AnimeItem>) {
         app.selected_group_index = None;
         app.selected_result_index = None;
         app.set_info_status("Нічого не знайдено");
+    }
+}
+
+#[cfg(test)]
+mod staged_source_loading_tests {
+    use super::*;
+
+    #[test]
+    fn preview_uses_only_the_first_franchise_entry() {
+        assert_eq!(
+            source_ids_for_scope(vec![10, 20, 30], &SourceLoadScope::Preview),
+            vec![10]
+        );
+    }
+
+    #[test]
+    fn opened_title_uses_every_franchise_entry() {
+        assert_eq!(
+            source_ids_for_scope(vec![10, 20, 30], &SourceLoadScope::Full),
+            vec![10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn continue_aligns_a_single_api_season_with_saved_progress() {
+        let sources = EpisodeSourcesResponse {
+            ashdi: vec![api::AshdiStudio {
+                id: 1,
+                studio_name: "Studio".to_string(),
+                season_number: 1,
+                episodes: vec![api::AshdiEpisode {
+                    episode_number: 1,
+                    display_episode_number: None,
+                    title: "Episode 1".to_string(),
+                    url: "https://ashdi.vip/episode/1".to_string(),
+                    ashdi_episode_id: "1".to_string(),
+                }],
+                episodes_count: 1,
+            }],
+            moonanime: Vec::new(),
+        };
+
+        let aligned = align_single_season_sources(sources, 3);
+
+        assert_eq!(aligned.ashdi[0].season_number, 3);
     }
 }
