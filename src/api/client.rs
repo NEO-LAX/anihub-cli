@@ -1,6 +1,5 @@
-use super::models::{
-    AnimeDetails, AnimeItem, AnimeSearchResponse, AshdiEpisode, AshdiStudio, EpisodeSourcesResponse,
-};
+use super::franchise::AniListMedia;
+use super::models::{AnimeDetails, AnimeItem, AnimeSearchResponse, EpisodeSourcesResponse};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{Client, RequestBuilder, Response, header};
@@ -12,11 +11,72 @@ use thiserror::Error;
 
 const API_BASE_URL: &str = "https://api.anihub.in.ua";
 const INTERNAL_API_BASE_URL: &str = "https://anihub.in.ua/api";
+const ANILIST_GRAPHQL_URL: &str = "https://graphql.anilist.co";
+const ANILIST_BATCH_SIZE: usize = 50;
 const SEARCH_PAGE_SIZE: u32 = 20;
 const MAX_SEARCH_PAGES: u32 = 100;
 const MAX_CONCURRENT_REQUESTS: usize = 3;
 const MAX_REQUEST_STARTS: usize = 40;
 const REQUEST_WINDOW: Duration = Duration::from_secs(60);
+
+const ANILIST_MEDIA_BATCH_QUERY: &str = r#"
+query AniHubFranchiseBatch($ids: [Int!]!) {
+  Page(page: 1, perPage: 50) {
+    media(id_in: $ids, type: ANIME, sort: ID) {
+      id
+      type
+      format
+      status
+      episodes
+      seasonYear
+      nextAiringEpisode { episode airingAt }
+      title { romaji english native }
+      coverImage { large }
+      relations {
+        edges {
+          relationType
+          node {
+            id
+            type
+            format
+            status
+            episodes
+            seasonYear
+            nextAiringEpisode { episode airingAt }
+            title { romaji english native }
+            coverImage { large }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+#[derive(Debug, serde::Deserialize)]
+struct AniListGraphQlResponse {
+    #[serde(default)]
+    data: Option<AniListGraphQlData>,
+    #[serde(default)]
+    errors: Vec<AniListGraphQlError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AniListGraphQlData {
+    #[serde(default, rename = "Page")]
+    page: Option<AniListGraphQlPage>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AniListGraphQlPage {
+    #[serde(default)]
+    media: Vec<AniListMedia>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AniListGraphQlError {
+    message: String,
+}
 
 struct RequestGate {
     concurrency: Arc<tokio::sync::Semaphore>,
@@ -116,6 +176,7 @@ pub struct ApiClient {
     client: Client,
     api_base_url: String,
     internal_api_base_url: String,
+    anilist_graphql_url: String,
     request_gate: Arc<RequestGate>,
 }
 
@@ -153,10 +214,41 @@ impl ApiClient {
         api_base_url: impl AsRef<str>,
         internal_api_base_url: impl AsRef<str>,
     ) -> Result<Self> {
+        Self::from_client_with_endpoints(
+            client,
+            api_base_url,
+            internal_api_base_url,
+            ANILIST_GRAPHQL_URL,
+        )
+    }
+
+    /// Build a client with an injectable AniList GraphQL endpoint.
+    pub fn with_endpoints(
+        api_base_url: impl AsRef<str>,
+        internal_api_base_url: impl AsRef<str>,
+        anilist_graphql_url: impl AsRef<str>,
+    ) -> Result<Self> {
+        let client = build_http_client().context("Failed to build HTTP client")?;
+        Self::from_client_with_endpoints(
+            client,
+            api_base_url,
+            internal_api_base_url,
+            anilist_graphql_url,
+        )
+    }
+
+    /// Injectable-endpoint variant for callers that already own a reqwest client.
+    pub fn from_client_with_endpoints(
+        client: Client,
+        api_base_url: impl AsRef<str>,
+        internal_api_base_url: impl AsRef<str>,
+        anilist_graphql_url: impl AsRef<str>,
+    ) -> Result<Self> {
         Ok(Self {
             client,
             api_base_url: normalize_base_url(api_base_url.as_ref())?,
             internal_api_base_url: normalize_base_url(internal_api_base_url.as_ref())?,
+            anilist_graphql_url: normalize_base_url(anilist_graphql_url.as_ref())?,
             request_gate: Arc::new(RequestGate::new()),
         })
     }
@@ -171,6 +263,10 @@ impl ApiClient {
 
     pub fn internal_api_base_url(&self) -> &str {
         &self.internal_api_base_url
+    }
+
+    pub fn anilist_graphql_url(&self) -> &str {
+        &self.anilist_graphql_url
     }
 
     fn generate_api_key(&self) -> String {
@@ -330,6 +426,61 @@ impl ApiClient {
             .map(|anime| anime.id))
     }
 
+    /// Fetch AniList media and their direct relation nodes in deterministic
+    /// batches. Duplicate and zero ids are ignored, and the result is sorted
+    /// by AniList id regardless of response order.
+    pub async fn get_anilist_media_batch(&self, anilist_ids: &[u32]) -> Result<Vec<AniListMedia>> {
+        let ids = anilist_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != 0)
+            .collect::<std::collections::BTreeSet<_>>();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        let mut media_by_id = std::collections::BTreeMap::new();
+        for batch in ids.chunks(ANILIST_BATCH_SIZE) {
+            let request = self
+                .client
+                .post(&self.anilist_graphql_url)
+                .json(&serde_json::json!({
+                    "query": ANILIST_MEDIA_BATCH_QUERY,
+                    "variables": { "ids": batch },
+                }));
+            let response = self
+                .send_request(request, "AniList media batch request")
+                .await
+                .context("Failed to send AniList media batch request")?;
+            let response = ensure_success(response, "AniList media batch")?;
+            let payload: AniListGraphQlResponse =
+                parse_json(response, "AniList media batch").await?;
+            if !payload.errors.is_empty() {
+                let message = payload
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(anyhow::Error::new(ApiError::Parse {
+                    operation: "AniList media batch".to_string(),
+                    message,
+                }));
+            }
+            let page = payload.data.and_then(|data| data.page).ok_or_else(|| {
+                anyhow::Error::new(ApiError::Parse {
+                    operation: "AniList media batch".to_string(),
+                    message: "response did not contain data.Page".to_string(),
+                })
+            })?;
+            for media in page.media {
+                media_by_id.insert(media.id, media);
+            }
+        }
+        Ok(media_by_id.into_values().collect())
+    }
+
     pub async fn fetch_poster(&self, url: &str) -> Result<image::DynamicImage> {
         let response = self
             .send_request(self.client.get(url), "AniHub poster request")
@@ -351,46 +502,20 @@ impl ApiClient {
             .context("Failed to decode poster image")
     }
 
-    /// Load the first season attached to one AniHub catalog entry.
-    ///
-    /// Franchise seasons are represented by separate AniHub ids and are
-    /// requested by the coordinator only after the user opens the title.
-    pub async fn get_first_season_sources(&self, anime_id: u32) -> Result<EpisodeSourcesResponse> {
-        let sources = self.get_episode_sources(anime_id, 1).await?;
-        let mut studios = if !sources.ashdi.is_empty() {
-            sources.ashdi
-        } else {
-            sources
-                .moonanime
-                .into_iter()
-                .map(|moon| {
-                    let episodes = moon
-                        .episodes
-                        .into_iter()
-                        .map(|episode| AshdiEpisode {
-                            episode_number: episode.episode_number,
-                            display_episode_number: episode.display_episode_number,
-                            title: episode.title,
-                            url: episode.iframe_url,
-                            ashdi_episode_id: String::new(),
-                        })
-                        .collect::<Vec<_>>();
-                    AshdiStudio {
-                        id: moon.id,
-                        studio_name: moon.studio_name,
-                        season_number: moon.season_number,
-                        episodes,
-                        episodes_count: moon.episodes_count,
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-
-        if studios.is_empty() {
-            anyhow::bail!("No episode sources found for anime {anime_id} season 1");
+    /// Load one AniHub release using the franchise-level season expected by
+    /// the episode-sources endpoint. Separate AniHub ids do not make this
+    /// parameter release-local: S2 entries still require `season=2`.
+    pub async fn get_release_sources(
+        &self,
+        anime_id: u32,
+        season: u32,
+    ) -> Result<EpisodeSourcesResponse> {
+        let mut sources = self.get_episode_sources(anime_id, season).await?;
+        if sources.ashdi.is_empty() && sources.moonanime.is_empty() {
+            anyhow::bail!("No episode sources found for anime {anime_id} season {season}");
         }
 
-        studios.sort_by(|left, right| {
+        sources.ashdi.sort_by(|left, right| {
             left.season_number
                 .cmp(&right.season_number)
                 .then_with(|| left.studio_name.cmp(&right.studio_name))
@@ -398,10 +523,7 @@ impl ApiClient {
                 .then_with(|| right.episodes.len().cmp(&left.episodes.len()))
         });
 
-        Ok(EpisodeSourcesResponse {
-            ashdi: studios,
-            moonanime: Vec::new(),
-        })
+        Ok(sources)
     }
 }
 
@@ -576,6 +698,12 @@ mod tests {
             anime_type: "TV".to_string(),
             year: Some(2024),
             has_ukrainian_dub: true,
+            poster_url: None,
+            episodes_count: None,
+            description: None,
+            rating: None,
+            genres: None,
+            dubbing_studios: None,
         }
     }
 
@@ -665,13 +793,103 @@ mod tests {
         server.stop().await;
     }
 
+    #[test]
+    fn search_metadata_is_optional_for_older_payloads() {
+        let parsed: AnimeItem = serde_json::from_value(serde_json::json!({
+            "id": 5048,
+            "anilist_id": 108465,
+            "slug": "mushoku-tensei",
+            "title_ukrainian": "Реінкарнація безробітного",
+            "title_original": "Mushoku Tensei",
+            "title_english": "Mushoku Tensei",
+            "status": "completed",
+            "type": "tv",
+            "year": 2021,
+            "has_ukrainian_dub": true
+        }))
+        .unwrap();
+        assert_eq!(parsed.poster_url, None);
+        assert_eq!(parsed.episodes_count, None);
+        assert_eq!(parsed.description, None);
+        assert_eq!(parsed.rating, None);
+        assert_eq!(parsed.genres, None);
+        assert_eq!(parsed.dubbing_studios, None);
+    }
+
     #[tokio::test]
-    async fn first_season_loader_makes_one_request_and_normalizes_moonanime() {
+    async fn anilist_batch_deduplicates_ids_and_returns_sorted_media() {
+        let server = MockServer::start(|_, path| {
+            assert_eq!(path, "/graphql");
+            (
+                200,
+                serde_json::json!({
+                    "data": {
+                        "Page": {
+                            "media": [
+                                {
+                                    "id": 127720,
+                                    "type": "ANIME",
+                                    "format": "TV",
+                                    "seasonYear": 2021,
+                                    "title": { "english": "Mushoku Tensei Part 2" },
+                                    "coverImage": { "large": "poster-2" },
+                                    "relations": { "edges": [] }
+                                },
+                                {
+                                    "id": 108465,
+                                    "type": "ANIME",
+                                    "format": "TV",
+                                    "seasonYear": 2021,
+                                    "title": { "english": "Mushoku Tensei" },
+                                    "coverImage": { "large": "poster-1" },
+                                    "relations": {
+                                        "edges": [{
+                                            "relationType": "SEQUEL",
+                                            "node": {
+                                                "id": 127720,
+                                                "type": "ANIME",
+                                                "format": "TV",
+                                                "seasonYear": 2021,
+                                                "title": { "english": "Mushoku Tensei Part 2" },
+                                                "coverImage": { "large": "poster-2" }
+                                            }
+                                        }]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                })
+                .to_string(),
+            )
+        })
+        .await;
+        let client = ApiClient::with_endpoints(
+            &server.address,
+            &server.address,
+            format!("{}/graphql", server.address),
+        )
+        .unwrap();
+        let media = client
+            .get_anilist_media_batch(&[127720, 108465, 127720, 0])
+            .await
+            .unwrap();
+        assert_eq!(
+            media.iter().map(|media| media.id).collect::<Vec<_>>(),
+            vec![108465, 127720]
+        );
+        assert_eq!(media[0].relations.edges[0].relation_type, "SEQUEL");
+        assert_eq!(server.requests().await.len(), 1);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn release_source_loader_marks_browser_only_moonanime() {
         let server = MockServer::start(|_, path| {
             let url = reqwest::Url::parse(&format!("http://localhost{path}"))
                 .expect("mock request path must form a valid URL");
             let params = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
-            assert_eq!(params.get("season"), Some(&"1".to_string()));
+            assert_eq!(params.get("season"), Some(&"2".to_string()));
             (
                 200,
                 serde_json::json!({
@@ -679,7 +897,7 @@ mod tests {
                     "moonanime": [{
                         "id": 17,
                         "studio_name": "Moon Studio",
-                        "season_number": 1,
+                        "season_number": 2,
                         "episodes_count": 1,
                         "episodes": [{
                             "episode_number": 1,
@@ -696,17 +914,17 @@ mod tests {
         .await;
 
         let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
-        let sources = client.get_first_season_sources(42).await.unwrap();
+        let sources = client.get_release_sources(42, 2).await.unwrap();
 
         assert_eq!(server.requests().await.len(), 1);
-        assert_eq!(sources.ashdi.len(), 1);
-        assert_eq!(sources.ashdi[0].season_number, 1);
-        assert_eq!(sources.ashdi[0].episodes.len(), 1);
+        assert!(sources.ashdi.is_empty());
+        assert!(sources.is_moonanime_only());
+        assert_eq!(sources.moonanime[0].studio_name, "Moon Studio");
+        assert_eq!(sources.moonanime[0].episodes_count, 1);
         assert_eq!(
-            sources.ashdi[0].episodes[0].url,
+            sources.moonanime[0].episodes[0].iframe_url,
             "https://moonanime.art/episode/1"
         );
-        assert!(sources.moonanime.is_empty());
         server.stop().await;
     }
 }

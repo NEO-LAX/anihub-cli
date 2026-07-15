@@ -5,8 +5,8 @@
 //! can discard an old result without racing a newer view.
 
 use super::client::{ApiClient, ApiError};
-use super::grouper::{CombinedEpisodeSources, combine_franchise_sources};
-use super::models::{AnimeDetails, AnimeItem, EpisodeSourcesResponse};
+use super::franchise::AniListMedia;
+use super::models::{AnimeDetails, AnimeItem, EpisodeSourcesKey, EpisodeSourcesResponse};
 use image::DynamicImage;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -62,20 +62,16 @@ impl From<u64> for ViewGeneration {
     }
 }
 
-/// Resources supported by the worker.  `Combined` is a pure merge of source
-/// responses supplied by the caller; it never starts episode-source requests.
+/// Resources supported by the worker.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResourceKey {
     Search(String),
+    AniHubByAniList(u32),
     Details(u32),
     /// Episode sources requested explicitly for the currently opened view.
     /// This variant is intentionally absent from [`PrefetchHandle`].
-    Sources(u32),
+    Sources(EpisodeSourcesKey),
     Poster(String),
-    Combined {
-        representative_id: u32,
-        franchise_order: Vec<u32>,
-    },
 }
 
 impl ResourceKey {
@@ -87,23 +83,20 @@ impl ResourceKey {
         Self::Details(anime_id)
     }
 
-    pub const fn sources(anime_id: u32) -> Self {
-        Self::Sources(anime_id)
+    pub const fn anihub_by_anilist(anilist_id: u32) -> Self {
+        Self::AniHubByAniList(anilist_id)
+    }
+
+    pub const fn sources(anime_id: u32, season: u32) -> Self {
+        Self::Sources(EpisodeSourcesKey::new(anime_id, season))
     }
 
     pub fn poster(url: impl Into<String>) -> Self {
         Self::Poster(url.into())
     }
 
-    pub fn combined(representative_id: u32, franchise_order: Vec<u32>) -> Self {
-        Self::Combined {
-            representative_id,
-            franchise_order,
-        }
-    }
-
     fn uses_anihub(&self) -> bool {
-        !matches!(self, Self::Combined { .. })
+        true
     }
 }
 
@@ -112,11 +105,17 @@ impl ResourceKey {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ResourceValue {
-    Search(Vec<AnimeItem>),
+    Search(SearchResultBundle),
+    AniHubId(Option<u32>),
     Details(AnimeDetails),
     Sources(EpisodeSourcesResponse),
     Poster(DynamicImage),
-    Combined(CombinedEpisodeSources),
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResultBundle {
+    pub items: Vec<AnimeItem>,
+    pub anilist_media: Vec<AniListMedia>,
 }
 
 /// Worker failure model.  HTTP status and retry-after are retained for
@@ -173,12 +172,6 @@ pub enum ResourceCommand {
         request_id: RequestId,
         generation: ViewGeneration,
         key: ResourceKey,
-    },
-    LoadCombined {
-        request_id: RequestId,
-        generation: ViewGeneration,
-        key: ResourceKey,
-        results: Vec<(u32, EpisodeSourcesResponse)>,
     },
     CancelGeneration {
         generation: ViewGeneration,
@@ -260,27 +253,6 @@ impl ResourceHandle {
         Ok(request_id)
     }
 
-    pub async fn load_combined(
-        &self,
-        generation: ViewGeneration,
-        representative_id: u32,
-        franchise_order: Vec<u32>,
-        results: Vec<(u32, EpisodeSourcesResponse)>,
-    ) -> Result<RequestId, ResourceCommandError> {
-        let request_id = self.allocate_request_id();
-        let key = ResourceKey::combined(representative_id, franchise_order);
-        self.command_tx
-            .send(ResourceCommand::LoadCombined {
-                request_id,
-                generation,
-                key,
-                results,
-            })
-            .await
-            .map_err(|_| ResourceCommandError::Closed)?;
-        Ok(request_id)
-    }
-
     pub async fn cancel_generation(
         &self,
         generation: ViewGeneration,
@@ -349,7 +321,6 @@ impl ResourceWorker {
 #[derive(Clone)]
 struct Work {
     key: ResourceKey,
-    combined_results: Option<Vec<(u32, EpisodeSourcesResponse)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -530,28 +501,7 @@ impl Actor {
                         request_id,
                         generation,
                     },
-                    Work {
-                        key,
-                        combined_results: None,
-                    },
-                )
-                .await;
-            }
-            ResourceCommand::LoadCombined {
-                request_id,
-                generation,
-                key,
-                results,
-            } => {
-                self.enqueue(
-                    Waiter {
-                        request_id,
-                        generation,
-                    },
-                    Work {
-                        key,
-                        combined_results: Some(results),
-                    },
+                    Work { key },
                 )
                 .await;
             }
@@ -755,18 +705,39 @@ async fn load_with_retries(
 
 async fn load_once(api_client: &ApiClient, work: &Work) -> Result<ResourceValue, LoadError> {
     match &work.key {
-        ResourceKey::Search(query) => api_client
-            .search_anime(query)
+        ResourceKey::Search(query) => {
+            let items = api_client
+                .search_anime(query)
+                .await
+                .map_err(classify_error)?;
+            let anilist_ids = items
+                .iter()
+                .filter_map(|item| item.anilist_id)
+                .collect::<Vec<_>>();
+            // Franchise enrichment is optional: AniHub search remains useful
+            // during an AniList outage, and the UI falls back to conservative
+            // one-release catalogs instead of failing the entire search.
+            let anilist_media = api_client
+                .get_anilist_media_batch(&anilist_ids)
+                .await
+                .unwrap_or_default();
+            Ok(ResourceValue::Search(SearchResultBundle {
+                items,
+                anilist_media,
+            }))
+        }
+        ResourceKey::AniHubByAniList(anilist_id) => api_client
+            .get_anime_by_anilist_id(*anilist_id)
             .await
-            .map(ResourceValue::Search)
+            .map(ResourceValue::AniHubId)
             .map_err(classify_error),
         ResourceKey::Details(anime_id) => api_client
             .get_anime_details(*anime_id)
             .await
             .map(ResourceValue::Details)
             .map_err(classify_error),
-        ResourceKey::Sources(anime_id) => api_client
-            .get_first_season_sources(*anime_id)
+        ResourceKey::Sources(key) => api_client
+            .get_release_sources(key.anime_id, key.season)
             .await
             .map(ResourceValue::Sources)
             .map_err(classify_error),
@@ -775,20 +746,6 @@ async fn load_once(api_client: &ApiClient, work: &Work) -> Result<ResourceValue,
             .await
             .map(ResourceValue::Poster)
             .map_err(classify_error),
-        ResourceKey::Combined {
-            representative_id: _,
-            franchise_order,
-        } => {
-            let Some(results) = &work.combined_results else {
-                return Err(LoadError::Unsupported(
-                    "Combined requests require source responses".to_string(),
-                ));
-            };
-            Ok(ResourceValue::Combined(combine_franchise_sources(
-                franchise_order,
-                results,
-            )))
-        }
     }
 }
 

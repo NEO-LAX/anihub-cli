@@ -98,12 +98,7 @@ cat > "${FAKE_BIN_DIR}/mpv" <<'EOF'
 exit 0
 EOF
 
-cat > "${FAKE_BIN_DIR}/python3" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-
-chmod 0755 "${FAKE_BIN_DIR}/curl" "${FAKE_BIN_DIR}/uname" "${FAKE_BIN_DIR}/mpv" "${FAKE_BIN_DIR}/python3"
+chmod 0755 "${FAKE_BIN_DIR}/curl" "${FAKE_BIN_DIR}/uname" "${FAKE_BIN_DIR}/mpv"
 
 export HOME="${TEST_ROOT}/home"
 export PATH="${FAKE_BIN_DIR}:${PATH}"

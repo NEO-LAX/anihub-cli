@@ -1,3 +1,3 @@
 pub mod history;
 
-pub use history::{AppHistory, EpisodeWatchedUpdate, StorageManager, WatchProgress};
+pub use history::{AnimeStatus, AppHistory, EpisodeWatchedUpdate, StorageManager, WatchProgress};

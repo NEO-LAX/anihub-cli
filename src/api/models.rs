@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// Exact AniHub source query. The same anime id can expose different episode
+/// sets depending on the franchise-level `season` query parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EpisodeSourcesKey {
+    pub anime_id: u32,
+    pub season: u32,
+}
+
+impl EpisodeSourcesKey {
+    pub const fn new(anime_id: u32, season: u32) -> Self {
+        Self { anime_id, season }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AnimeSearchResponse {
     pub total: u32,
@@ -9,7 +23,7 @@ pub struct AnimeSearchResponse {
     pub items: Vec<AnimeItem>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct AnimeItem {
     pub id: u32,
     pub anilist_id: Option<u32>,
@@ -22,32 +36,58 @@ pub struct AnimeItem {
     pub anime_type: String,
     pub year: Option<u32>,
     pub has_ukrainian_dub: bool,
+    /// Search responses did not always include poster metadata.  Keeping this
+    /// optional lets older fixtures and partial API responses deserialize.
+    #[serde(default)]
+    pub poster_url: Option<String>,
+    /// Number of episodes reported for this particular AniHub release.
+    #[serde(default)]
+    pub episodes_count: Option<u32>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub rating: Option<f32>,
+    #[serde(default)]
+    pub genres: Option<Vec<String>>,
+    #[serde(default)]
+    pub dubbing_studios: Option<Vec<DubbingStudio>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct EpisodeSourcesResponse {
     pub ashdi: Vec<AshdiStudio>,
     #[serde(default)]
-    pub moonanime: Vec<MoonAnimeStudio>,
+    pub moonanime: Vec<MoonAnimeSourceMarker>,
 }
 
+/// Minimal browser-only MoonAnime metadata. Episode/iframe payloads are
+/// intentionally ignored; the TUI only needs the dubbing label and count.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct MoonAnimeStudio {
-    pub id: u32,
+pub struct MoonAnimeSourceMarker {
+    #[serde(default)]
     pub studio_name: String,
+    #[serde(default)]
     pub season_number: u32,
-    pub episodes: Vec<MoonAnimeEpisode>,
+    #[serde(default)]
     pub episodes_count: u32,
+    #[serde(default)]
+    pub episodes: Vec<MoonAnimeBrowserEpisode>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct MoonAnimeEpisode {
+pub struct MoonAnimeBrowserEpisode {
     pub episode_number: u32,
+    #[serde(default)]
     pub display_episode_number: Option<f32>,
+    #[serde(default)]
     pub title: String,
     pub iframe_url: String,
-    #[serde(default)]
-    pub poster_url: String,
+}
+
+impl EpisodeSourcesResponse {
+    pub fn is_moonanime_only(&self) -> bool {
+        self.ashdi.is_empty() && !self.moonanime.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -89,7 +129,7 @@ pub struct AnimeDetails {
     pub dubbing_studios: Option<Vec<DubbingStudio>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct DubbingStudio {
     pub id: u32,
     pub name: String,

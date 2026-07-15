@@ -83,23 +83,7 @@ detect_release() {
     esac
 }
 
-resolve_executable() {
-    local candidate="$1"
-
-    if [[ "${candidate}" == */* ]]; then
-        if [[ -x "${candidate}" ]]; then
-            printf '%s\n' "${candidate}"
-            return 0
-        fi
-        return 1
-    fi
-
-    command -v "${candidate}"
-}
-
 check_dependencies() {
-    local python_candidate python_path
-
     info "Checking runtime dependencies..."
 
     if command -v mpv >/dev/null 2>&1; then
@@ -108,41 +92,6 @@ check_dependencies() {
         warning "mpv not found. Install mpv before trying to play an episode."
     fi
 
-    python_candidate="${ANIHUB_PYTHON:-python3}"
-
-    if ! python_path="$(resolve_executable "${python_candidate}")"; then
-        warning "${python_candidate} not found. Python Playwright/Firefox is optional until MoonAnime playback is used."
-        return 0
-    fi
-    success "Python interpreter found: ${python_path}"
-
-    if "${python_path}" -c 'from playwright.async_api import async_playwright' >/dev/null 2>&1; then
-        success "Python Playwright package found."
-    else
-        warning "Python Playwright package not found for ${python_path}. Install it with: ${python_path} -m pip install --user playwright"
-        return 0
-    fi
-
-    if "${python_path}" - <<'PY'
-import os
-import sys
-
-from playwright.sync_api import sync_playwright
-
-try:
-    with sync_playwright() as playwright:
-        firefox_path = playwright.firefox.executable_path
-    if not os.path.isfile(firefox_path):
-        raise RuntimeError(f"Firefox executable is missing: {firefox_path}")
-except Exception as error:
-    print(error, file=sys.stderr)
-    raise SystemExit(1)
-PY
-    then
-        success "Playwright Firefox browser found."
-    else
-        warning "Playwright Firefox browser not found. Install it with: ${python_path} -m playwright install firefox"
-    fi
 }
 
 checksum_value() {

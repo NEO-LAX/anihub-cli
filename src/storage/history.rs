@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -13,10 +12,50 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const HISTORY_SCHEMA_VERSION: u32 = 1;
+const HISTORY_SCHEMA_VERSION: u32 = 2;
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeStatus {
+    NotAdded,
+    Planned,
+    Watching,
+    Completed,
+    OnHold,
+    Dropped,
+}
+
+impl AnimeStatus {
+    pub const ALL: [Self; 6] = [
+        Self::NotAdded,
+        Self::Planned,
+        Self::Watching,
+        Self::Completed,
+        Self::OnHold,
+        Self::Dropped,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotAdded => "Не додано",
+            Self::Planned => "У планах",
+            Self::Watching => "Дивлюся",
+            Self::Completed => "Переглянуто",
+            Self::OnHold => "Відкладено",
+            Self::Dropped => "Кинуто",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AnimeLibraryRecord {
+    pub title: String,
+    pub status: AnimeStatus,
+    pub updated_at: i64,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct WatchProgress {
@@ -24,23 +63,19 @@ pub struct WatchProgress {
     pub anime_title: String,
     pub season: u32,
     pub episode: u32,
-    #[serde(default)]
     pub studio_name: String, // Назва студії (озвучки)
-    #[serde(default)]
-    pub timestamp: f64, // час у секундах, на якому зупинився користувач
-    #[serde(default)]
-    pub duration: f64, // загальна тривалість епізоду, якщо відома
-    #[serde(default)]
-    pub watched: bool, // чи вважається серія переглянутою
-    #[serde(default)]
-    pub updated_at: i64, // Unix timestamp для сортування "Продовжити перегляд"
+    pub timestamp: f64,      // час у секундах, на якому зупинився користувач
+    pub duration: f64,       // загальна тривалість епізоду, якщо відома
+    pub watched: bool,       // чи вважається серія переглянутою
+    pub updated_at: i64,     // Unix timestamp для сортування "Продовжити перегляд"
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AppHistory {
     /// Ключ - це ID аніме. Значення - прогрес перегляду.
     pub progress: HashMap<String, WatchProgress>,
-    pub bookmarks: Vec<u32>, // Список ID аніме, які збережені в закладки
+    pub library: HashMap<u32, AnimeLibraryRecord>,
 }
 
 /// One watched-state change for [`StorageManager::set_episodes_watched`].
@@ -112,17 +147,12 @@ enum ParseHistoryError {
     UnsupportedSchemaVersion { version: u64 },
 }
 
-#[derive(Debug, Deserialize)]
-struct RawAppHistory {
-    progress: HashMap<String, Value>,
-    bookmarks: Vec<u32>,
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HistoryEnvelope {
     schema_version: u32,
-    #[serde(flatten)]
-    history: AppHistory,
+    progress: HashMap<String, WatchProgress>,
+    library: HashMap<u32, AnimeLibraryRecord>,
 }
 
 #[derive(Debug)]
@@ -158,7 +188,7 @@ impl StorageManager {
             fs::create_dir_all(data_dir).context("Failed to create data directory")?;
         }
 
-        let history_file = data_dir.join("history.json");
+        let history_file = data_dir.join("history-v2.json");
 
         Ok(Self { history_file })
     }
@@ -200,6 +230,27 @@ impl StorageManager {
         self.save_history_locked(&history, loaded.primary_bytes.as_deref(), &content)?;
 
         Ok(history)
+    }
+
+    pub fn set_anime_status(
+        &self,
+        anime_ids: &[u32],
+        title: &str,
+        status: AnimeStatus,
+    ) -> Result<AppHistory> {
+        let now = Utc::now().timestamp();
+        self.update_history_batch(|history| {
+            for &anime_id in anime_ids {
+                history.library.insert(
+                    anime_id,
+                    AnimeLibraryRecord {
+                        title: title.to_string(),
+                        status,
+                        updated_at: now,
+                    },
+                );
+            }
+        })
     }
 
     /// Update several episodes with one lock acquisition and one atomic save.
@@ -306,6 +357,28 @@ impl StorageManager {
         .map(|_| ())
     }
 
+    /// Clear only the resume timestamp. The explicit watched flag is kept.
+    pub fn clear_episode_timestamp(
+        &self,
+        anime_id: u32,
+        season: u32,
+        episode: u32,
+        studio_name: &str,
+    ) -> Result<AppHistory> {
+        let now = Utc::now().timestamp();
+        self.update_history_batch(|history| {
+            if let Some(progress) = history.progress.values_mut().find(|progress| {
+                progress.anime_id == anime_id
+                    && progress.season == season
+                    && progress.episode == episode
+                    && progress.studio_name == studio_name
+            }) {
+                progress.timestamp = 0.0;
+                progress.updated_at = now;
+            }
+        })
+    }
+
     pub fn set_episode_watched(
         &self,
         anime_id: u32,
@@ -314,7 +387,7 @@ impl StorageManager {
         episode: u32,
         studio_name: &str,
         watched: bool,
-    ) -> Result<()> {
+    ) -> Result<AppHistory> {
         let update = EpisodeWatchedUpdate {
             anime_id,
             anime_title: title.to_string(),
@@ -325,7 +398,6 @@ impl StorageManager {
         };
 
         self.set_episodes_watched(std::slice::from_ref(&update))
-            .map(|_| ())
     }
 
     #[allow(dead_code)]
@@ -347,22 +419,6 @@ impl StorageManager {
             .filter(|progress| progress.anime_id == anime_id)
             .max_by_key(|progress| progress.updated_at)
             .cloned())
-    }
-
-    #[allow(dead_code)]
-    pub fn toggle_bookmark(&self, anime_id: u32) -> Result<bool> {
-        let mut is_bookmarked = false;
-
-        self.update_history_batch(|history| {
-            if let Some(pos) = history.bookmarks.iter().position(|&x| x == anime_id) {
-                history.bookmarks.remove(pos); // Якщо вже є - видаляємо (зняти закладку)
-            } else {
-                history.bookmarks.push(anime_id); // Якщо немає - додаємо
-                is_bookmarked = true;
-            }
-        })?;
-
-        Ok(is_bookmarked)
     }
 
     fn apply_episode_watched(history: &mut AppHistory, update: &EpisodeWatchedUpdate, now: i64) {
@@ -553,98 +609,38 @@ impl StorageManager {
 fn serialize_history(history: &AppHistory) -> Result<String> {
     serde_json::to_string_pretty(&HistoryEnvelope {
         schema_version: HISTORY_SCHEMA_VERSION,
-        history: history.clone(),
+        progress: history.progress.clone(),
+        library: history.library.clone(),
     })
     .context("Failed to serialize history")
 }
 
 fn parse_history(bytes: &[u8]) -> std::result::Result<AppHistory, ParseHistoryError> {
-    let value: Value =
+    let envelope: HistoryEnvelope =
         serde_json::from_slice(bytes).map_err(|error| ParseHistoryError::Invalid {
             message: error.to_string(),
         })?;
-
-    let history_value = match value {
-        Value::Object(mut object) => match object.remove("schema_version") {
-            None => Value::Object(object),
-            Some(version) => {
-                let version = version.as_u64().ok_or_else(|| ParseHistoryError::Invalid {
-                    message: "schema_version must be a non-negative integer".to_string(),
-                })?;
-
-                if version != u64::from(HISTORY_SCHEMA_VERSION) {
-                    return Err(ParseHistoryError::UnsupportedSchemaVersion { version });
-                }
-
-                // The canonical writer uses a flattened envelope. Accept a
-                // nested `history` object as well so the version marker can
-                // evolve without making recovery less tolerant.
-                if let Some(history) = object.remove("history") {
-                    history
-                } else if let Some(history) = object.remove("data") {
-                    history
-                } else {
-                    Value::Object(object)
-                }
-            }
-        },
-        _ => {
-            return Err(ParseHistoryError::Invalid {
-                message: "history root must be a JSON object".to_string(),
-            });
-        }
-    };
-
-    let raw: RawAppHistory =
-        serde_json::from_value(history_value).map_err(|error| ParseHistoryError::Invalid {
-            message: error.to_string(),
-        })?;
-
-    let mut migrated = BTreeMap::<String, (String, WatchProgress)>::new();
-    for (source_key, raw_progress) in raw.progress {
-        let watched_was_explicit = raw_progress
-            .as_object()
-            .is_some_and(|object| object.contains_key("watched"));
-
-        let mut progress: WatchProgress =
-            serde_json::from_value(raw_progress).map_err(|error| ParseHistoryError::Invalid {
-                message: format!("progress `{source_key}`: {error}"),
-            })?;
-
-        // The old format did not have `watched`. Only those records are
-        // derived; an explicit false is a user decision and must survive.
-        if !watched_was_explicit {
-            progress.watched =
-                StorageManager::compute_watched(progress.timestamp, progress.duration);
-        }
-
-        let migrated_key = StorageManager::make_progress_key(
+    if envelope.schema_version != HISTORY_SCHEMA_VERSION {
+        return Err(ParseHistoryError::UnsupportedSchemaVersion {
+            version: u64::from(envelope.schema_version),
+        });
+    }
+    for (key, progress) in &envelope.progress {
+        let expected = StorageManager::make_progress_key(
             progress.anime_id,
             progress.season,
             progress.episode,
             &progress.studio_name,
         );
-
-        let replace =
-            migrated
-                .get(&migrated_key)
-                .is_none_or(|(existing_source_key, existing_progress)| {
-                    progress.updated_at > existing_progress.updated_at
-                        || (progress.updated_at == existing_progress.updated_at
-                            && source_key.as_str() < existing_source_key.as_str())
-                });
-
-        if replace {
-            migrated.insert(migrated_key, (source_key, progress));
+        if *key != expected {
+            return Err(ParseHistoryError::Invalid {
+                message: format!("non-canonical progress key `{key}`; expected `{expected}`"),
+            });
         }
     }
-
     Ok(AppHistory {
-        progress: migrated
-            .into_iter()
-            .map(|(key, (_, progress))| (key, progress))
-            .collect(),
-        bookmarks: raw.bookmarks,
+        progress: envelope.progress,
+        library: envelope.library,
     })
 }
 
@@ -668,7 +664,7 @@ fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "history.json".to_string());
+        .unwrap_or_else(|| "history-v2.json".to_string());
     path.with_file_name(format!("{file_name}{suffix}"))
 }
 
@@ -676,7 +672,7 @@ fn unique_sibling_path(path: &Path, suffix: &str) -> PathBuf {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "history.json".to_string());
+        .unwrap_or_else(|| "history-v2.json".to_string());
 
     loop {
         let candidate = path.with_file_name(format!(
@@ -871,7 +867,7 @@ impl Drop for StorageLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     struct TestDirectory {
         path: PathBuf,
@@ -943,84 +939,34 @@ mod tests {
     }
 
     #[test]
-    fn reads_legacy_bare_history_and_migrates_keys() {
-        let directory = TestDirectory::new();
-        let manager = directory.manager();
-        let legacy = json!({
-            "progress": {
-                "7": {
-                    "anime_id": 7,
-                    "anime_title": "Legacy",
-                    "season": 2,
-                    "episode": 3,
-                    "studio_name": "Dub",
-                    "timestamp": 1000.0,
-                    "duration": 2000.0,
-                    "updated_at": 10
-                }
-            },
-            "bookmarks": [7]
-        });
-        fs::write(
-            directory.history_path(),
-            serde_json::to_vec_pretty(&legacy).expect("serialize legacy history"),
-        )
-        .expect("write legacy history");
+    fn rejects_previous_history_schema() {
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "progress": {},
+            "library": {}
+        }))
+        .expect("serialize old schema");
 
-        let loaded = manager.load_history().expect("load legacy history");
-        let key = StorageManager::make_progress_key(7, 2, 3, "Dub");
-        assert_eq!(loaded.bookmarks, vec![7]);
-        assert!(!loaded.progress.get(&key).expect("migrated record").watched);
-
-        manager
-            .save_history(&loaded)
-            .expect("save migrated history");
-        let saved: Value = serde_json::from_slice(
-            &fs::read(directory.history_path()).expect("read saved history"),
-        )
-        .expect("parse saved history");
-        assert_eq!(saved["schema_version"], json!(1));
+        assert!(matches!(
+            parse_history(&bytes),
+            Err(ParseHistoryError::UnsupportedSchemaVersion { version: 1 })
+        ));
     }
 
     #[test]
-    fn migration_preserves_explicit_watched_false() {
-        let directory = TestDirectory::new();
-        let manager = directory.manager();
-        let legacy = json!({
-            "progress": {
-                "explicit-false": {
-                    "anime_id": 8,
-                    "anime_title": "Explicit false",
-                    "season": 1,
-                    "episode": 1,
-                    "timestamp": 1500.0,
-                    "duration": 1600.0,
-                    "watched": false,
-                    "updated_at": 11
-                },
-                "missing-watched": {
-                    "anime_id": 8,
-                    "anime_title": "Derived",
-                    "season": 1,
-                    "episode": 2,
-                    "timestamp": 1500.0,
-                    "duration": 1600.0,
-                    "updated_at": 12
-                }
-            },
-            "bookmarks": []
-        });
-        fs::write(
-            directory.history_path(),
-            serde_json::to_vec_pretty(&legacy).expect("serialize legacy history"),
-        )
-        .expect("write legacy history");
+    fn rejects_removed_legacy_fields() {
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "progress": {},
+            "library": {},
+            "bookmarks": [42]
+        }))
+        .expect("serialize legacy field");
 
-        let loaded = manager.load_history().expect("load history");
-        let explicit_key = StorageManager::make_progress_key(8, 1, 1, "");
-        let derived_key = StorageManager::make_progress_key(8, 1, 2, "");
-        assert!(!loaded.progress[&explicit_key].watched);
-        assert!(loaded.progress[&derived_key].watched);
+        assert!(matches!(
+            parse_history(&bytes),
+            Err(ParseHistoryError::Invalid { .. })
+        ));
     }
 
     #[test]
@@ -1032,14 +978,14 @@ mod tests {
                 StorageManager::make_progress_key(1, 1, 1, "Dub"),
                 progress(1, "Original", 1, 1, "Dub", false, 1),
             )]),
-            bookmarks: vec![1],
+            library: HashMap::new(),
         };
         let newer = AppHistory {
             progress: HashMap::from([(
                 StorageManager::make_progress_key(2, 1, 1, "Dub"),
                 progress(2, "Newer", 1, 1, "Dub", true, 2),
             )]),
-            bookmarks: vec![2],
+            library: HashMap::new(),
         };
         manager.save_history(&original).expect("save original");
         manager.save_history(&newer).expect("save newer");
@@ -1083,20 +1029,20 @@ mod tests {
                 StorageManager::make_progress_key(3, 1, 1, "Dub"),
                 progress(3, "First", 1, 1, "Dub", false, 3),
             )]),
-            bookmarks: vec![3],
+            library: HashMap::new(),
         };
         let second = AppHistory {
             progress: HashMap::from([(
                 StorageManager::make_progress_key(4, 1, 1, "Dub"),
                 progress(4, "Second", 1, 1, "Dub", true, 4),
             )]),
-            bookmarks: vec![4],
+            library: HashMap::new(),
         };
 
         manager.save_history(&first).expect("save first");
         let first_on_disk = fs::read(directory.history_path()).expect("read first");
         let first_json: Value = serde_json::from_slice(&first_on_disk).expect("parse first");
-        assert_eq!(first_json["schema_version"], json!(1));
+        assert_eq!(first_json["schema_version"], json!(2));
 
         manager.save_history(&second).expect("save second");
         assert_eq!(
@@ -1122,90 +1068,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_migration_is_deterministic_by_timestamp_then_source_key() {
-        let directory = TestDirectory::new();
-        let manager = directory.manager();
-        let legacy = json!({
-            "progress": {
-                "z-source": {
-                    "anime_id": 9,
-                    "anime_title": "Z source",
-                    "season": 1,
-                    "episode": 1,
-                    "studio_name": "Dub",
-                    "timestamp": 20.0,
-                    "duration": 100.0,
-                    "watched": false,
-                    "updated_at": 20
-                },
-                "a-source": {
-                    "anime_id": 9,
-                    "anime_title": "A source",
-                    "season": 1,
-                    "episode": 1,
-                    "studio_name": "Dub",
-                    "timestamp": 30.0,
-                    "duration": 100.0,
-                    "watched": true,
-                    "updated_at": 20
-                },
-                "newer-source": {
-                    "anime_id": 9,
-                    "anime_title": "Newer source",
-                    "season": 1,
-                    "episode": 1,
-                    "studio_name": "Dub",
-                    "timestamp": 40.0,
-                    "duration": 100.0,
-                    "watched": false,
-                    "updated_at": 21
-                }
-            },
-            "bookmarks": []
-        });
-        fs::write(
-            directory.history_path(),
-            serde_json::to_vec_pretty(&legacy).expect("serialize legacy history"),
-        )
-        .expect("write legacy history");
-
-        let loaded = manager.load_history().expect("load migrated history");
-        let key = StorageManager::make_progress_key(9, 1, 1, "Dub");
-        assert_eq!(loaded.progress[&key].anime_title, "Newer source");
-
-        let tie_only = json!({
-            "progress": {
-                "z-source": {
-                    "anime_id": 10,
-                    "anime_title": "Z source",
-                    "season": 1,
-                    "episode": 1,
-                    "studio_name": "Dub",
-                    "updated_at": 20
-                },
-                "a-source": {
-                    "anime_id": 10,
-                    "anime_title": "A source",
-                    "season": 1,
-                    "episode": 1,
-                    "studio_name": "Dub",
-                    "updated_at": 20
-                }
-            },
-            "bookmarks": []
-        });
-        fs::write(
-            directory.history_path(),
-            serde_json::to_vec_pretty(&tie_only).expect("serialize tie history"),
-        )
-        .expect("write tie history");
-
-        let tied = manager.load_history().expect("load tied history");
-        let tie_key = StorageManager::make_progress_key(10, 1, 1, "Dub");
-        assert_eq!(tied.progress[&tie_key].anime_title, "A source");
-    }
-
-    #[test]
     fn batch_episode_updates_share_one_transaction() {
         let directory = TestDirectory::new();
         let manager = directory.manager();
@@ -1214,7 +1076,7 @@ mod tests {
                 StorageManager::make_progress_key(11, 1, 1, "Dub"),
                 progress(11, "Initial", 1, 1, "Dub", false, 1),
             )]),
-            bookmarks: vec![],
+            library: HashMap::new(),
         };
         manager.save_history(&initial).expect("save initial");
 
@@ -1248,5 +1110,49 @@ mod tests {
         let backup_bytes = fs::read(directory.backup_path()).expect("read batch backup");
         let backup = parse_history(&backup_bytes).expect("parse batch backup");
         assert_eq!(backup, initial);
+    }
+
+    #[test]
+    fn anime_status_is_persisted_for_every_release() {
+        let directory = TestDirectory::new();
+        let manager = directory.manager();
+        let history = manager
+            .set_anime_status(&[42, 43], "Каґуя", AnimeStatus::Watching)
+            .expect("set anime status");
+
+        assert_eq!(history.library[&42].status, AnimeStatus::Watching);
+        assert_eq!(history.library[&43].title, "Каґуя");
+        assert_eq!(manager.load_history().expect("reload history"), history);
+    }
+
+    #[test]
+    fn clearing_timestamp_preserves_watched_state() {
+        let directory = TestDirectory::new();
+        let manager = directory.manager();
+        manager
+            .update_history_batch(|history| {
+                history.progress.insert(
+                    StorageManager::make_progress_key(7, 2, 3, "Dub"),
+                    WatchProgress {
+                        anime_id: 7,
+                        anime_title: "Test".to_string(),
+                        season: 2,
+                        episode: 3,
+                        studio_name: "Dub".to_string(),
+                        timestamp: 777.0,
+                        duration: 1400.0,
+                        watched: true,
+                        updated_at: 1,
+                    },
+                );
+            })
+            .expect("seed progress");
+
+        let history = manager
+            .clear_episode_timestamp(7, 2, 3, "Dub")
+            .expect("clear timestamp");
+        let progress = &history.progress[&StorageManager::make_progress_key(7, 2, 3, "Dub")];
+        assert_eq!(progress.timestamp, 0.0);
+        assert!(progress.watched);
     }
 }

@@ -1,6 +1,5 @@
 use crate::api;
 use crate::api::EpisodeSourcesResponse;
-use crate::moonanime::{MoonAnimeProcess, resolve_moonanime_stream};
 use crate::player::{EndFileReason, MpvMonitorEvent, MpvSession, TaskCancellation};
 use crate::storage;
 use crate::ui::AppState;
@@ -22,8 +21,21 @@ pub struct PlayTarget {
     pub stream_page_url: String,
     pub start_time: Option<f64>,
     pub studio_name: String,
-    /// HTTP Referer для mpv — "https://ashdi.vip/" або "https://moonanime.art/"
+    /// HTTP Referer for the Ashdi player page.
     pub referrer: String,
+}
+
+/// One source-bearing release in an explicitly ordered mainline timeline.
+///
+/// The caller decides which releases belong to the timeline, so specials,
+/// recaps, and other extras never enter the autoplay queue accidentally.
+/// Source season and episode numbers are copied verbatim into [`PlayTarget`].
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackRelease<'a> {
+    pub anime_id: u32,
+    pub anime_title: &'a str,
+    pub player_title: &'a str,
+    pub sources: &'a EpisodeSourcesResponse,
 }
 
 pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
@@ -99,7 +111,6 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         .unwrap_or_else(|| progress_title.clone());
 
     let episode_title = format!("Серія {}", episode_num);
-    let is_moonanime = target_url.starts_with("https://moonanime.art");
     Some(PlayTarget {
         anime_id: progress_anime_id,
         anime_title: progress_title,
@@ -110,17 +121,12 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         stream_page_url: target_url,
         start_time: None,
         studio_name,
-        referrer: if is_moonanime {
-            "https://moonanime.art/".to_string()
-        } else {
-            "https://ashdi.vip/".to_string()
-        },
+        referrer: "https://ashdi.vip/".to_string(),
     })
 }
 
 /// Build a deterministic queue after the selected target. The supervisor
-/// resolves each stream only when it becomes current, so MoonAnime proxies
-/// and Ashdi requests are never eagerly spawned for the whole season.
+/// resolves each Ashdi stream only when it becomes current.
 pub fn build_playback_queue(app: &AppState, target: &PlayTarget) -> Vec<PlayTarget> {
     let mut queue = Vec::new();
     let mut current = (
@@ -154,6 +160,115 @@ pub fn build_playback_queue(app: &AppState, target: &PlayTarget) -> Vec<PlayTarg
     queue
 }
 
+/// Build autoplay targets across an ordered list of distinct releases.
+///
+/// Identity is never inferred from a normalized display season. Two
+/// consecutive releases may both expose raw
+/// season 1 and episode 1; their `anime_id` values keep them distinct.
+pub fn build_release_playback_queue(
+    target: &PlayTarget,
+    timeline: &[PlaybackRelease<'_>],
+) -> Vec<PlayTarget> {
+    let Some(start_release_index) = timeline.iter().position(|release| {
+        release.anime_id == target.anime_id
+            && release.sources.ashdi.iter().any(|studio| {
+                studio.season_number == target.season
+                    && studio.studio_name == target.studio_name
+                    && studio
+                        .episodes
+                        .iter()
+                        .any(|episode| episode.episode_number == target.episode)
+            })
+    }) else {
+        return Vec::new();
+    };
+
+    let mut queue = Vec::new();
+    for (release_index, release) in timeline.iter().enumerate().skip(start_release_index) {
+        let mut seasons = release
+            .sources
+            .ashdi
+            .iter()
+            .map(|studio| studio.season_number)
+            .collect::<Vec<_>>();
+        seasons.sort_unstable();
+        seasons.dedup();
+
+        for season in seasons {
+            if release_index == start_release_index && season < target.season {
+                continue;
+            }
+
+            let studios_for_season = release
+                .sources
+                .ashdi
+                .iter()
+                .filter(|studio| studio.season_number == season)
+                .collect::<Vec<_>>();
+            let studio = if release_index == start_release_index && season == target.season {
+                studios_for_season.iter().copied().find(|studio| {
+                    studio.studio_name == target.studio_name
+                        && studio
+                            .episodes
+                            .iter()
+                            .any(|episode| episode.episode_number == target.episode)
+                })
+            } else {
+                studios_for_season
+                    .iter()
+                    .copied()
+                    .find(|studio| studio.studio_name == target.studio_name)
+                    .or_else(|| studios_for_season.first().copied())
+            };
+            let Some(studio) = studio else {
+                continue;
+            };
+
+            let start_episode_index = if release_index == start_release_index
+                && season == target.season
+                && studio.studio_name == target.studio_name
+            {
+                studio
+                    .episodes
+                    .iter()
+                    .position(|episode| episode.episode_number == target.episode)
+                    .map(|index| index + 1)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            queue.extend(
+                studio
+                    .episodes
+                    .iter()
+                    .skip(start_episode_index)
+                    .map(|episode| play_target_for_release(release, studio, episode)),
+            );
+        }
+    }
+    queue
+}
+
+fn play_target_for_release(
+    release: &PlaybackRelease<'_>,
+    studio: &api::AshdiStudio,
+    episode: &api::AshdiEpisode,
+) -> PlayTarget {
+    PlayTarget {
+        anime_id: release.anime_id,
+        anime_title: release.anime_title.to_string(),
+        player_title: release.player_title.to_string(),
+        season: studio.season_number,
+        episode: episode.episode_number,
+        episode_title: format!("Серія {}", episode.episode_number),
+        stream_page_url: episode.url.clone(),
+        start_time: None,
+        studio_name: studio.studio_name.clone(),
+        referrer: "https://ashdi.vip/".to_string(),
+    }
+}
+
 #[derive(Clone)]
 pub struct ContinueResolvedEpisode {
     pub season: u32,
@@ -178,11 +293,7 @@ pub fn resolve_continue_target(
     seasons.sort();
     seasons.dedup();
 
-    let season_index = seasons
-        .iter()
-        .position(|season| *season == progress.season)?;
-
-    let current_studio_data = sources
+    let exact_studio_data = sources
         .ashdi
         .iter()
         .filter(|studio| studio.season_number == progress.season)
@@ -195,7 +306,13 @@ pub fn resolve_continue_target(
                 .filter(|studio| studio.season_number == progress.season)
                 .enumerate()
                 .next()
-        })?;
+        });
+
+    let current_studio_data = exact_studio_data?;
+    let canonical_season = current_studio_data.1.season_number;
+    let season_index = seasons
+        .iter()
+        .position(|season| *season == canonical_season)?;
 
     let current_dubbing_index = current_studio_data.0;
     let current_studio = current_studio_data.1;
@@ -208,7 +325,7 @@ pub fn resolve_continue_target(
     if !progress.watched {
         let episode = current_studio.episodes.get(current_episode_index)?;
         return Some(ContinueResolvedEpisode {
-            season: progress.season,
+            season: canonical_season,
             episode: progress.episode,
             season_index,
             dubbing_index: current_dubbing_index,
@@ -221,7 +338,7 @@ pub fn resolve_continue_target(
 
     if let Some(next_episode) = current_studio.episodes.get(current_episode_index + 1) {
         return Some(ContinueResolvedEpisode {
-            season: progress.season,
+            season: canonical_season,
             episode: next_episode.episode_number,
             season_index,
             dubbing_index: current_dubbing_index,
@@ -261,7 +378,10 @@ pub fn get_next_episode(
 
     let sources = app
         .sources_cache
-        .get(current_anime_id)
+        .get(&api::EpisodeSourcesKey::new(
+            *current_anime_id,
+            *current_season,
+        ))
         .or_else(|| app.current_sources.clone())?;
 
     // Check if the current studio data is present
@@ -301,7 +421,6 @@ pub fn get_next_episode(
             .map(|d| format!("{} ({})", d.title_ukrainian, d.year.unwrap_or(0)))
             .unwrap_or_else(|| title.clone());
 
-        let is_moonanime = next_ep.url.starts_with("https://moonanime.art");
         return Some(PlayTarget {
             anime_id,
             anime_title: title,
@@ -312,11 +431,7 @@ pub fn get_next_episode(
             stream_page_url: next_ep.url.clone(),
             start_time: None,
             studio_name: current_studio.clone(),
-            referrer: if is_moonanime {
-                "https://moonanime.art/".to_string()
-            } else {
-                "https://ashdi.vip/".to_string()
-            },
+            referrer: "https://ashdi.vip/".to_string(),
         });
     }
 
@@ -345,7 +460,6 @@ pub fn get_next_episode(
         .map(|d| format!("{} ({})", d.title_ukrainian, d.year.unwrap_or(0)))
         .unwrap_or_else(|| title.clone());
 
-    let is_moonanime = next_ep.url.starts_with("https://moonanime.art");
     Some(PlayTarget {
         anime_id,
         anime_title: title,
@@ -356,11 +470,7 @@ pub fn get_next_episode(
         stream_page_url: next_ep.url.clone(),
         start_time: None,
         studio_name: next_studio_data.studio_name.clone(),
-        referrer: if is_moonanime {
-            "https://moonanime.art/".to_string()
-        } else {
-            "https://ashdi.vip/".to_string()
-        },
+        referrer: "https://ashdi.vip/".to_string(),
     })
 }
 
@@ -457,8 +567,8 @@ struct CommandEnvelope {
     reply: oneshot::Sender<std::result::Result<(), String>>,
 }
 
-/// Bounded command/event handle. All mpv, monitor, stream-resolution, proxy,
-/// and cancellation resources live behind its actor; callers only exchange
+/// Bounded command/event handle. All mpv, monitor, stream-resolution, and
+/// cancellation resources live behind its actor; callers only exchange
 /// commands and typed events.
 pub struct PlaybackSupervisor {
     commands: mpsc::Sender<CommandEnvelope>,
@@ -522,9 +632,8 @@ impl PlaybackSupervisor {
 
 impl Drop for PlaybackSupervisor {
     fn drop(&mut self) {
-        // The actor owns Drop-safe MpvSession/MoonAnimeProcess values. An
-        // explicit shutdown is still the normal path because it can query
-        // final position and wait for graceful process exit.
+        // Explicit shutdown is still the normal path because it can query
+        // final position and wait for graceful mpv exit.
         if let Some(actor) = self.actor.take() {
             actor.abort();
         }
@@ -533,13 +642,11 @@ impl Drop for PlaybackSupervisor {
 
 struct ResolvedStream {
     url: String,
-    proxy: Option<MoonAnimeProcess>,
 }
 
 struct ActivePlayback {
     id: PlaybackSessionId,
     mpv: MpvSession,
-    proxy: Option<MoonAnimeProcess>,
     current: PlayTarget,
     queue: VecDeque<PlayTarget>,
     position: f64,
@@ -657,19 +764,15 @@ impl PlaybackActor {
     }
 
     async fn begin_resolution(&mut self, purpose: ResolutionPurpose) {
-        let (target, session_id) = match &purpose {
-            ResolutionPurpose::Start {
-                target, session_id, ..
-            }
-            | ResolutionPurpose::Next { target, session_id }
-            | ResolutionPurpose::Replace {
-                target, session_id, ..
-            } => (target.clone(), *session_id),
+        let target = match &purpose {
+            ResolutionPurpose::Start { target, .. }
+            | ResolutionPurpose::Next { target, .. }
+            | ResolutionPurpose::Replace { target, .. } => target.clone(),
         };
         let cancellation = TaskCancellation::new();
         let task_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
-            resolve_stream(&target, session_id, &task_cancellation)
+            resolve_stream(&target, &task_cancellation)
                 .await
                 .map_err(|error| error.to_string())
         });
@@ -778,8 +881,6 @@ impl PlaybackActor {
                 if self.active.is_none() {
                     self.launch_active(session_id, target, queue, resolved)
                         .await;
-                } else {
-                    self.cleanup_resolved(resolved).await;
                 }
             }
             ResolutionPurpose::Next { target, session_id } => {
@@ -801,7 +902,7 @@ impl PlaybackActor {
         session_id: PlaybackSessionId,
         target: PlayTarget,
         queue: Vec<PlayTarget>,
-        mut resolved: ResolvedStream,
+        resolved: ResolvedStream,
     ) {
         let mpv = match MpvSession::spawn(
             session_id.raw(),
@@ -820,16 +921,12 @@ impl PlaybackActor {
                     message: error.to_string(),
                 })
                 .await;
-                if let Some(proxy) = resolved.proxy.take() {
-                    let _ = proxy.shutdown().await;
-                }
                 return;
             }
         };
         self.active = Some(ActivePlayback {
             id: session_id,
             mpv,
-            proxy: resolved.proxy,
             current: target.clone(),
             queue: queue.into_iter().collect(),
             position: 0.0,
@@ -845,14 +942,12 @@ impl PlaybackActor {
         &mut self,
         session_id: PlaybackSessionId,
         target: PlayTarget,
-        mut resolved: ResolvedStream,
+        resolved: ResolvedStream,
     ) {
         let Some(active) = self.active.as_mut() else {
-            self.cleanup_resolved(resolved).await;
             return;
         };
         if active.id != session_id || !active.waiting_for_next {
-            self.cleanup_resolved(resolved).await;
             return;
         }
         let load_result = active
@@ -871,23 +966,15 @@ impl PlaybackActor {
                 message: error.to_string(),
             })
             .await;
-            if let Some(proxy) = resolved.proxy.take() {
-                let _ = proxy.shutdown().await;
-            }
             self.stop_active(false).await;
             return;
         }
 
-        let old_proxy = active.proxy.take();
-        active.proxy = resolved.proxy.take();
         active.current = target.clone();
         active.position = 0.0;
         active.duration = 0.0;
         active.entry_id = None;
         active.waiting_for_next = false;
-        if let Some(proxy) = old_proxy {
-            let _ = proxy.shutdown().await;
-        }
         self.emit(PlaybackEvent::SessionStarted { session_id, target })
             .await;
     }
@@ -897,14 +984,13 @@ impl PlaybackActor {
         session_id: PlaybackSessionId,
         target: PlayTarget,
         queue: Vec<PlayTarget>,
-        mut resolved: ResolvedStream,
+        resolved: ResolvedStream,
     ) {
         let Some(mut old) = self.active.take() else {
             self.launch_active(session_id, target, queue, resolved)
                 .await;
             return;
         };
-        let old_proxy = old.proxy.take();
         let old_snapshot = old.mpv.shutdown().await;
         if !old.waiting_for_next {
             self.emit_partial(&old, old_snapshot.time_pos, old_snapshot.duration)
@@ -921,13 +1007,9 @@ impl PlaybackActor {
         .await;
         match launch_result {
             Ok(mpv) => {
-                if let Some(proxy) = old_proxy {
-                    let _ = proxy.shutdown().await;
-                }
                 self.active = Some(ActivePlayback {
                     id: session_id,
                     mpv,
-                    proxy: resolved.proxy.take(),
                     current: target.clone(),
                     queue: queue.into_iter().collect(),
                     position: 0.0,
@@ -939,24 +1021,12 @@ impl PlaybackActor {
                     .await;
             }
             Err(error) => {
-                if let Some(proxy) = old_proxy {
-                    let _ = proxy.shutdown().await;
-                }
-                if let Some(proxy) = resolved.proxy.take() {
-                    let _ = proxy.shutdown().await;
-                }
                 self.emit(PlaybackEvent::Error {
                     session_id: Some(session_id),
                     message: error.to_string(),
                 })
                 .await;
             }
-        }
-    }
-
-    async fn cleanup_resolved(&self, resolved: ResolvedStream) {
-        if let Some(proxy) = resolved.proxy {
-            let _ = proxy.shutdown().await;
         }
     }
 
@@ -1122,16 +1192,6 @@ impl PlaybackActor {
             self.emit_partial(&active, snapshot.time_pos, snapshot.duration)
                 .await;
         }
-        if let Some(proxy) = active.proxy.take() {
-            let diagnostics = proxy.shutdown().await;
-            if !diagnostics.is_empty() {
-                self.emit(PlaybackEvent::Error {
-                    session_id: Some(active.id),
-                    message: diagnostics,
-                })
-                .await;
-            }
-        }
         self.emit(PlaybackEvent::SessionStopped {
             session_id: active.id,
         })
@@ -1141,33 +1201,44 @@ impl PlaybackActor {
 
 async fn resolve_stream(
     target: &PlayTarget,
-    session_id: PlaybackSessionId,
     cancellation: &TaskCancellation,
 ) -> Result<ResolvedStream> {
     if cancellation.is_cancelled() {
         return Err(anyhow!("stream resolution cancelled"));
     }
-    if target.stream_page_url.starts_with("https://moonanime.art") {
-        let resolved =
-            resolve_moonanime_stream(&target.stream_page_url, session_id.raw(), cancellation)
-                .await?;
-        return Ok(ResolvedStream {
-            url: resolved.url,
-            proxy: resolved.process,
-        });
-    }
-
     let parser = api::AshdiParser::new()?;
     let url = tokio::select! {
         _ = cancellation.cancelled() => return Err(anyhow!("stream resolution cancelled")),
         result = parser.extract_m3u8(&target.stream_page_url) => result?,
     };
-    Ok(ResolvedStream { url, proxy: None })
+    Ok(ResolvedStream { url })
 }
 
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+
+    fn sources(season: u32, episodes: &[u32]) -> EpisodeSourcesResponse {
+        EpisodeSourcesResponse {
+            ashdi: vec![api::AshdiStudio {
+                id: season,
+                studio_name: "dub".to_string(),
+                season_number: season,
+                episodes: episodes
+                    .iter()
+                    .map(|episode| api::AshdiEpisode {
+                        episode_number: *episode,
+                        display_episode_number: None,
+                        title: format!("Episode {episode}"),
+                        url: format!("https://ashdi.vip/s{season}/e{episode}"),
+                        ashdi_episode_id: format!("{season}-{episode}"),
+                    })
+                    .collect(),
+                episodes_count: episodes.len() as u32,
+            }],
+            moonanime: Vec::new(),
+        }
+    }
 
     fn target(episode: u32, start_time: Option<f64>) -> PlayTarget {
         PlayTarget {
@@ -1196,6 +1267,110 @@ mod supervisor_tests {
         let identity = PlaybackIdentity::from(&target(4, Some(123.0)));
         assert_eq!(identity.episode, 4);
         assert_eq!(identity.studio_name, "dub");
+    }
+
+    #[test]
+    fn duplicate_raw_season_one_remains_distinct_across_release_ids() {
+        let part_one = sources(1, &[1, 2]);
+        let part_two = sources(1, &[1, 2]);
+        let releases = [
+            PlaybackRelease {
+                anime_id: 10,
+                anime_title: "Part 1",
+                player_title: "Part 1 (2024)",
+                sources: &part_one,
+            },
+            PlaybackRelease {
+                anime_id: 20,
+                anime_title: "Part 2",
+                player_title: "Part 2 (2024)",
+                sources: &part_two,
+            },
+        ];
+
+        let queue = build_release_playback_queue(&target_for(10, 1, 1), &releases);
+        let identities = queue
+            .iter()
+            .map(|target| (target.anime_id, target.season, target.episode))
+            .collect::<Vec<_>>();
+        assert_eq!(identities, vec![(10, 1, 2), (20, 1, 1), (20, 1, 2)]);
+    }
+
+    #[test]
+    fn ordered_timeline_crosses_cours_and_skips_unlisted_extra() {
+        let part_one = sources(1, &[1, 2]);
+        let extra = sources(1, &[1]);
+        let part_two = sources(1, &[1, 2]);
+        let next_release = sources(1, &[1]);
+        let releases = [
+            PlaybackRelease {
+                anime_id: 10,
+                anime_title: "Part 1",
+                player_title: "Part 1",
+                sources: &part_one,
+            },
+            PlaybackRelease {
+                anime_id: 20,
+                anime_title: "Part 2",
+                player_title: "Part 2",
+                sources: &part_two,
+            },
+            PlaybackRelease {
+                anime_id: 30,
+                anime_title: "Next",
+                player_title: "Next",
+                sources: &next_release,
+            },
+        ];
+
+        let queue = build_release_playback_queue(&target_for(10, 1, 2), &releases);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|target| (target.anime_id, target.episode))
+                .collect::<Vec<_>>(),
+            vec![(20, 1), (20, 2), (30, 1)]
+        );
+        assert!(queue.iter().all(|target| target.anime_id != 15));
+        let _unlisted_extra = PlaybackRelease {
+            anime_id: 15,
+            anime_title: "Recap",
+            player_title: "Recap",
+            sources: &extra,
+        };
+    }
+
+    #[test]
+    fn continue_requires_the_exact_stored_season() {
+        let sources = sources(1, &[1, 2]);
+        let progress = storage::WatchProgress {
+            anime_id: 10,
+            anime_title: "Part 1".to_string(),
+            season: 3,
+            episode: 2,
+            studio_name: "dub".to_string(),
+            timestamp: 42.0,
+            duration: 1200.0,
+            watched: false,
+            updated_at: 1,
+        };
+
+        assert!(resolve_continue_target(&progress, &sources).is_none());
+    }
+
+    fn target_for(anime_id: u32, season: u32, episode: u32) -> PlayTarget {
+        PlayTarget {
+            anime_id,
+            anime_title: format!("Release {anime_id}"),
+            player_title: format!("Release {anime_id}"),
+            season,
+            episode,
+            episode_title: format!("Episode {episode}"),
+            stream_page_url: format!("https://ashdi.vip/s{season}/e{episode}"),
+            start_time: None,
+            studio_name: "dub".to_string(),
+            referrer: "https://ashdi.vip/".to_string(),
+        }
     }
 
     #[tokio::test]
