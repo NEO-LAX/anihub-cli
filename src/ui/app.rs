@@ -1,17 +1,22 @@
 use crate::api::{
     AniListMedia, AnimeDetails, AnimeItem, ApiClient, AshdiStudio, EpisodeSourcesKey,
     EpisodeSourcesResponse, FranchiseCatalog, MoonAnimeBrowserEpisode, MoonAnimeSourceMarker,
-    ReleaseAvailability, ReleaseEntry,
+    ReleaseAvailability, ReleaseClassification, ReleaseEntry,
+};
+use crate::settings::{
+    DefaultLibraryFilter, GITHUB_URL, Settings, SettingsStore, StartScreen, UpdateCheck,
+    mpv_is_available,
 };
 use crate::storage::{
-    AnimeStatus, AppHistory, EpisodeWatchedUpdate, StorageManager, WatchProgress,
+    AnimeStatus, AnimeStatusUpdate, AppHistory, EpisodeWatchedUpdate, LibraryReleaseKind,
+    LibraryReleaseMetadata, StorageManager, WatchProgress,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,9 +130,114 @@ impl LibraryFilter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnimeStatusEditor {
     pub anime_ids: Vec<u32>,
+    pub releases: Vec<Option<LibraryReleaseMetadata>>,
     pub title: String,
     pub selected: usize,
 }
+
+type AnimeStatusContext = (
+    Vec<u32>,
+    Vec<Option<LibraryReleaseMetadata>>,
+    String,
+    AnimeStatus,
+);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SettingsTab {
+    #[default]
+    General,
+    About,
+}
+
+impl SettingsTab {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::General => "Основні",
+            Self::About => "Про",
+        }
+    }
+
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::General => Self::About,
+            Self::About => Self::General,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsInput {
+    MpvPath,
+    MpvArgs,
+}
+
+/// Multi-choice setting edited through a centered radio popup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsChoiceKind {
+    StartScreen,
+    LibraryFilter,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingsChoiceEditor {
+    pub kind: SettingsChoiceKind,
+    pub selected: usize,
+}
+
+/// Draft state for the watched-threshold slider popup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsThresholdEditor {
+    /// `None` means the auto-watched feature is disabled (Space).
+    pub percent: Option<u8>,
+}
+
+impl SettingsChoiceKind {
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::StartScreen => " Стартовий екран ",
+            Self::LibraryFilter => " Фільтр бібліотеки ",
+        }
+    }
+
+    pub fn option_labels(self) -> Vec<&'static str> {
+        match self {
+            Self::StartScreen => vec![StartScreen::Search.label(), StartScreen::Library.label()],
+            Self::LibraryFilter => DefaultLibraryFilter::ALL
+                .iter()
+                .map(|filter| filter.label())
+                .collect(),
+        }
+    }
+
+    pub fn selected_index(self, settings: &Settings) -> usize {
+        match self {
+            Self::StartScreen => match settings.start_screen {
+                StartScreen::Search => 0,
+                StartScreen::Library => 1,
+            },
+            Self::LibraryFilter => DefaultLibraryFilter::ALL
+                .iter()
+                .position(|filter| *filter == settings.default_library_filter)
+                .unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    Current(String),
+    Available(UpdateCheck),
+    Failed(String),
+}
+
+/// Watched-threshold slider: 50–100% in steps of 5.
+pub const THRESHOLD_MIN: u8 = 50;
+pub const THRESHOLD_MAX: u8 = 100;
+pub const THRESHOLD_STEP: u8 = 5;
+pub const THRESHOLD_BAR_WIDTH: usize = 12;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
@@ -153,7 +263,26 @@ pub struct LibraryAnimeEntry {
 pub struct LibrarySeasonEntry {
     pub anime_id: u32,
     pub season: u32,
+    pub part: Option<u32>,
+    pub title: String,
+    pub kind: LibraryReleaseKind,
+    pub episodes_count: Option<u32>,
+    pub first_episode: Option<u32>,
+    pub status: AnimeStatus,
     pub episodes: Vec<WatchProgress>,
+}
+
+impl LibrarySeasonEntry {
+    fn metadata(&self) -> LibraryReleaseMetadata {
+        LibraryReleaseMetadata {
+            title: self.title.clone(),
+            kind: self.kind,
+            season: self.season,
+            part: self.part,
+            episodes_count: self.episodes_count,
+            first_episode: self.first_episode,
+        }
+    }
 }
 
 pub type HistoryIndexes = (HashSet<(u32, u32, u32)>, HashMap<(u32, u32, u32), f64>);
@@ -255,6 +384,9 @@ pub struct AppState {
     pub library_items: Vec<LibraryAnimeEntry>,
     pub library_all_items: Vec<LibraryAnimeEntry>,
     pub library_filter: LibraryFilter,
+    pub library_search_query: String,
+    pub library_search_cursor: usize,
+    pub library_search_editing: bool,
     pub library_anime_index: Option<usize>,
     pub library_season_index: Option<usize>,
     pub library_episode_index: Option<usize>,
@@ -262,7 +394,24 @@ pub struct AppState {
     pub library_season_list_state: ListState,
     pub library_episode_list_state: ListState,
     pub pending_delete_confirmation: Option<(Vec<u32>, String)>,
+    pub clear_library_confirmation: bool,
     pub status_editor: Option<AnimeStatusEditor>,
+
+    pub settings: Settings,
+    pub settings_tab: SettingsTab,
+    pub settings_selected: usize,
+    pub settings_input: Option<SettingsInput>,
+    pub settings_input_value: String,
+    pub settings_input_cursor: usize,
+    pub settings_choice: Option<SettingsChoiceEditor>,
+    pub settings_threshold: Option<SettingsThresholdEditor>,
+    /// Centered popup for the GitHub update check flow.
+    pub settings_update_popup: bool,
+    pub settings_store: SettingsStore,
+    pub mpv_available: bool,
+    pub image_protocol: String,
+    pub update_state: UpdateState,
+    pub update_check_requested: bool,
 
     pub should_quit: bool,
     pub api_client: ApiClient,
@@ -299,13 +448,18 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(picker: Picker) -> anyhow::Result<Self> {
+    pub fn new(picker: Picker, image_protocol: impl Into<String>) -> anyhow::Result<Self> {
         let storage = StorageManager::new()?;
         let history = storage.load_history()?;
         let (watched_index, progress_index) = Self::build_history_indexes(&history);
+        let settings_store = SettingsStore::new()?;
+        let settings = settings_store.load()?;
+        let mpv_available = mpv_is_available(&settings.mpv_path);
+        let default_library_filter = library_filter_from_setting(settings.default_library_filter);
+        let start_in_library = settings.start_screen == StartScreen::Library;
 
-        Ok(Self {
-            mode: AppMode::SearchInput,
+        let mut app = Self {
+            mode: AppMode::Normal,
             focus: FocusPanel::SearchList,
             search_query: String::new(),
             last_search_query: String::new(),
@@ -335,7 +489,10 @@ impl AppState {
 
             library_items: Vec::new(),
             library_all_items: Vec::new(),
-            library_filter: LibraryFilter::All,
+            library_filter: default_library_filter,
+            library_search_query: String::new(),
+            library_search_cursor: 0,
+            library_search_editing: false,
             library_anime_index: None,
             library_season_index: None,
             library_episode_index: None,
@@ -343,7 +500,23 @@ impl AppState {
             library_season_list_state: ListState::default(),
             library_episode_list_state: ListState::default(),
             pending_delete_confirmation: None,
+            clear_library_confirmation: false,
             status_editor: None,
+
+            settings,
+            settings_tab: SettingsTab::General,
+            settings_selected: 0,
+            settings_input: None,
+            settings_input_value: String::new(),
+            settings_input_cursor: 0,
+            settings_choice: None,
+            settings_threshold: None,
+            settings_update_popup: false,
+            settings_store,
+            mpv_available,
+            image_protocol: image_protocol.into(),
+            update_state: UpdateState::Idle,
+            update_check_requested: false,
 
             should_quit: false,
             api_client: ApiClient::new()?,
@@ -370,7 +543,11 @@ impl AppState {
 
             watched_index,
             progress_index,
-        })
+        };
+        if start_in_library {
+            app.open_library();
+        }
+        Ok(app)
     }
 
     /// Будує O(1) індекси з AppHistory.
@@ -428,6 +605,12 @@ impl AppState {
             anime_id.and_then(|id| self.search_results.iter().position(|anime| anime.id == id));
         self.current_details = anime_id.and_then(|id| self.details_cache.get(&id));
 
+        if !self.settings.show_posters {
+            self.current_poster = None;
+            self.poster_fetch_pending = None;
+            return;
+        }
+
         match anime_id {
             Some(id) => {
                 if let Some(image) = self.poster_cache.get(&id) {
@@ -447,7 +630,7 @@ impl AppState {
 
     /// Whether an asynchronously completed poster still owns the sidebar.
     pub fn accepts_poster(&self, anime_id: u32) -> bool {
-        self.sidebar_subject() == Some(anime_id)
+        self.settings.show_posters && self.sidebar_subject() == Some(anime_id)
     }
 
     /// Cache a completed poster and only install it when its release is still
@@ -638,7 +821,10 @@ impl AppState {
     pub fn selected_season_num(&self) -> Option<u32> {
         if self.is_library_mode() {
             let idx = self.selected_season_index?;
-            self.library_season_numbers().get(idx).copied()
+            self.library_selected_anime()?
+                .seasons
+                .get(idx)
+                .map(|release| release.season)
         } else if self.has_release_catalog() {
             (self.selected_release_available()
                 && self.current_sources_key == self.selected_release_source_key())
@@ -702,22 +888,16 @@ impl AppState {
     }
 
     pub fn library_season_numbers(&self) -> Vec<u32> {
-        if self.current_sources.is_some() {
-            return self.unique_seasons();
-        }
-
         let Some(anime) = self.library_selected_anime() else {
             return Vec::new();
         };
-        let mut seasons: Vec<u32> = anime.seasons.iter().map(|season| season.season).collect();
-        seasons.sort_unstable();
-        seasons
+        anime.seasons.iter().map(|release| release.season).collect()
     }
 
     #[allow(dead_code)]
     pub fn library_selected_season(&self) -> Option<&LibrarySeasonEntry> {
         let anime = self.library_selected_anime()?;
-        self.library_season_index
+        self.selected_season_index
             .and_then(|idx| anime.seasons.get(idx))
     }
 
@@ -752,8 +932,24 @@ impl AppState {
     fn switch_primary_tab(&mut self, tab: PrimaryTab) {
         self.status_editor = None;
         self.pending_delete_confirmation = None;
+        self.clear_library_confirmation = false;
         self.moonanime_browser_prompt = None;
+        self.library_search_editing = false;
+        self.settings_input = None;
+        self.settings_input_value.clear();
+        self.settings_input_cursor = 0;
+        self.settings_choice = None;
+        self.settings_threshold = None;
+        self.settings_update_popup = false;
+        // Leaving search-edit must not require Esc first when the user
+        // deliberately picks another primary tab (including via Alt/Ctrl).
+        if self.mode == AppMode::SearchInput {
+            self.search_query.clear();
+            self.search_cursor = 0;
+        }
         match tab {
+            // Always land on Search in Normal mode (never auto-open the editor).
+            // `/` is the only way to start typing a query.
             PrimaryTab::Search => self.reset_to_home(),
             PrimaryTab::Library => self.open_library(),
             PrimaryTab::Settings => {
@@ -765,28 +961,327 @@ impl AppState {
     }
 
     fn handle_primary_tab_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        // While typing a query, bare 1/2/3 must remain insertable. Tab switches
+        // still work with Alt or Ctrl so the user is never trapped in the editor.
+        let chord = modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if (self.mode == AppMode::SearchInput || self.library_search_editing) && !chord {
+            return false;
+        }
         match code {
-            KeyCode::Char('1')
-                if self.mode != AppMode::SearchInput
-                    || modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.switch_primary_tab(PrimaryTab::Search);
-            }
-            KeyCode::Char('2')
-                if self.mode != AppMode::SearchInput
-                    || modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.switch_primary_tab(PrimaryTab::Library);
-            }
-            KeyCode::Char('3')
-                if self.mode != AppMode::SearchInput
-                    || modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.switch_primary_tab(PrimaryTab::Settings);
-            }
+            KeyCode::Char('1') => self.switch_primary_tab(PrimaryTab::Search),
+            KeyCode::Char('2') => self.switch_primary_tab(PrimaryTab::Library),
+            KeyCode::Char('3') => self.switch_primary_tab(PrimaryTab::Settings),
             _ => return false,
         }
         true
+    }
+
+    fn persist_settings(&mut self) {
+        match self.settings_store.save(&self.settings) {
+            Ok(()) => self.set_info_status("Налаштування збережено"),
+            Err(error) => self.set_error_status(format!("Не вдалося зберегти: {error}")),
+        }
+    }
+
+    fn toggle_poster_setting(&mut self) {
+        self.settings.show_posters = !self.settings.show_posters;
+        if self.settings.show_posters {
+            self.select_sidebar_subject(self.sidebar_subject());
+        } else {
+            self.current_poster = None;
+            self.poster_fetch_pending = None;
+        }
+    }
+
+    fn open_settings_choice(&mut self, kind: SettingsChoiceKind) {
+        self.settings_choice = Some(SettingsChoiceEditor {
+            selected: kind.selected_index(&self.settings),
+            kind,
+        });
+    }
+
+    fn open_settings_threshold(&mut self) {
+        self.settings_threshold = Some(SettingsThresholdEditor {
+            percent: self.settings.watched_threshold_percent,
+        });
+    }
+
+    fn activate_general_setting(&mut self) {
+        match self.settings_selected {
+            0 => {
+                self.settings.autoplay_next = !self.settings.autoplay_next;
+                self.persist_settings();
+            }
+            1 => {
+                self.settings.resume_from_timestamp = !self.settings.resume_from_timestamp;
+                self.persist_settings();
+            }
+            2 => self.open_settings_threshold(),
+            3 => self.open_settings_choice(SettingsChoiceKind::StartScreen),
+            4 => self.open_settings_choice(SettingsChoiceKind::LibraryFilter),
+            5 => {
+                self.toggle_poster_setting();
+                self.persist_settings();
+            }
+            6 => self.open_settings_text(SettingsInput::MpvPath),
+            7 => self.open_settings_text(SettingsInput::MpvArgs),
+            _ => {}
+        }
+    }
+
+    fn open_settings_text(&mut self, kind: SettingsInput) {
+        let value = match kind {
+            SettingsInput::MpvPath => self.settings.mpv_path.clone(),
+            SettingsInput::MpvArgs => self.settings.mpv_extra_args.clone(),
+        };
+        self.settings_input_cursor = value.chars().count();
+        self.settings_input_value = value;
+        self.settings_input = Some(kind);
+    }
+
+    fn spawn_external(&mut self, command: crate::platform::CommandSpec, label: &str) {
+        if std::process::Command::new(command.program)
+            .args(command.args)
+            .spawn()
+            .is_ok()
+        {
+            self.set_info_status(format!("Відкрито: {label}"));
+        } else {
+            self.set_error_status(format!("Не вдалося відкрити: {label}"));
+        }
+    }
+
+    fn activate_about_setting(&mut self) {
+        match self.settings_selected {
+            0 => {
+                let path = self.settings_store.data_dir().display().to_string();
+                let command =
+                    crate::platform::path_open_command(crate::platform::Platform::current(), &path);
+                self.spawn_external(command, "теку даних");
+            }
+            1 => self.open_url_in_browser(GITHUB_URL, "GitHub"),
+            2 => self.open_update_popup(),
+            3 => self.clear_library_confirmation = true,
+            _ => {}
+        }
+    }
+
+    fn open_update_popup(&mut self) {
+        self.settings_update_popup = true;
+        // Always re-check when opening, unless a check is already in flight.
+        if !matches!(self.update_state, UpdateState::Checking) {
+            self.update_state = UpdateState::Checking;
+            self.update_check_requested = true;
+        }
+    }
+
+    fn handle_settings_update_popup(&mut self, key_code: KeyCode) -> bool {
+        if !self.settings_update_popup {
+            return false;
+        }
+        match key_code {
+            KeyCode::Enter => match &self.update_state {
+                UpdateState::Available(update) => {
+                    let url = update.release_url.clone();
+                    self.open_url_in_browser(&url, "сторінку оновлення");
+                }
+                UpdateState::Failed(_) | UpdateState::Current(_) | UpdateState::Idle => {
+                    self.update_state = UpdateState::Checking;
+                    self.update_check_requested = true;
+                }
+                UpdateState::Checking => {}
+            },
+            KeyCode::Esc => self.settings_update_popup = false,
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_settings_input(&mut self, key_code: KeyCode) -> bool {
+        let Some(input) = self.settings_input else {
+            return false;
+        };
+        match key_code {
+            KeyCode::Enter => {
+                match input {
+                    SettingsInput::MpvPath => {
+                        self.settings.mpv_path = self.settings_input_value.trim().to_string();
+                        if self.settings.mpv_path.is_empty() {
+                            self.settings.mpv_path = "mpv".to_string();
+                        }
+                        self.mpv_available = mpv_is_available(&self.settings.mpv_path);
+                    }
+                    SettingsInput::MpvArgs => {
+                        self.settings.mpv_extra_args = self.settings_input_value.trim().to_string();
+                    }
+                }
+                self.settings_input = None;
+                self.settings_input_value.clear();
+                self.settings_input_cursor = 0;
+                self.persist_settings();
+            }
+            KeyCode::Esc => {
+                self.settings_input = None;
+                self.settings_input_value.clear();
+                self.settings_input_cursor = 0;
+            }
+            KeyCode::Home => self.settings_input_cursor = 0,
+            KeyCode::End => self.settings_input_cursor = self.settings_input_value.chars().count(),
+            KeyCode::Left => {
+                self.settings_input_cursor = self.settings_input_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                self.settings_input_cursor =
+                    (self.settings_input_cursor + 1).min(self.settings_input_value.chars().count());
+            }
+            KeyCode::Backspace if self.settings_input_cursor > 0 => {
+                let start =
+                    byte_index_for_char(&self.settings_input_value, self.settings_input_cursor - 1);
+                let end =
+                    byte_index_for_char(&self.settings_input_value, self.settings_input_cursor);
+                self.settings_input_value.replace_range(start..end, "");
+                self.settings_input_cursor -= 1;
+            }
+            KeyCode::Backspace => {}
+            KeyCode::Delete => {
+                let len = self.settings_input_value.chars().count();
+                if self.settings_input_cursor < len {
+                    let start =
+                        byte_index_for_char(&self.settings_input_value, self.settings_input_cursor);
+                    let end = byte_index_for_char(
+                        &self.settings_input_value,
+                        self.settings_input_cursor + 1,
+                    );
+                    self.settings_input_value.replace_range(start..end, "");
+                }
+            }
+            KeyCode::Char(character) => {
+                let idx =
+                    byte_index_for_char(&self.settings_input_value, self.settings_input_cursor);
+                self.settings_input_value.insert(idx, character);
+                self.settings_input_cursor += 1;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_settings_choice(&mut self, key_code: KeyCode) -> bool {
+        let Some(editor) = self.settings_choice.as_mut() else {
+            return false;
+        };
+        let option_count = editor.kind.option_labels().len().max(1);
+        match key_code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                editor.selected = editor.selected.checked_sub(1).unwrap_or(option_count - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                editor.selected = (editor.selected + 1) % option_count;
+            }
+            KeyCode::Enter => {
+                let editor = self.settings_choice.take().expect("choice editor open");
+                match editor.kind {
+                    SettingsChoiceKind::StartScreen => {
+                        self.settings.start_screen = if editor.selected == 0 {
+                            StartScreen::Search
+                        } else {
+                            StartScreen::Library
+                        };
+                    }
+                    SettingsChoiceKind::LibraryFilter => {
+                        let filter = DefaultLibraryFilter::ALL
+                            .get(editor.selected)
+                            .copied()
+                            .unwrap_or(DefaultLibraryFilter::All);
+                        self.settings.default_library_filter = filter;
+                        self.library_filter = library_filter_from_setting(filter);
+                    }
+                }
+                self.persist_settings();
+            }
+            KeyCode::Esc => self.settings_choice = None,
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_settings_threshold(&mut self, key_code: KeyCode) -> bool {
+        let Some(editor) = self.settings_threshold.as_mut() else {
+            return false;
+        };
+        match key_code {
+            KeyCode::Char(' ') => {
+                // Space disables / re-enables the threshold feature.
+                if editor.percent.is_some() {
+                    editor.percent = None;
+                } else {
+                    editor.percent = Some(90);
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                let current = editor.percent.unwrap_or(THRESHOLD_MIN);
+                let next = current.saturating_sub(THRESHOLD_STEP).max(THRESHOLD_MIN);
+                editor.percent = Some(next);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let current = editor.percent.unwrap_or(THRESHOLD_MIN);
+                let next = (current + THRESHOLD_STEP).min(THRESHOLD_MAX);
+                editor.percent = Some(next);
+            }
+            KeyCode::Home => editor.percent = Some(THRESHOLD_MIN),
+            KeyCode::End => editor.percent = Some(THRESHOLD_MAX),
+            KeyCode::Enter => {
+                let editor = self
+                    .settings_threshold
+                    .take()
+                    .expect("threshold editor open");
+                self.settings.watched_threshold_percent = editor.percent;
+                self.persist_settings();
+            }
+            KeyCode::Esc => self.settings_threshold = None,
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_settings_key(&mut self, key_code: KeyCode) {
+        let rows = match self.settings_tab {
+            SettingsTab::General => 8,
+            SettingsTab::About => 4,
+        };
+        match key_code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.settings_tab = self.settings_tab.toggled();
+                self.settings_selected = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_selected = self.settings_selected.checked_sub(1).unwrap_or(rows - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_selected = (self.settings_selected + 1) % rows;
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => match self.settings_tab {
+                SettingsTab::General => self.activate_general_setting(),
+                SettingsTab::About => self.activate_about_setting(),
+            },
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => self.switch_primary_tab(PrimaryTab::Search),
+            _ => {}
+        }
+    }
+
+    pub fn take_update_check_request(&mut self) -> bool {
+        std::mem::take(&mut self.update_check_requested)
+    }
+
+    pub fn finish_update_check(&mut self, result: anyhow::Result<UpdateCheck>) {
+        self.update_state = match result {
+            Ok(update) if update.update_available => UpdateState::Available(update),
+            Ok(update) => UpdateState::Current(update.latest_version),
+            Err(error) => UpdateState::Failed(error.to_string()),
+        };
+        // Keep the update popup open so the user sees the result in-dialog.
+        self.clear_info_status();
     }
 
     // ---
@@ -826,7 +1321,31 @@ impl AppState {
                         return Ok(());
                     }
 
+                    if self.handle_clear_library_confirmation(key.code) {
+                        return Ok(());
+                    }
+
+                    if self.handle_settings_update_popup(key.code) {
+                        return Ok(());
+                    }
+
+                    if self.handle_settings_threshold(key.code) {
+                        return Ok(());
+                    }
+
+                    if self.handle_settings_choice(key.code) {
+                        return Ok(());
+                    }
+
+                    if self.handle_settings_input(key.code) {
+                        return Ok(());
+                    }
+
                     if self.handle_primary_tab_key(key.code, key.modifiers) {
+                        return Ok(());
+                    }
+                    if self.library_search_editing {
+                        self.handle_library_search_key(key.code);
                         return Ok(());
                     }
                     self.clear_info_status();
@@ -892,10 +1411,14 @@ impl AppState {
                             KeyCode::Home => self.search_cursor = 0,
                             KeyCode::End => self.search_cursor = self.search_query.chars().count(),
                             KeyCode::Esc => {
+                                // Cancel edit only — keep last results and last query display.
                                 self.mode = AppMode::Normal;
                                 self.search_query.clear();
                                 self.search_cursor = 0;
                                 self.clear_activity();
+                                if let Some(index) = self.selected_group_index {
+                                    self.result_list_state.select(Some(index));
+                                }
                             }
                             _ => {}
                         },
@@ -905,11 +1428,19 @@ impl AppState {
                             KeyCode::Char('d') => self.delete_library_selection(),
                             KeyCode::Char('e') => self.open_status_editor(),
                             KeyCode::Char('o') => self.open_in_browser(),
-                            KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Char('/') => self.open_library_search(),
                             KeyCode::Tab => self.cycle_library_filter(false),
                             KeyCode::BackTab => self.cycle_library_filter(true),
                             KeyCode::Left => {}
-                            KeyCode::Esc => self.reset_to_home(),
+                            KeyCode::Esc => {
+                                if self.library_search_query.is_empty() {
+                                    self.reset_to_home();
+                                } else {
+                                    self.library_search_query.clear();
+                                    self.library_search_cursor = 0;
+                                    self.apply_library_filter();
+                                }
+                            }
                             KeyCode::Up => self.move_library_up(),
                             KeyCode::Down => self.move_library_down(),
                             KeyCode::Right | KeyCode::Enter => self.enter_library_season(),
@@ -920,7 +1451,7 @@ impl AppState {
                             KeyCode::Char(' ') => self.toggle_library_selection_watched(),
                             KeyCode::Char('e') => self.open_status_editor(),
                             KeyCode::Char('o') => self.open_in_browser(),
-                            KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Char('/') => self.open_library_search(),
                             KeyCode::Tab => self.cycle_library_filter(false),
                             KeyCode::BackTab => self.cycle_library_filter(true),
                             KeyCode::Left => self.leave_library_level(),
@@ -935,7 +1466,7 @@ impl AppState {
                             KeyCode::Char(' ') => self.toggle_library_selection_watched(),
                             KeyCode::Char('e') => self.open_status_editor(),
                             KeyCode::Char('o') => self.open_in_browser(),
-                            KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Char('/') => self.open_library_search(),
                             KeyCode::Tab => self.cycle_library_filter(false),
                             KeyCode::BackTab => self.cycle_library_filter(true),
                             KeyCode::Left => self.leave_library_level(),
@@ -951,7 +1482,7 @@ impl AppState {
                             KeyCode::Backspace => self.clear_selected_episode_timestamp(),
                             KeyCode::Char('e') => self.open_status_editor(),
                             KeyCode::Char('o') => self.open_in_browser(),
-                            KeyCode::Char('/') => self.open_global_search(),
+                            KeyCode::Char('/') => self.open_library_search(),
                             KeyCode::Tab => self.cycle_library_filter(false),
                             KeyCode::BackTab => self.cycle_library_filter(true),
                             KeyCode::Left => self.leave_library_level(),
@@ -961,11 +1492,7 @@ impl AppState {
                             KeyCode::Enter => self.activate_selected_episode(),
                             _ => {}
                         },
-                        AppMode::Settings => match key.code {
-                            KeyCode::Char('q') => self.should_quit = true,
-                            KeyCode::Esc => self.switch_primary_tab(PrimaryTab::Search),
-                            _ => {}
-                        },
+                        AppMode::Settings => self.handle_settings_key(key.code),
                     }
                 }
             }
@@ -997,6 +1524,58 @@ impl AppState {
         let start = byte_index_for_char(&self.search_query, self.search_cursor);
         let end = byte_index_for_char(&self.search_query, self.search_cursor + 1);
         self.search_query.replace_range(start..end, "");
+    }
+
+    fn handle_library_search_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.library_search_editing = false,
+            KeyCode::Esc => {
+                self.library_search_editing = false;
+                self.library_search_query.clear();
+                self.library_search_cursor = 0;
+                self.apply_library_filter();
+            }
+            KeyCode::Tab => self.cycle_library_filter(false),
+            KeyCode::BackTab => self.cycle_library_filter(true),
+            KeyCode::Char(character) => {
+                let byte_index =
+                    byte_index_for_char(&self.library_search_query, self.library_search_cursor);
+                self.library_search_query.insert(byte_index, character);
+                self.library_search_cursor += 1;
+                self.apply_library_filter();
+            }
+            KeyCode::Backspace if self.library_search_cursor > 0 => {
+                let start =
+                    byte_index_for_char(&self.library_search_query, self.library_search_cursor - 1);
+                let end =
+                    byte_index_for_char(&self.library_search_query, self.library_search_cursor);
+                self.library_search_query.replace_range(start..end, "");
+                self.library_search_cursor -= 1;
+                self.apply_library_filter();
+            }
+            KeyCode::Delete
+                if self.library_search_cursor < self.library_search_query.chars().count() =>
+            {
+                let start =
+                    byte_index_for_char(&self.library_search_query, self.library_search_cursor);
+                let end =
+                    byte_index_for_char(&self.library_search_query, self.library_search_cursor + 1);
+                self.library_search_query.replace_range(start..end, "");
+                self.apply_library_filter();
+            }
+            KeyCode::Left => {
+                self.library_search_cursor = self.library_search_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                self.library_search_cursor =
+                    (self.library_search_cursor + 1).min(self.library_search_query.chars().count());
+            }
+            KeyCode::Home => self.library_search_cursor = 0,
+            KeyCode::End => {
+                self.library_search_cursor = self.library_search_query.chars().count();
+            }
+            _ => {}
+        }
     }
 
     fn handle_list_navigation_key(&mut self, code: KeyCode) -> bool {
@@ -1118,13 +1697,8 @@ impl AppState {
         self.library_items = self
             .library_all_items
             .iter()
-            .filter(|anime| match self.library_filter {
-                LibraryFilter::All => true,
-                LibraryFilter::Watching => anime.status == AnimeStatus::Watching,
-                LibraryFilter::Planned => anime.status == AnimeStatus::Planned,
-                LibraryFilter::Completed => anime.status == AnimeStatus::Completed,
-                LibraryFilter::OnHold => anime.status == AnimeStatus::OnHold,
-                LibraryFilter::Dropped => anime.status == AnimeStatus::Dropped,
+            .filter(|anime| {
+                library_item_matches(anime, self.library_filter, &self.library_search_query)
             })
             .cloned()
             .collect();
@@ -1158,23 +1732,7 @@ impl AppState {
     fn get_current_anime_context(&self) -> Option<(u32, String, String)> {
         if self.is_library_mode() {
             let anime = self.library_selected_anime()?;
-            let anime_id = match self.mode {
-                AppMode::LibrarySeason | AppMode::LibraryDubbing | AppMode::LibraryEpisode => {
-                    self.selected_season_num()
-                        .and_then(|sn| {
-                            self.studios_for_season(sn).iter().find_map(|studio| {
-                                if anime.anime_ids.contains(&studio.id) {
-                                    // Not quite right, but we need the seasonal ID
-                                    Some(studio.id)
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .unwrap_or(anime.latest_progress.anime_id)
-                }
-                _ => anime.latest_progress.anime_id,
-            };
+            let anime_id = self.library_selected_anime_id()?;
 
             let slug = self
                 .details_cache
@@ -1215,25 +1773,77 @@ impl AppState {
         }
     }
 
-    fn selected_anime_status_context(&self) -> Option<(Vec<u32>, String, AnimeStatus)> {
-        let (mut anime_ids, title) = if self.is_library_mode() {
+    fn selected_anime_status_context(&self) -> Option<AnimeStatusContext> {
+        let (mut targets, title) = if self.is_library_mode() {
             let anime = self.library_selected_anime()?;
-            return Some((
-                anime.anime_ids.clone(),
+            if self.mode != AppMode::Library {
+                let release = self.library_selected_season()?;
+                let status = self
+                    .history
+                    .library
+                    .get(&release.anime_id)
+                    .map_or(release.status, |record| record.status);
+                return Some((
+                    vec![release.anime_id],
+                    vec![Some(release.metadata())],
+                    anime.anime_title.clone(),
+                    status,
+                ));
+            }
+            (
+                anime
+                    .anime_ids
+                    .iter()
+                    .map(|anime_id| {
+                        let release = anime
+                            .seasons
+                            .iter()
+                            .find(|release| release.anime_id == *anime_id)
+                            .map(LibrarySeasonEntry::metadata)
+                            .or_else(|| {
+                                self.history
+                                    .library
+                                    .get(anime_id)
+                                    .and_then(|record| record.release.clone())
+                            });
+                        (*anime_id, release)
+                    })
+                    .collect::<Vec<_>>(),
                 anime.anime_title.clone(),
-                anime.status,
-            ));
+            )
         } else {
             let group_index = self.selected_group_index?;
             if let Some(catalog) = self.franchise_catalogs.get(group_index) {
-                (
-                    catalog
-                        .releases
-                        .iter()
-                        .filter_map(|release| release.anihub_id)
-                        .collect::<Vec<_>>(),
-                    catalog.canonical_title.clone(),
-                )
+                if self.focus != FocusPanel::SearchList {
+                    let release = self.selected_release()?;
+                    let anime_id = self.selected_release_anihub_id()?;
+                    (
+                        vec![(
+                            anime_id,
+                            Some(library_metadata_for_release(catalog, release)),
+                        )],
+                        catalog.canonical_title.clone(),
+                    )
+                } else {
+                    (
+                        catalog
+                            .releases
+                            .iter()
+                            .filter(|release| {
+                                release.availability == ReleaseAvailability::Available
+                            })
+                            .filter_map(|release| {
+                                release.anihub_id.map(|anime_id| {
+                                    (
+                                        anime_id,
+                                        Some(library_metadata_for_release(catalog, release)),
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                        catalog.canonical_title.clone(),
+                    )
+                }
             } else {
                 let group = self.franchise_groups.get(group_index)?;
                 let representative = group
@@ -1242,14 +1852,19 @@ impl AppState {
                 (
                     group
                         .iter()
-                        .filter_map(|index| self.search_results.get(*index).map(|anime| anime.id))
+                        .filter_map(|index| {
+                            self.search_results
+                                .get(*index)
+                                .map(|anime| (anime.id, None))
+                        })
                         .collect::<Vec<_>>(),
                     representative.title_ukrainian.clone(),
                 )
             }
         };
-        anime_ids.sort_unstable();
-        anime_ids.dedup();
+        targets.sort_by_key(|(anime_id, _)| *anime_id);
+        targets.dedup_by_key(|(anime_id, _)| *anime_id);
+        let (anime_ids, releases): (Vec<_>, Vec<_>) = targets.into_iter().unzip();
         if anime_ids.is_empty() {
             return None;
         }
@@ -1260,25 +1875,23 @@ impl AppState {
             .max_by_key(|record| record.updated_at)
             .map(|record| record.status);
         let status = explicit.unwrap_or_else(|| {
-            let progress = self
+            let has_progress = self
                 .history
                 .progress
                 .values()
-                .filter(|progress| anime_ids.contains(&progress.anime_id))
-                .collect::<Vec<_>>();
-            if progress.is_empty() {
-                AnimeStatus::NotAdded
-            } else if progress.iter().all(|progress| progress.watched) {
-                AnimeStatus::Completed
-            } else {
+                .any(|progress| anime_ids.contains(&progress.anime_id));
+            if has_progress {
                 AnimeStatus::Watching
+            } else {
+                AnimeStatus::NotAdded
             }
         });
-        Some((anime_ids, title, status))
+        Some((anime_ids, releases, title, status))
     }
 
     fn open_status_editor(&mut self) {
-        let Some((anime_ids, title, status)) = self.selected_anime_status_context() else {
+        let Some((anime_ids, releases, title, status)) = self.selected_anime_status_context()
+        else {
             return;
         };
         let selected = AnimeStatus::ALL
@@ -1287,9 +1900,131 @@ impl AppState {
             .unwrap_or(0);
         self.status_editor = Some(AnimeStatusEditor {
             anime_ids,
+            releases,
             title,
             selected,
         });
+    }
+
+    fn completed_episode_updates(
+        &self,
+        anime_ids: &[u32],
+        anime_title: &str,
+    ) -> Vec<EpisodeWatchedUpdate> {
+        let mut source_keys = self
+            .franchise_catalogs
+            .iter()
+            .flat_map(|catalog| catalog.releases.iter())
+            .filter(|release| release.availability == ReleaseAvailability::Available)
+            .filter_map(|release| {
+                let anime_id = release.anihub_id?;
+                anime_ids
+                    .contains(&anime_id)
+                    .then_some(EpisodeSourcesKey::new(
+                        anime_id,
+                        release.conceptual_season.unwrap_or(1),
+                    ))
+            })
+            .collect::<Vec<_>>();
+        if source_keys.is_empty() {
+            source_keys.extend(
+                anime_ids
+                    .iter()
+                    .map(|anime_id| self.source_key_for_anime_id(*anime_id)),
+            );
+        }
+        source_keys.sort_by_key(|key| (key.anime_id, key.season));
+        source_keys.dedup();
+
+        let mut seen = HashSet::new();
+        let mut updates = Vec::new();
+        for source_key in source_keys {
+            if let Some(sources) = self.sources_cache.get(&source_key) {
+                for studio in &sources.ashdi {
+                    for episode in &studio.episodes {
+                        push_completed_episode(
+                            &mut updates,
+                            &mut seen,
+                            source_key.anime_id,
+                            anime_title,
+                            studio.season_number,
+                            episode.episode_number,
+                            &studio.studio_name,
+                        );
+                    }
+                }
+                for studio in &sources.moonanime {
+                    for episode in &studio.episodes {
+                        push_completed_episode(
+                            &mut updates,
+                            &mut seen,
+                            source_key.anime_id,
+                            anime_title,
+                            studio.season_number,
+                            episode.episode_number,
+                            &studio.studio_name,
+                        );
+                    }
+                }
+            }
+
+            if seen.iter().any(|(anime_id, season, _)| {
+                *anime_id == source_key.anime_id && *season == source_key.season
+            }) {
+                continue;
+            }
+
+            let fallback = self.franchise_catalogs.iter().find_map(|catalog| {
+                let release = catalog.releases.iter().find(|release| {
+                    release.anihub_id == Some(source_key.anime_id)
+                        && release.conceptual_season.unwrap_or(1) == source_key.season
+                })?;
+                let count = release.available_episodes.or(release.episodes_count)?;
+                let part = release.part.unwrap_or(1);
+                let offset = catalog
+                    .releases
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.classification == release.classification
+                            && candidate.conceptual_season == release.conceptual_season
+                            && candidate.part.unwrap_or(1) < part
+                    })
+                    .filter_map(|candidate| {
+                        candidate.available_episodes.or(candidate.episodes_count)
+                    })
+                    .sum::<u32>();
+                Some((release.conceptual_season.unwrap_or(1), offset + 1, count))
+            });
+            let fallback = fallback.or_else(|| {
+                self.details_cache
+                    .get(&source_key.anime_id)
+                    .or_else(|| {
+                        self.current_details
+                            .as_ref()
+                            .filter(|details| details.id == source_key.anime_id)
+                            .cloned()
+                    })
+                    .and_then(|details| {
+                        details
+                            .episodes_count
+                            .map(|count| (source_key.season, 1, count))
+                    })
+            });
+            if let Some((season, first_episode, count)) = fallback {
+                for episode in first_episode..first_episode.saturating_add(count) {
+                    push_completed_episode(
+                        &mut updates,
+                        &mut seen,
+                        source_key.anime_id,
+                        anime_title,
+                        season,
+                        episode,
+                        "Статус",
+                    );
+                }
+            }
+        }
+        updates
     }
 
     fn handle_status_editor(&mut self, key_code: KeyCode) -> bool {
@@ -1310,10 +2045,33 @@ impl AppState {
             KeyCode::Enter => {
                 let editor = self.status_editor.take().expect("status editor exists");
                 let status = AnimeStatus::ALL[editor.selected];
-                match self
-                    .storage
-                    .set_anime_status(&editor.anime_ids, &editor.title, status)
-                {
+                if status == AnimeStatus::Completed {
+                    let updates = self.completed_episode_updates(&editor.anime_ids, &editor.title);
+                    if !updates.is_empty() {
+                        match self.storage.set_episodes_watched(&updates) {
+                            Ok(history) => self.history = history,
+                            Err(error) => {
+                                self.set_error_status(format!(
+                                    "Не вдалося позначити всі серії: {error}"
+                                ));
+                                return true;
+                            }
+                        }
+                    }
+                }
+                let status_updates = editor
+                    .anime_ids
+                    .iter()
+                    .copied()
+                    .zip(editor.releases.iter().cloned())
+                    .map(|(anime_id, release)| AnimeStatusUpdate {
+                        anime_id,
+                        title: editor.title.clone(),
+                        status,
+                        release,
+                    })
+                    .collect::<Vec<_>>();
+                match self.storage.set_anime_statuses(&status_updates) {
                     Ok(history) => {
                         self.history = history;
                         self.rebuild_history_indexes();
@@ -1475,18 +2233,47 @@ impl AppState {
                 if self.has_release_catalog() {
                     self.focus = FocusPanel::ReleaseList;
                 } else if self.unique_seasons().len() <= 1 {
-                    self.focus = FocusPanel::SearchList;
-                    self.restore_representative_poster();
+                    self.collapse_search_drilldown();
                 } else {
                     self.focus = FocusPanel::ReleaseList;
                 }
             }
             FocusPanel::ReleaseList => {
-                self.focus = FocusPanel::SearchList;
-                self.restore_representative_poster();
+                self.collapse_search_drilldown();
             }
-            FocusPanel::SearchList => {} // Esc на SearchList — нічого не робимо
+            FocusPanel::SearchList => {
+                // Residual drill-down (sources/selection) left from a previous
+                // open → collapse back to the franchise list without wiping results.
+                if self.selected_release_index.is_some()
+                    || self.selected_season_index.is_some()
+                    || self.selected_dubbing_index.is_some()
+                    || self.current_sources.is_some()
+                {
+                    self.collapse_search_drilldown();
+                }
+                // Already at a clean search root: keep results. Use `/` for a new query.
+            }
         }
+    }
+
+    /// Leave season/dubbing/episode columns and keep the franchise list + query.
+    fn collapse_search_drilldown(&mut self) {
+        self.focus = FocusPanel::SearchList;
+        self.selected_release_index = None;
+        self.selected_season_index = None;
+        self.selected_dubbing_index = None;
+        self.selected_episode_index = None;
+        self.season_list_state.select(None);
+        self.dubbing_list_state.select(None);
+        self.episode_list_state.select(None);
+        self.current_sources = None;
+        self.current_sources_key = None;
+        self.studio_anime_ids.clear();
+        // Keep details/poster for the highlighted franchise when possible.
+        if let Some(index) = self.selected_group_index {
+            self.result_list_state.select(Some(index));
+        }
+        self.restore_representative_poster();
     }
 
     fn handle_enter(&mut self) {
@@ -1779,11 +2566,9 @@ impl AppState {
     }
 
     fn reset_to_home(&mut self) {
-        self.mode = if self.search_results.is_empty() {
-            AppMode::SearchInput
-        } else {
-            AppMode::Normal
-        };
+        // Never auto-enter SearchInput: `/` is the only way to start typing.
+        // Empty results show an empty-state hint instead of trapping the user.
+        self.mode = AppMode::Normal;
         self.focus = FocusPanel::SearchList;
         self.search_query.clear();
         self.search_cursor = 0;
@@ -1823,11 +2608,10 @@ impl AppState {
         self.status_editor = None;
     }
 
-    fn open_global_search(&mut self) {
-        self.mode = AppMode::SearchInput;
-        self.focus = FocusPanel::SearchList;
-        self.search_query.clone_from(&self.last_search_query);
-        self.search_cursor = self.search_query.chars().count();
+    fn open_library_search(&mut self) {
+        self.open_library();
+        self.library_search_editing = true;
+        self.library_search_cursor = self.library_search_query.chars().count();
         self.pending_delete_confirmation = None;
         self.status_editor = None;
         self.clear_activity();
@@ -1836,39 +2620,82 @@ impl AppState {
 
     pub fn open_library(&mut self) {
         if self.is_library_mode() {
+            // Re-pressing 2 while already in the library jumps to the root list.
+            if self.mode != AppMode::Library {
+                self.mode = AppMode::Library;
+                self.library_season_index = None;
+                self.library_episode_index = None;
+                self.selected_season_index = None;
+                self.selected_dubbing_index = None;
+                self.selected_episode_index = None;
+                self.library_season_list_state.select(None);
+                self.library_episode_list_state.select(None);
+                self.season_list_state.select(None);
+                self.dubbing_list_state.select(None);
+                self.episode_list_state.select(None);
+                self.current_sources = None;
+                self.current_sources_key = None;
+                self.current_details = None;
+                self.current_poster = None;
+                self.studio_anime_ids.clear();
+                if let Some(index) = self.library_anime_index {
+                    self.prepare_library_anime_selection();
+                    self.library_anime_list_state.select(Some(index));
+                }
+            }
             return;
         }
 
+        self.hydrate_legacy_library_metadata();
         self.library_all_items = build_library_items(&self.history);
         self.library_items.clear();
         self.mode = AppMode::Library;
         self.apply_library_filter();
         if self.library_all_items.is_empty() {
-            self.set_info_status("Бібліотека порожня — додайте аніме через e");
+            self.set_info_status("Бібліотека порожня — додайте аніме через e, або / для пошуку");
+        }
+    }
+
+    /// Older v2 records only stored an AniHub ID and a franchise title. When a
+    /// matching catalog is already available, enrich those records in place so
+    /// the library can distinguish seasons, cours, films and extras.
+    fn hydrate_legacy_library_metadata(&mut self) {
+        let updates = self
+            .franchise_catalogs
+            .iter()
+            .flat_map(|catalog| {
+                catalog.releases.iter().filter_map(|release| {
+                    let anime_id = release.anihub_id?;
+                    let record = self.history.library.get(&anime_id)?;
+                    (record.release.is_none()
+                        && release.availability == ReleaseAvailability::Available)
+                        .then(|| AnimeStatusUpdate {
+                            anime_id,
+                            title: catalog.canonical_title.clone(),
+                            status: record.status,
+                            release: Some(library_metadata_for_release(catalog, release)),
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            return;
+        }
+        match self.storage.set_anime_statuses(&updates) {
+            Ok(history) => {
+                self.history = history;
+                self.rebuild_history_indexes();
+            }
+            Err(error) => {
+                self.set_error_status(format!("Не вдалося оновити формат бібліотеки: {error}"));
+            }
         }
     }
 
     pub fn library_selected_anime_id(&self) -> Option<u32> {
-        if let Some(season_num) = self.selected_season_num() {
-            if let Some(anime_id) = self.current_sources.as_ref().and_then(|sources| {
-                sources
-                    .ashdi
-                    .iter()
-                    .position(|studio| studio.season_number == season_num)
-                    .and_then(|idx| self.studio_anime_ids.get(idx))
-                    .copied()
-            }) {
-                return Some(anime_id);
-            }
-
-            if let Some(anime) = self.library_selected_anime() {
-                if let Some(season) = anime
-                    .seasons
-                    .iter()
-                    .find(|season| season.season == season_num)
-                {
-                    return Some(season.anime_id);
-                }
+        if self.mode != AppMode::Library {
+            if let Some(release) = self.library_selected_season() {
+                return Some(release.anime_id);
             }
         }
 
@@ -2202,25 +3029,65 @@ impl AppState {
         };
 
         match key_code {
-            KeyCode::Char('y') => {
+            KeyCode::Enter => {
                 self.pending_delete_confirmation = None;
-                match self.storage.delete_anime_progresses(&anime_ids) {
-                    Ok(()) => {
-                        self.history = self.storage.load_history().unwrap_or_default();
+                match self.storage.delete_library_entries(&anime_ids) {
+                    Ok(history) => {
+                        self.history = history;
                         self.rebuild_history_indexes();
                         self.reload_library_after_mutation();
-                        self.set_info_status(format!("Прогрес для \"{}\" видалено", anime_title));
+                        self.set_info_status(format!("\"{}\" видалено з бібліотеки", anime_title));
                     }
-                    Err(e) => self.set_error_status(format!("Не вдалося видалити прогрес: {}", e)),
+                    Err(e) => self.set_error_status(format!("Не вдалося видалити аніме: {}", e)),
                 }
                 true
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            KeyCode::Esc => {
                 self.pending_delete_confirmation = None;
                 true
             }
+            // Ignore other keys while the confirm dialog is open.
             _ => true,
         }
+    }
+
+    fn handle_clear_library_confirmation(&mut self, key_code: KeyCode) -> bool {
+        if !self.clear_library_confirmation {
+            return false;
+        }
+        match key_code {
+            KeyCode::Enter => {
+                self.clear_library_confirmation = false;
+                match self.storage.clear_library() {
+                    Ok(history) => {
+                        self.history = history;
+                        self.rebuild_history_indexes();
+                        self.library_all_items.clear();
+                        self.library_items.clear();
+                        self.library_anime_index = None;
+                        self.selected_season_index = None;
+                        self.selected_dubbing_index = None;
+                        self.selected_episode_index = None;
+                        self.library_anime_list_state.select(None);
+                        self.season_list_state.select(None);
+                        self.dubbing_list_state.select(None);
+                        self.episode_list_state.select(None);
+                        self.current_sources = None;
+                        self.current_sources_key = None;
+                        self.current_details = None;
+                        self.current_poster = None;
+                        self.poster_fetch_pending = None;
+                        self.set_info_status("Бібліотеку та прогрес очищено");
+                    }
+                    Err(error) => {
+                        self.set_error_status(format!("Не вдалося очистити бібліотеку: {error}"));
+                    }
+                }
+            }
+            KeyCode::Esc => self.clear_library_confirmation = false,
+            _ => {}
+        }
+        true
     }
 
     fn delete_library_selection(&mut self) {
@@ -2234,81 +3101,115 @@ impl AppState {
         }
     }
 
+    fn toggle_release_watched(
+        &mut self,
+        anime_id: u32,
+        anime_title: String,
+        release: LibraryReleaseMetadata,
+    ) {
+        let source_key = EpisodeSourcesKey::new(anime_id, release.season);
+        let sources = self.sources_cache.get(&source_key).or_else(|| {
+            (self.current_sources_key == Some(source_key))
+                .then(|| self.current_sources.clone())
+                .flatten()
+        });
+        let mut target_episodes = BTreeMap::<u32, String>::new();
+        if let Some(sources) = sources {
+            for studio in sources
+                .ashdi
+                .iter()
+                .filter(|studio| studio.season_number == release.season)
+            {
+                for episode in &studio.episodes {
+                    target_episodes
+                        .entry(episode.episode_number)
+                        .or_insert_with(|| studio.studio_name.clone());
+                }
+            }
+            if target_episodes.is_empty() {
+                for studio in sources
+                    .moonanime
+                    .iter()
+                    .filter(|studio| studio.season_number == release.season)
+                {
+                    for episode in &studio.episodes {
+                        target_episodes
+                            .entry(episode.episode_number)
+                            .or_insert_with(|| studio.studio_name.clone());
+                    }
+                }
+            }
+        }
+        if target_episodes.is_empty() {
+            if let Some(count) = release.episodes_count {
+                let first = release.first_episode.unwrap_or(1);
+                for episode in first..first.saturating_add(count) {
+                    target_episodes.insert(episode, "Статус".to_string());
+                }
+            }
+        }
+        if target_episodes.is_empty() {
+            self.set_info_status("Список серій цього випуску ще не завантажено");
+            return;
+        }
+
+        let all_watched = target_episodes.keys().all(|episode| {
+            self.watched_index
+                .contains(&(anime_id, release.season, *episode))
+        });
+        let mark_watched = !all_watched;
+        let episode_updates = target_episodes
+            .into_iter()
+            .map(|(episode, studio_name)| EpisodeWatchedUpdate {
+                anime_id,
+                anime_title: anime_title.clone(),
+                season: release.season,
+                episode,
+                studio_name,
+                watched: mark_watched,
+            })
+            .collect::<Vec<_>>();
+        let status_update = AnimeStatusUpdate {
+            anime_id,
+            title: anime_title,
+            status: if mark_watched {
+                AnimeStatus::Completed
+            } else {
+                AnimeStatus::Watching
+            },
+            release: Some(release.clone()),
+        };
+        match self
+            .storage
+            .set_release_watched(&status_update, &episode_updates)
+        {
+            Ok(history) => {
+                self.history = history;
+                self.rebuild_history_indexes();
+                if self.is_library_mode() {
+                    self.reload_library_after_mutation();
+                }
+                self.set_info_status(if mark_watched {
+                    format!("{} позначено як переглянутий", release.title)
+                } else {
+                    format!("{} позначено як непереглянутий", release.title)
+                });
+            }
+            Err(error) => self.set_error_status(format!("Не вдалося оновити випуск: {error}")),
+        }
+    }
+
     fn toggle_library_selection_watched(&mut self) {
         match self.mode {
             AppMode::LibrarySeason | AppMode::LibraryDubbing => {
-                let Some(anime_id) = self.library_selected_anime_id() else {
+                let Some(anime) = self.library_selected_anime() else {
                     return;
                 };
-                let Some(season_num) = self.selected_season_num() else {
+                let anime_title = anime.anime_title.clone();
+                let Some(release) = self.library_selected_season().cloned() else {
                     return;
                 };
-                let Some(anime_title) = self
-                    .library_selected_anime()
-                    .map(|anime| anime.anime_title.clone())
-                else {
-                    return;
-                };
-
-                let Some(sources) = self.current_sources.as_ref() else {
-                    return;
-                };
-
-                let mut target_episodes = Vec::new();
-                for studio in sources
-                    .ashdi
-                    .iter()
-                    .filter(|s| s.season_number == season_num)
-                {
-                    for episode in &studio.episodes {
-                        target_episodes.push((studio.studio_name.clone(), episode.episode_number));
-                    }
-                }
-                target_episodes.sort_unstable();
-                target_episodes.dedup();
-
-                if target_episodes.is_empty() {
-                    return;
-                }
-
-                let all_watched = target_episodes.iter().all(|(studio_name, episode)| {
-                    let key = crate::storage::StorageManager::make_progress_key(
-                        anime_id,
-                        season_num,
-                        *episode,
-                        studio_name,
-                    );
-                    self.history
-                        .progress
-                        .get(&key)
-                        .is_some_and(|progress| progress.watched)
-                });
-                let mark_watched = !all_watched;
-
-                let updates = target_episodes
-                    .iter()
-                    .map(|(studio_name, episode_number)| EpisodeWatchedUpdate {
-                        anime_id,
-                        anime_title: anime_title.clone(),
-                        season: season_num,
-                        episode: *episode_number,
-                        studio_name: studio_name.clone(),
-                        watched: mark_watched,
-                    })
-                    .collect::<Vec<_>>();
-                match self.storage.set_episodes_watched(&updates) {
-                    Ok(history) => self.history = history,
-                    Err(e) => {
-                        self.set_error_status(format!("Не вдалося оновити сезон: {}", e));
-                        return;
-                    }
-                }
-                self.rebuild_history_indexes();
-                self.set_info_status(if mark_watched {
-                    format!("Сезон {} позначено як переглянутий", season_num)
-                } else {
-                    format!("Сезон {} позначено як непереглянутий", season_num)
-                });
+                self.toggle_release_watched(release.anime_id, anime_title, release.metadata());
             }
             AppMode::LibraryEpisode => {
                 let Some(anime_id) = self.library_selected_anime_id() else {
@@ -2422,10 +3323,14 @@ impl AppState {
             return;
         };
         let Some(anime_title) = self
-            .search_results
-            .iter()
-            .find(|anime| anime.id == anime_id)
-            .map(|anime| anime.title_ukrainian.clone())
+            .selected_franchise_catalog()
+            .map(|catalog| catalog.canonical_title.clone())
+            .or_else(|| {
+                self.search_results
+                    .iter()
+                    .find(|anime| anime.id == anime_id)
+                    .map(|anime| anime.title_ukrainian.clone())
+            })
             .or_else(|| {
                 self.current_details
                     .as_ref()
@@ -2440,59 +3345,14 @@ impl AppState {
 
         match self.focus {
             FocusPanel::ReleaseList | FocusPanel::DubbingList => {
-                let Some(sources) = self.current_sources.as_ref() else {
+                let Some(catalog) = self.selected_franchise_catalog() else {
                     return;
                 };
-                let mut target_episodes = Vec::new();
-                for studio in sources
-                    .ashdi
-                    .iter()
-                    .filter(|s| s.season_number == season_num)
-                {
-                    for episode in &studio.episodes {
-                        target_episodes.push((studio.studio_name.clone(), episode.episode_number));
-                    }
-                }
-                target_episodes.sort_unstable();
-                target_episodes.dedup();
-                if target_episodes.is_empty() {
+                let Some(release) = self.selected_release() else {
                     return;
-                }
-
-                let all_watched = target_episodes.iter().all(|(studio_name, episode)| {
-                    self.history.progress.values().any(|progress| {
-                        progress.anime_id == anime_id
-                            && progress.season == season_num
-                            && progress.episode == *episode
-                            && progress.studio_name == *studio_name
-                            && progress.watched
-                    })
-                });
-
-                let updates = target_episodes
-                    .iter()
-                    .map(|(studio_name, episode_number)| EpisodeWatchedUpdate {
-                        anime_id,
-                        anime_title: anime_title.clone(),
-                        season: season_num,
-                        episode: *episode_number,
-                        studio_name: studio_name.clone(),
-                        watched: !all_watched,
-                    })
-                    .collect::<Vec<_>>();
-                match self.storage.set_episodes_watched(&updates) {
-                    Ok(history) => self.history = history,
-                    Err(e) => {
-                        self.set_error_status(format!("Не вдалося оновити сезон: {}", e));
-                        return;
-                    }
-                }
-                self.rebuild_history_indexes();
-                self.set_info_status(if all_watched {
-                    format!("Сезон {} позначено як непереглянутий", season_num)
-                } else {
-                    format!("Сезон {} позначено як переглянутий", season_num)
-                });
+                };
+                let metadata = library_metadata_for_release(catalog, release);
+                self.toggle_release_watched(anime_id, anime_title, metadata);
             }
             FocusPanel::EpisodeList => {
                 let Some(selected_studio) = self.selected_studio() else {
@@ -2543,10 +3403,12 @@ impl AppState {
         let prev_anime_title = self
             .library_selected_anime()
             .map(|anime| anime.anime_title.clone());
-        let prev_season = self.selected_season_num();
+        let prev_mode = self.mode;
+        let prev_release_id = (prev_mode != AppMode::Library)
+            .then(|| self.library_selected_anime_id())
+            .flatten();
         let prev_dubbing = self.selected_dubbing_index;
         let prev_episode = self.selected_episode_index;
-        let prev_mode = self.mode;
 
         self.library_all_items = build_library_items(&self.history);
         self.apply_library_filter();
@@ -2578,11 +3440,12 @@ impl AppState {
             self.prepare_library_anime_selection();
         }
 
-        if let Some(season_num) = prev_season {
+        if let Some(anime_id) = prev_release_id {
             self.selected_season_index = self
-                .library_season_numbers()
-                .iter()
-                .position(|&s| s == season_num);
+                .library_selected_anime()
+                .into_iter()
+                .flat_map(|anime| anime.seasons.iter())
+                .position(|release| release.anime_id == anime_id);
             self.season_list_state.select(self.selected_season_index);
         }
         if prev_mode == AppMode::LibraryDubbing || prev_mode == AppMode::LibraryEpisode {
@@ -2671,119 +3534,190 @@ impl AppState {
     }
 }
 
+fn library_metadata_for_release(
+    catalog: &FranchiseCatalog,
+    release: &ReleaseEntry,
+) -> LibraryReleaseMetadata {
+    let kind = match release.classification {
+        ReleaseClassification::MainlineSeason => LibraryReleaseKind::Season,
+        ReleaseClassification::MainlineMovie => LibraryReleaseKind::Movie,
+        ReleaseClassification::MainlineSpecial => LibraryReleaseKind::Special,
+        ReleaseClassification::Extra => LibraryReleaseKind::Extra,
+    };
+    let part = release.part.unwrap_or(1);
+    let offset = catalog
+        .releases
+        .iter()
+        .filter(|candidate| {
+            candidate.classification == release.classification
+                && candidate.conceptual_season == release.conceptual_season
+                && candidate.part.unwrap_or(1) < part
+        })
+        .filter_map(|candidate| candidate.available_episodes.or(candidate.episodes_count))
+        .sum::<u32>();
+    LibraryReleaseMetadata {
+        title: release.title.clone(),
+        kind,
+        season: release.conceptual_season.unwrap_or(1),
+        part: release.part,
+        episodes_count: release.available_episodes.or(release.episodes_count),
+        first_episode: Some(offset.saturating_add(1)),
+    }
+}
+
 fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
-    let mut per_anime: HashMap<String, Vec<WatchProgress>> = HashMap::new();
+    let mut title_by_id = HashMap::<u32, String>::new();
     for progress in history.progress.values() {
-        per_anime
-            .entry(progress.anime_title.clone())
-            .or_default()
-            .push(progress.clone());
+        title_by_id
+            .entry(progress.anime_id)
+            .or_insert_with(|| progress.anime_title.clone());
+    }
+    for (&anime_id, record) in &history.library {
+        title_by_id.insert(anime_id, record.title.clone());
     }
 
-    let mut items: Vec<LibraryAnimeEntry> = per_anime
-        .into_iter()
-        .filter_map(|(anime_title, progress_list)| {
-            let latest_progress = progress_list
-                .iter()
-                .max_by_key(|progress| progress.updated_at)?
-                .clone();
+    let mut ids_by_title = HashMap::<String, Vec<u32>>::new();
+    for (anime_id, title) in title_by_id {
+        ids_by_title.entry(title).or_default().push(anime_id);
+    }
 
-            let mut per_season: HashMap<u32, Vec<WatchProgress>> = HashMap::new();
-            for progress in progress_list {
-                per_season
-                    .entry(progress.season)
-                    .or_default()
-                    .push(progress);
-            }
-
-            let mut seasons: Vec<LibrarySeasonEntry> = per_season
-                .into_iter()
-                .map(|(season, mut episodes)| {
-                    episodes.sort_by_key(|progress| progress.episode);
-                    let anime_id = episodes
-                        .iter()
-                        .max_by_key(|progress| progress.updated_at)
-                        .map(|progress| progress.anime_id)
-                        .unwrap_or(latest_progress.anime_id);
-                    LibrarySeasonEntry {
-                        anime_id,
-                        season,
-                        episodes,
-                    }
-                })
-                .collect();
-            seasons.sort_by_key(|entry| entry.season);
-            let mut anime_ids: Vec<u32> = seasons.iter().map(|season| season.anime_id).collect();
-            anime_ids.sort();
-            anime_ids.dedup();
-
-            let explicit_status = anime_ids
-                .iter()
-                .filter_map(|anime_id| history.library.get(anime_id))
-                .max_by_key(|record| record.updated_at)
-                .map(|record| record.status);
-            let inferred_status = if seasons
-                .iter()
-                .all(|season| season.episodes.iter().all(|episode| episode.watched))
-            {
-                AnimeStatus::Completed
-            } else {
-                AnimeStatus::Watching
-            };
-            let status = explicit_status.unwrap_or(inferred_status);
-            if status == AnimeStatus::NotAdded {
-                return None;
-            }
-
-            Some(LibraryAnimeEntry {
-                anime_ids,
-                anime_title,
-                latest_progress,
-                seasons,
-                status,
-            })
-        })
-        .collect();
-
-    let mut known_ids = items
-        .iter()
-        .flat_map(|item| item.anime_ids.iter().copied())
-        .collect::<HashSet<_>>();
-    let mut library_records = history.library.iter().collect::<Vec<_>>();
-    library_records.sort_by_key(|(anime_id, record)| (record.updated_at, **anime_id));
-    for (&anime_id, record) in library_records {
-        if record.status == AnimeStatus::NotAdded || known_ids.contains(&anime_id) {
-            continue;
-        }
-        if let Some(existing) = items
-            .iter_mut()
-            .find(|item| item.anime_title == record.title)
-        {
-            existing.anime_ids.push(anime_id);
-            existing.anime_ids.sort_unstable();
-            existing.anime_ids.dedup();
-            existing.status = record.status;
-            known_ids.insert(anime_id);
-            continue;
-        }
-        items.push(LibraryAnimeEntry {
-            anime_ids: vec![anime_id],
-            anime_title: record.title.clone(),
-            latest_progress: WatchProgress {
-                anime_id,
-                anime_title: record.title.clone(),
-                season: 1,
-                episode: 1,
-                studio_name: String::new(),
-                timestamp: 0.0,
-                duration: 0.0,
-                watched: false,
-                updated_at: record.updated_at,
-            },
-            seasons: Vec::new(),
-            status: record.status,
+    let mut items = Vec::new();
+    for (anime_title, mut anime_ids) in ids_by_title {
+        anime_ids.sort_unstable();
+        anime_ids.dedup();
+        anime_ids.retain(|anime_id| {
+            history
+                .library
+                .get(anime_id)
+                .is_none_or(|record| record.status != AnimeStatus::NotAdded)
         });
-        known_ids.insert(anime_id);
+        if anime_ids.is_empty() {
+            continue;
+        }
+
+        let explicit_statuses = anime_ids
+            .iter()
+            .filter_map(|anime_id| history.library.get(anime_id))
+            .collect::<Vec<_>>();
+        let status = if !explicit_statuses.is_empty()
+            && explicit_statuses
+                .iter()
+                .all(|record| record.status == AnimeStatus::Completed)
+        {
+            AnimeStatus::Completed
+        } else if explicit_statuses.iter().any(|record| {
+            matches!(
+                record.status,
+                AnimeStatus::Watching | AnimeStatus::Completed
+            )
+        }) {
+            AnimeStatus::Watching
+        } else {
+            explicit_statuses
+                .into_iter()
+                .max_by_key(|record| record.updated_at)
+                .map_or(AnimeStatus::Watching, |record| record.status)
+        };
+
+        let mut seasons = anime_ids
+            .iter()
+            .enumerate()
+            .map(|(release_index, &anime_id)| {
+                let record = history.library.get(&anime_id);
+                let metadata = record.and_then(|record| record.release.clone());
+                let mut episodes = history
+                    .progress
+                    .values()
+                    .filter(|progress| progress.anime_id == anime_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                episodes.sort_by_key(|progress| (progress.episode, progress.updated_at));
+                let season = metadata
+                    .as_ref()
+                    .map(|release| release.season)
+                    .or_else(|| episodes.first().map(|progress| progress.season))
+                    .unwrap_or(release_index as u32 + 1);
+                LibrarySeasonEntry {
+                    anime_id,
+                    season,
+                    part: metadata.as_ref().and_then(|release| release.part),
+                    title: metadata
+                        .as_ref()
+                        .map(|release| release.title.clone())
+                        .unwrap_or_else(|| format!("Сезон {season}")),
+                    kind: metadata
+                        .as_ref()
+                        .map_or(LibraryReleaseKind::Season, |release| release.kind),
+                    episodes_count: metadata
+                        .as_ref()
+                        .and_then(|release| release.episodes_count)
+                        .or_else(|| episodes.iter().map(|progress| progress.episode).max()),
+                    first_episode: metadata
+                        .as_ref()
+                        .and_then(|release| release.first_episode)
+                        .or_else(|| episodes.iter().map(|progress| progress.episode).min()),
+                    status: record.map_or(AnimeStatus::Watching, |record| record.status),
+                    episodes,
+                }
+            })
+            .collect::<Vec<_>>();
+        seasons.sort_by_key(|release| {
+            (
+                match release.kind {
+                    LibraryReleaseKind::Season => 0,
+                    LibraryReleaseKind::Movie => 1,
+                    LibraryReleaseKind::Special => 2,
+                    LibraryReleaseKind::Extra => 3,
+                },
+                release.season,
+                release.part.unwrap_or(1),
+                release.anime_id,
+            )
+        });
+
+        let latest_progress = history
+            .progress
+            .values()
+            .filter(|progress| anime_ids.contains(&progress.anime_id))
+            .max_by_key(|progress| progress.updated_at)
+            .cloned()
+            .unwrap_or_else(|| {
+                let latest_record = anime_ids
+                    .iter()
+                    .filter_map(|anime_id| {
+                        history
+                            .library
+                            .get(anime_id)
+                            .map(|record| (*anime_id, record))
+                    })
+                    .max_by_key(|(_, record)| record.updated_at);
+                let (anime_id, updated_at) = latest_record
+                    .map(|(anime_id, record)| (anime_id, record.updated_at))
+                    .unwrap_or((anime_ids[0], 0));
+                let season = seasons
+                    .iter()
+                    .find(|release| release.anime_id == anime_id)
+                    .map_or(1, |release| release.season);
+                WatchProgress {
+                    anime_id,
+                    anime_title: anime_title.clone(),
+                    season,
+                    episode: 1,
+                    studio_name: String::new(),
+                    timestamp: 0.0,
+                    duration: 0.0,
+                    watched: false,
+                    updated_at,
+                }
+            });
+
+        items.push(LibraryAnimeEntry {
+            anime_ids,
+            anime_title,
+            latest_progress,
+            seasons,
+            status,
+        });
     }
     items.sort_by(|a, b| {
         b.latest_progress
@@ -2791,6 +3725,30 @@ fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
             .cmp(&a.latest_progress.updated_at)
     });
     items
+}
+
+fn library_item_matches(anime: &LibraryAnimeEntry, filter: LibraryFilter, query: &str) -> bool {
+    let status_matches = match filter {
+        LibraryFilter::All => true,
+        LibraryFilter::Watching => anime.status == AnimeStatus::Watching,
+        LibraryFilter::Planned => anime.status == AnimeStatus::Planned,
+        LibraryFilter::Completed => anime.status == AnimeStatus::Completed,
+        LibraryFilter::OnHold => anime.status == AnimeStatus::OnHold,
+        LibraryFilter::Dropped => anime.status == AnimeStatus::Dropped,
+    };
+    let query = query.trim().to_lowercase();
+    status_matches && (query.is_empty() || anime.anime_title.to_lowercase().contains(&query))
+}
+
+const fn library_filter_from_setting(filter: DefaultLibraryFilter) -> LibraryFilter {
+    match filter {
+        DefaultLibraryFilter::All => LibraryFilter::All,
+        DefaultLibraryFilter::Watching => LibraryFilter::Watching,
+        DefaultLibraryFilter::Planned => LibraryFilter::Planned,
+        DefaultLibraryFilter::Completed => LibraryFilter::Completed,
+        DefaultLibraryFilter::OnHold => LibraryFilter::OnHold,
+        DefaultLibraryFilter::Dropped => LibraryFilter::Dropped,
+    }
 }
 
 fn byte_index_for_char(text: &str, char_index: usize) -> usize {
@@ -2804,6 +3762,27 @@ fn normalize_studio_name(name: &str) -> String {
         .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn push_completed_episode(
+    updates: &mut Vec<EpisodeWatchedUpdate>,
+    seen: &mut HashSet<(u32, u32, u32)>,
+    anime_id: u32,
+    anime_title: &str,
+    season: u32,
+    episode: u32,
+    studio_name: &str,
+) {
+    if seen.insert((anime_id, season, episode)) {
+        updates.push(EpisodeWatchedUpdate {
+            anime_id,
+            anime_title: anime_title.to_string(),
+            season,
+            episode,
+            studio_name: studio_name.to_string(),
+            watched: true,
+        });
+    }
 }
 
 fn dubbing_choices_for_sources(
@@ -2961,6 +3940,34 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].anime_title, "Тест");
+        assert!(library_item_matches(&items[0], LibraryFilter::All, "тЕс"));
+        assert!(!library_item_matches(
+            &items[0],
+            LibraryFilter::Completed,
+            "тест"
+        ));
+
+        history.progress.values_mut().next().unwrap().watched = true;
+        let items = build_library_items(&history);
+        assert_eq!(items[0].status, AnimeStatus::Watching);
+        assert!(!library_item_matches(
+            &items[0],
+            LibraryFilter::Completed,
+            "тест"
+        ));
+    }
+
+    #[test]
+    fn completion_updates_deduplicate_the_same_episode_across_dubbings() {
+        let mut updates = Vec::new();
+        let mut seen = HashSet::new();
+        push_completed_episode(&mut updates, &mut seen, 7, "Тест", 1, 1, "Dub A");
+        push_completed_episode(&mut updates, &mut seen, 7, "Тест", 1, 1, "Dub B");
+        push_completed_episode(&mut updates, &mut seen, 7, "Тест", 1, 2, "Dub A");
+
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|update| update.watched));
+        assert_eq!(updates[0].studio_name, "Dub A");
     }
 
     #[test]
@@ -2972,6 +3979,7 @@ mod tests {
                 title: "Каґуя".to_string(),
                 status: AnimeStatus::Planned,
                 updated_at: 10,
+                release: None,
             },
         );
         let items = build_library_items(&history);
@@ -2981,5 +3989,64 @@ mod tests {
 
         history.library.get_mut(&42).unwrap().status = AnimeStatus::NotAdded;
         assert!(build_library_items(&history).is_empty());
+    }
+
+    #[test]
+    fn library_materializes_unplayed_seasons_and_movies_from_status_metadata() {
+        let mut history = AppHistory::default();
+        for (anime_id, kind, season, title) in [
+            (10, LibraryReleaseKind::Season, 1, "Перший сезон"),
+            (20, LibraryReleaseKind::Season, 2, "Другий сезон"),
+            (30, LibraryReleaseKind::Movie, 2, "Фільм після сезону"),
+        ] {
+            history.library.insert(
+                anime_id,
+                crate::storage::history::AnimeLibraryRecord {
+                    title: "Франшиза".to_string(),
+                    status: AnimeStatus::Completed,
+                    updated_at: i64::from(anime_id),
+                    release: Some(LibraryReleaseMetadata {
+                        title: title.to_string(),
+                        kind,
+                        season,
+                        part: Some(1),
+                        episodes_count: Some(if kind == LibraryReleaseKind::Movie {
+                            1
+                        } else {
+                            12
+                        }),
+                        first_episode: Some(1),
+                    }),
+                },
+            );
+        }
+
+        let items = build_library_items(&history);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].anime_ids, vec![10, 20, 30]);
+        assert_eq!(items[0].seasons.len(), 3);
+        assert_eq!(items[0].seasons[0].season, 1);
+        assert_eq!(items[0].seasons[1].season, 2);
+        assert_eq!(items[0].seasons[2].kind, LibraryReleaseKind::Movie);
+        assert_eq!(items[0].status, AnimeStatus::Completed);
+    }
+
+    #[test]
+    fn partially_completed_franchise_remains_in_watching_filter() {
+        let mut history = AppHistory::default();
+        for (anime_id, status) in [(10, AnimeStatus::Completed), (20, AnimeStatus::Planned)] {
+            history.library.insert(
+                anime_id,
+                crate::storage::history::AnimeLibraryRecord {
+                    title: "Франшиза".to_string(),
+                    status,
+                    updated_at: i64::from(anime_id),
+                    release: None,
+                },
+            );
+        }
+
+        let items = build_library_items(&history);
+        assert_eq!(items[0].status, AnimeStatus::Watching);
     }
 }

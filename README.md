@@ -4,18 +4,20 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 
 ![AniHub CLI demo](assets/demo.gif)
 
-## What's new in v0.5.0
+## What's new in v0.6.0
 
+- Persistent General/About settings for playback, resume, watched threshold, startup, library defaults, posters, and custom `mpv` launch options.
+- An in-app GitHub release check that reports newer versions and opens the release page only after user action.
 - A responsive terminal layout that gives the active panel more space and hides the poster sidebar in narrow terminals.
 - A two-line contextual footer with relevant shortcuts, loading activity, selection position, version, and current playback progress.
 - Editable Unicode search with cursor movement, `Home`/`End`, `Delete`, and automatic restoration of the previous query.
 - A status-based library for Watching, Planned, Completed, On Hold, Dropped, and All.
 - Faster long-list navigation with `j`/`k`, `Page Up`/`Page Down`, and `Home`/`End`.
-- Clearer breadcrumbs, empty states, modal errors, and a fully Ukrainian in-app help screen.
+- Centered empty states, modal errors, and a fully Ukrainian in-app help screen.
 
 ## Supported functionality
 
-- Search AniHub by title. Results are limited to entries that currently have Ukrainian dubbing in the AniHub API.
+- Search AniHub conservatively by title. The default search requests one page, keeps at most 20 Ukrainian-dubbed entries, and matches within the first two words of a Ukrainian/original/English title; broad search is intentionally reserved for a future advanced mode.
 - Browse anime details, posters, seasons, dubbing options, and episodes.
 - Group related seasons and films deterministically and cache loaded metadata for repeated navigation.
 - Keep the interface responsive while search, posters, episode sources, and stream resolution run in bounded background workers.
@@ -29,19 +31,25 @@ The application depends on the live AniHub/API and streaming pages. Search and s
 
 ## Installation
 
-The installer supports Linux x86_64 and macOS x86_64/arm64. It downloads the matching release binary, verifies it against `SHA256SUMS`, and installs it to `~/.local/bin` by default.
+The installer supports Linux x86_64 and macOS x86_64/arm64. It downloads the matching release binary, verifies it against `SHA256SUMS`, validates/migrates local data, and installs it to `~/.local/bin` by default. Run it without an action to open the arrow-key menu; it shows **Install** for a fresh setup and **Update / Uninstall** when the binary already exists.
 
 ```bash
-curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- install
+curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash
 ```
 
-Run the installer non-interactively with `install` or `uninstall`:
+Use `↑`/`↓` (or `j`/`k`) and `Enter` in the menu. Uninstall asks whether to keep or delete local history/settings. Automation can pass `install`, `update`, or `uninstall` explicitly:
 
 ```bash
+curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- update
+
+# Remove the app but keep history and settings
 curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- uninstall
+
+# Remove the app and all AniHub CLI user data
+curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- uninstall --purge
 ```
 
-To install into another directory, set `ANIHUB_INSTALL_DIR` before running the script. The installer never removes the history directory when uninstalling.
+To install into another directory, set `ANIHUB_INSTALL_DIR` before running the script. The installer runs the downloaded, checksum-verified binary in `--migrate-data` mode before replacing the installed executable. A failed validation leaves the current executable and source data intact. User data is deleted only after selecting **Delete user data** or passing the explicit `uninstall --purge` option.
 
 After installation, make sure the install directory is in `PATH`:
 
@@ -89,8 +97,9 @@ The footer shows shortcuts for the current screen. Press `?` or `h` outside sear
 
 | Key | Action |
 | --- | --- |
-| `1` / `2` / `3` | Open Search / Library / Settings outside search editing |
-| `/` | Open search and restore the previous query |
+| `1` / `2` / `3` | Switch Search / Library / Settings (does not open the search editor) |
+| `Alt+1` / `Alt+2` / `Alt+3` or `Ctrl+1`… | Same tab switch while the search field is focused |
+| `/` | Search AniHub from Search, or filter only the local library from Library |
 | `?` or `h` | Open help |
 | `Up` / `Down` or `k` / `j` | Move through the active list |
 | `Page Up` / `Page Down` | Move ten entries at a time |
@@ -112,29 +121,35 @@ The footer shows shortcuts for the current screen. Press `?` or `h` outside sear
 | `d` | Delete the selected library progress after confirmation |
 | `Tab` / `Shift+Tab` | Cycle library status filters forward or backward |
 
-While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and `Delete` normally. `Enter` starts the search and `Esc` cancels it.
+Library search is local and immediate: press `/` anywhere inside Library, type part of a title, and press `Enter` to keep the filter. `Esc` clears it. It never starts an AniHub network search.
+
+While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and `Delete` normally. `Enter` starts the search and `Esc` cancels it. Digits stay typeable; switch tabs with `Alt+1`/`Alt+2`/`Alt+3` (or `Ctrl`) without leaving the editor first.
+
+### Settings
+
+Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` to switch General/About, `Up`/`Down` to select a row, and `Space` or `Enter` to change it. Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
 
 ## History and recovery
 
-Progress and library statuses use the strict v2 format stored as `history-v2.json` under the application data directory. Older history formats are intentionally not imported.
+Progress and library statuses use the v2 schema stored under the stable `history.json` filename. On update, `history-v2.json`, schema-v1 history, and the original unversioned `history.json` format are imported automatically. Legacy files are retained, and an in-place schema migration keeps the original bytes in `history.json.bak` before writing the canonical format.
 
 | Platform | History file |
 | --- | --- |
-| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/anihub-cli/history-v2.json` |
-| macOS | `$HOME/Library/Application Support/com.shadowgarden.anihub-cli/history-v2.json` |
-| Windows | `%LOCALAPPDATA%\\shadowgarden\\anihub-cli\\data\\history-v2.json` |
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/anihub-cli/history.json` |
+| macOS | `$HOME/Library/Application Support/com.shadowgarden.anihub-cli/history.json` |
+| Windows | `%LOCALAPPDATA%\\shadowgarden\\anihub-cli\\data\\history.json` |
 
-The installer only replaces the executable; uninstall leaves this data in place. Back it up before manual recovery:
+Normal uninstall leaves this data in place; the interactive purge option and `uninstall --purge` remove the complete AniHub CLI data directory. Back it up before purging or manual recovery:
 
 ```bash
-cp "/path/to/history-v2.json" "/path/to/history-v2.json.backup"
+cp "/path/to/history.json" "/path/to/history.json.backup"
 ```
 
-Writes are atomic and the previous valid file is retained as `history-v2.json.bak`. If the primary JSON is damaged, the application preserves it with a `.corrupt-*` suffix and restores the valid backup automatically. If both files are damaged, startup reports an error instead of silently replacing the library. For manual recovery, quit the application and restore a known-good copy:
+Writes are atomic and the previous valid file is retained as `history.json.bak`. If the primary JSON is damaged, the application preserves it with a `.corrupt-*` suffix and restores the valid backup automatically. If both files are damaged, startup reports an error instead of silently replacing the library. For manual recovery, quit the application and restore a known-good copy:
 
 ```bash
-mv "/path/to/history-v2.json" "/path/to/history-v2.json.corrupt"
-cp "/path/to/history-v2.json.bak" "/path/to/history-v2.json"
+mv "/path/to/history.json" "/path/to/history.json.corrupt"
+cp "/path/to/history.json.bak" "/path/to/history.json"
 ```
 
 If no valid backup exists, keep the corrupt files for manual JSON recovery before creating a new history file.

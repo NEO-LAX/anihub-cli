@@ -14,7 +14,7 @@ const INTERNAL_API_BASE_URL: &str = "https://anihub.in.ua/api";
 const ANILIST_GRAPHQL_URL: &str = "https://graphql.anilist.co";
 const ANILIST_BATCH_SIZE: usize = 50;
 const SEARCH_PAGE_SIZE: u32 = 20;
-const MAX_SEARCH_PAGES: u32 = 100;
+const BASIC_SEARCH_RESULT_LIMIT: usize = 20;
 const MAX_CONCURRENT_REQUESTS: usize = 3;
 const MAX_REQUEST_STARTS: usize = 40;
 const REQUEST_WINDOW: Duration = Duration::from_secs(60);
@@ -302,56 +302,45 @@ impl ApiClient {
             .map_err(|source| request_error(operation, source))
     }
 
-    /// Search all reported pages.  Query text is passed to reqwest's query
-    /// serializer as-is, so spaces, punctuation, Unicode, and every other
-    /// user character are encoded exactly once by the HTTP client.
+    /// Conservative title search used by the main UI.
+    ///
+    /// Only the first AniHub page is requested. Broad pagination belongs to a
+    /// future explicit advanced-search mode; doing it for every short query
+    /// can exhaust the upstream request budget. Results must match the first
+    /// first two words of one of the available titles.
     pub async fn search_anime(&self, query: &str) -> Result<Vec<AnimeItem>> {
-        let mut page = 1u32;
-        let mut all_items = Vec::new();
-
-        loop {
-            if page > MAX_SEARCH_PAGES {
-                anyhow::bail!(
-                    "AniHub search pagination exceeded hard limit of {MAX_SEARCH_PAGES} pages"
-                );
-            }
-
-            let page_text = page.to_string();
-            let request = self
-                .authenticated(self.client.get(self.api_url("/anime/")))
-                .query(&[
-                    ("search", query),
-                    ("has_ukrainian_dub", "true"),
-                    ("page_size", "20"),
-                    ("page", page_text.as_str()),
-                ]);
-            let response = self
-                .send_request(request, "AniHub search request")
-                .await
-                .with_context(|| format!("Failed to send AniHub search request for page {page}"))?;
-
-            let response = ensure_success(response, "AniHub search")?;
-            let search_response: AnimeSearchResponse = parse_json(response, "AniHub search")
-                .await
-                .with_context(|| {
-                    format!("Failed to parse AniHub search response for page {page}")
-                })?;
-
-            all_items.extend(
-                search_response
-                    .items
-                    .into_iter()
-                    .filter(|item| item.has_ukrainian_dub),
-            );
-
-            let total_pages = search_response.total_pages.max(1);
-            if page >= total_pages {
-                break;
-            }
-            page += 1;
+        let normalized_query = normalize_search_text(query);
+        if normalized_query.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(deduplicate_anime_by_id(all_items))
+        let request = self
+            .authenticated(self.client.get(self.api_url("/anime/")))
+            .query(&[
+                ("search", query),
+                ("has_ukrainian_dub", "true"),
+                ("page_size", "20"),
+                ("page", "1"),
+            ]);
+        let response = self
+            .send_request(request, "AniHub search request")
+            .await
+            .context("Failed to send AniHub search request")?;
+        let response = ensure_success(response, "AniHub search")?;
+        let search_response: AnimeSearchResponse = parse_json(response, "AniHub search")
+            .await
+            .context("Failed to parse AniHub search response")?;
+
+        let matches = search_response
+            .items
+            .into_iter()
+            .filter(|item| item.has_ukrainian_dub)
+            .filter(|item| basic_title_match(item, &normalized_query));
+
+        Ok(deduplicate_anime_by_id(matches.collect())
+            .into_iter()
+            .take(BASIC_SEARCH_RESULT_LIMIT)
+            .collect())
     }
 
     pub async fn get_anime_details(&self, anime_id: u32) -> Result<AnimeDetails> {
@@ -601,6 +590,46 @@ pub(crate) fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration>
     (until - Utc::now()).to_std().ok()
 }
 
+fn normalize_search_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for character in text.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push(character);
+            pending_space = false;
+        } else {
+            pending_space = true;
+        }
+    }
+    normalized
+}
+
+fn basic_title_match(item: &AnimeItem, normalized_query: &str) -> bool {
+    [
+        Some(item.title_ukrainian.as_str()),
+        item.title_original.as_deref(),
+        item.title_english.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|title| {
+        let title = normalize_search_text(title);
+        let title_words = title.split_whitespace().collect::<Vec<_>>();
+        let query_is_one_word = !normalized_query.contains(' ');
+
+        title_words.iter().take(2).enumerate().any(|(start, word)| {
+            if query_is_one_word {
+                word.contains(normalized_query)
+            } else {
+                title_words[start..].join(" ").starts_with(normalized_query)
+            }
+        })
+    })
+}
+
 fn deduplicate_anime_by_id(items: Vec<AnimeItem>) -> Vec<AnimeItem> {
     let mut seen = std::collections::HashSet::new();
     items
@@ -719,22 +748,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_encodes_all_characters_and_follows_pages_deterministically() {
+    async fn basic_search_requests_one_page_and_filters_by_first_two_words() {
         let server = MockServer::start(|_, path| {
             let url = reqwest::Url::parse(&format!("http://localhost{path}"))
                 .expect("mock request path must form a valid URL");
             let params = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
-            assert_eq!(
-                params.get("search"),
-                Some(&"Mushoku Tensei: S?2 + Україна".to_string())
-            );
+            assert_eq!(params.get("search"), Some(&"дівчина".to_string()));
             assert_eq!(params.get("has_ukrainian_dub"), Some(&"true".to_string()));
             assert_eq!(params.get("page_size"), Some(&"20".to_string()));
             match params.get("page").map(String::as_str) {
-                Some("1") => (200, page(vec![item(1, "one"), item(2, "two")], 1, 2)),
-                Some("2") => (
+                Some("1") => (
                     200,
-                    page(vec![item(2, "duplicate"), item(3, "three")], 2, 2),
+                    page(
+                        vec![
+                            item(1, "Дівчина напрокат"),
+                            item(2, "Моя дівчина — монстр"),
+                            item(3, "Супердівчина з космосу"),
+                            item(4, "Та сама дівчина"),
+                        ],
+                        1,
+                        42,
+                    ),
                 ),
                 _ => (500, "{}".to_string()),
             }
@@ -742,20 +776,36 @@ mod tests {
         .await;
 
         let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
-        let result = client
-            .search_anime("Mushoku Tensei: S?2 + Україна")
-            .await
-            .unwrap();
+        let result = client.search_anime("дівчина").await.unwrap();
         assert_eq!(
             result.iter().map(|anime| anime.id).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
 
         let requests = server.requests().await;
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("page=1"));
-        assert!(requests[1].contains("page=2"));
         server.stop().await;
+    }
+
+    #[test]
+    fn basic_search_checks_alternative_titles_and_phrase_prefixes() {
+        let mut anime = item(1, "Зовсім інша назва");
+        anime.title_english = Some("Kaguya-sama: Love is War".to_string());
+
+        assert!(basic_title_match(&anime, &normalize_search_text("kaguya")));
+        assert!(basic_title_match(&anime, &normalize_search_text("sama")));
+        assert!(basic_title_match(
+            &anime,
+            &normalize_search_text("Kaguya sama love")
+        ));
+        assert!(!basic_title_match(&anime, &normalize_search_text("love")));
+
+        anime.title_ukrainian = "Моя дівчина напрокат".to_string();
+        assert!(basic_title_match(
+            &anime,
+            &normalize_search_text("дівчина напрокат")
+        ));
     }
 
     #[tokio::test]

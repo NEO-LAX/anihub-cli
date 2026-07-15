@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -540,6 +541,50 @@ pub struct MpvSession {
     pub(crate) monitor_cancel: TaskCancellation,
 }
 
+#[derive(Clone, Debug)]
+struct MpvLaunchSettings {
+    path: String,
+    extra_args: Vec<String>,
+}
+
+impl Default for MpvLaunchSettings {
+    fn default() -> Self {
+        Self {
+            path: "mpv".to_string(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+static MPV_LAUNCH_SETTINGS: OnceLock<RwLock<MpvLaunchSettings>> = OnceLock::new();
+
+pub fn configure_mpv(path: &str, extra_args: &str) -> Result<()> {
+    let parsed = shell_words::split(extra_args).context("Invalid additional mpv arguments")?;
+    let settings = MpvLaunchSettings {
+        path: if path.trim().is_empty() {
+            "mpv".to_string()
+        } else {
+            path.trim().to_string()
+        },
+        extra_args: parsed,
+    };
+    *MPV_LAUNCH_SETTINGS
+        .get_or_init(|| RwLock::new(MpvLaunchSettings::default()))
+        .write()
+        .map_err(|_| anyhow!("mpv settings lock is poisoned"))? = settings;
+    Ok(())
+}
+
+fn mpv_launch_settings() -> MpvLaunchSettings {
+    MPV_LAUNCH_SETTINGS
+        .get_or_init(|| RwLock::new(MpvLaunchSettings::default()))
+        .read()
+        .map_or_else(
+            |_| MpvLaunchSettings::default(),
+            |settings| settings.clone(),
+        )
+}
+
 pub fn build_mpv_args(
     endpoint: &IpcEndpoint,
     media_url: &str,
@@ -586,13 +631,18 @@ impl MpvSession {
             episode_title,
             referrer,
         );
-        let child = Command::new("mpv")
+        let launch = mpv_launch_settings();
+        let mut args = args;
+        let media_url = args.pop().expect("mpv arguments always end with media URL");
+        args.extend(launch.extra_args);
+        args.push(media_url);
+        let child = Command::new(&launch.path)
             .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .context("Failed to start mpv. Please make sure mpv is installed.")?;
+            .with_context(|| format!("Failed to start mpv at `{}`", launch.path))?;
 
         let request_ids = Arc::new(AtomicU64::new(1));
         let ipc = MpvIpc::with_request_ids(endpoint.clone(), request_ids);

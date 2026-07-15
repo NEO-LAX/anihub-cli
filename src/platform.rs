@@ -60,6 +60,15 @@ pub fn browser_open_command(platform: Platform, url: &str) -> CommandSpec {
     }
 }
 
+pub fn path_open_command(platform: Platform, path: &str) -> CommandSpec {
+    match platform {
+        Platform::Linux => CommandSpec::new("xdg-open", [path]),
+        Platform::MacOs => CommandSpec::new("open", [path]),
+        Platform::Windows => CommandSpec::new("explorer", [path]),
+        Platform::Other => CommandSpec::new("xdg-open", [path]),
+    }
+}
+
 /// Best-effort process-tree termination used only after a graceful shutdown
 /// has timed out. The direct child is still waited by the caller.
 pub fn kill_process_tree(pid: u32) {
@@ -103,6 +112,18 @@ mod tests {
         assert_eq!(
             browser_open_command(Platform::Windows, url),
             CommandSpec::new("cmd", ["/C", "start", "", url])
+        );
+    }
+
+    #[test]
+    fn path_command_matches_each_supported_platform() {
+        assert_eq!(
+            path_open_command(Platform::Linux, "/tmp/anihub"),
+            CommandSpec::new("xdg-open", ["/tmp/anihub"])
+        );
+        assert_eq!(
+            path_open_command(Platform::Windows, r"C:\anihub"),
+            CommandSpec::new("explorer", [r"C:\anihub"])
         );
     }
 }

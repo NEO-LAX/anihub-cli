@@ -2,11 +2,12 @@ mod api;
 mod platform;
 mod playback;
 mod player;
+mod settings;
 mod storage;
 mod ui;
 
 use crate::playback::*;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use api::{
     EpisodeSourcesKey, EpisodeSourcesResponse, RequestId, ResourceEvent, ResourceKey,
     ResourceValue, ResourceWorker, ResourceWorkerRuntime, ViewGeneration,
@@ -18,6 +19,7 @@ use crossterm::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::io::stdout;
 use ui::{AppMode, AppState, FocusPanel};
 
@@ -317,6 +319,10 @@ impl ResourceCoordinator {
     }
 
     async fn schedule_poster(&mut self, app: &mut AppState) {
+        if !app.settings.show_posters {
+            app.poster_fetch_pending = None;
+            return;
+        }
         let Some(anime_id) = app.poster_fetch_pending.take() else {
             return;
         };
@@ -405,9 +411,11 @@ impl ResourceCoordinator {
             }
             (ResourceKey::Details(anime_id), Ok(ResourceValue::Details(details))) => {
                 app.details_cache.insert(anime_id, details.clone());
-                if !app.search_results.iter().any(|item| item.id == anime_id)
-                    && details.anilist_id.is_some()
-                {
+                if should_add_details_to_search(
+                    app.mode,
+                    app.search_results.iter().any(|item| item.id == anime_id),
+                    details.anilist_id.is_some(),
+                ) {
                     app.search_results.push(anime_item_from_details(&details));
                     rebuild_franchise_projection(app);
                 }
@@ -429,7 +437,10 @@ impl ResourceCoordinator {
                 );
                 if is_current {
                     app.current_details = Some(details);
-                    if app.current_poster.is_none() && app.sidebar_subject() == Some(anime_id) {
+                    if app.settings.show_posters
+                        && app.current_poster.is_none()
+                        && app.sidebar_subject() == Some(anime_id)
+                    {
                         app.poster_fetch_pending = Some(anime_id);
                     }
                 }
@@ -662,11 +673,61 @@ fn install_terminal_panic_hook() {
     }));
 }
 
+fn handle_cli_mode() -> Result<bool> {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(false),
+        [argument] if argument == "--version" || argument == "-V" => {
+            println!("anihub-cli {}", env!("CARGO_PKG_VERSION"));
+            Ok(true)
+        }
+        [argument] if argument == "--migrate-data" => {
+            let storage = storage::StorageManager::new()?;
+            let history = storage.load_history()?;
+            let settings_store = settings::SettingsStore::new()?;
+            let settings = settings_store.load()?;
+            settings_store.save(&settings)?;
+
+            println!("Local data was validated and migrated:");
+            println!("  history: {}", storage.history_path().display());
+            println!("  settings: {}", settings_store.settings_path().display());
+            println!(
+                "  progress: {} · library: {}",
+                history.progress.len(),
+                history.library.len()
+            );
+            Ok(true)
+        }
+        [argument] if argument == "--help" || argument == "-h" => {
+            println!(
+                "anihub-cli {}\n\n  --version       show the version\n  --migrate-data  validate and migrate local data",
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(true)
+        }
+        _ => bail!("невідомі аргументи: {}", arguments.join(" ")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if handle_cli_mode()? {
+        return Ok(());
+    }
+
     // Picker MUST be initialized before enable_raw_mode
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+    let (picker, image_protocol) = match ratatui_image::picker::Picker::from_query_stdio() {
+        Ok(picker) => {
+            let protocol = match picker.protocol_type() {
+                ratatui_image::picker::ProtocolType::Halfblocks => "Halfblocks",
+                ratatui_image::picker::ProtocolType::Sixel => "Sixel",
+                ratatui_image::picker::ProtocolType::Kitty => "Kitty",
+                ratatui_image::picker::ProtocolType::Iterm2 => "iTerm2",
+            };
+            (picker, protocol)
+        }
+        Err(_) => (ratatui_image::picker::Picker::halfblocks(), "Halfblocks"),
+    };
 
     install_terminal_panic_hook();
     enable_raw_mode()?;
@@ -677,10 +738,11 @@ async fn main() -> Result<()> {
     terminal_restore.alternate_screen = true;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let mut app = AppState::new(picker)?;
+    let mut app = AppState::new(picker, image_protocol)?;
     let mut resources = ResourceCoordinator::new(app.api_client.clone());
     let mut playback = PlaybackSupervisor::new();
     let mut persisted_positions = HashMap::new();
+    let mut update_check: Option<tokio::task::JoinHandle<Result<settings::UpdateCheck>>> = None;
 
     loop {
         // Apply the latest UI selection before accepting worker completions.
@@ -688,10 +750,29 @@ async fn main() -> Result<()> {
         // already moved to S2/S3 but before the generation is canceled.
         resources.sync(&mut app).await;
         resources.drain(&mut app).await;
-        if let Some((target, queue)) = resources.take_ready_playback() {
-            app.prepare_playback(&target);
-            if let Err(error) = playback.play(target, queue).await {
+        if app.take_update_check_request() && update_check.is_none() {
+            update_check = Some(tokio::spawn(settings::check_for_update(env!(
+                "CARGO_PKG_VERSION"
+            ))));
+        }
+        if update_check.as_ref().is_some_and(|task| task.is_finished()) {
+            let result = update_check
+                .take()
+                .expect("finished update task exists")
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+            app.finish_update_check(result);
+        }
+
+        if let Some((mut target, mut queue)) = resources.take_ready_playback() {
+            if let Err(error) = apply_playback_settings(&app, &mut target, &mut queue) {
                 app.set_error_status(format!("Помилка відтворення: {error}"));
+            } else {
+                app.prepare_playback(&target);
+                if let Err(error) = playback.play(target, queue).await {
+                    app.set_error_status(format!("Помилка відтворення: {error}"));
+                }
             }
         }
         for event in playback.drain_events() {
@@ -700,11 +781,15 @@ async fn main() -> Result<()> {
 
         if app.play_episode {
             app.play_episode = false;
-            if let Some(target) = selected_play_target(&app) {
-                let queue = build_active_playback_queue(&app, &target);
-                app.prepare_playback(&target);
-                if let Err(error) = playback.play(target, queue).await {
+            if let Some(mut target) = selected_play_target(&app) {
+                let mut queue = build_active_playback_queue(&app, &target);
+                if let Err(error) = apply_playback_settings(&app, &mut target, &mut queue) {
                     app.set_error_status(format!("Помилка відтворення: {error}"));
+                } else {
+                    app.prepare_playback(&target);
+                    if let Err(error) = playback.play(target, queue).await {
+                        app.set_error_status(format!("Помилка відтворення: {error}"));
+                    }
                 }
             }
         }
@@ -725,8 +810,29 @@ async fn main() -> Result<()> {
         persist_playback_event(&mut app, &mut persisted_positions, event);
     }
     resources.shutdown().await;
+    if let Some(task) = update_check {
+        task.abort();
+    }
     if let Some(error) = playback_shutdown_error {
         return Err(error);
+    }
+    Ok(())
+}
+
+fn apply_playback_settings(
+    app: &AppState,
+    target: &mut PlayTarget,
+    queue: &mut Vec<PlayTarget>,
+) -> Result<()> {
+    player::configure_mpv(&app.settings.mpv_path, &app.settings.mpv_extra_args)?;
+    if !app.settings.resume_from_timestamp {
+        target.start_time = None;
+        for queued in queue.iter_mut() {
+            queued.start_time = None;
+        }
+    }
+    if !app.settings.autoplay_next {
+        queue.clear();
     }
     Ok(())
 }
@@ -806,6 +912,7 @@ fn persist_playback_event(
                     &snapshot.identity.studio_name,
                     snapshot.position,
                     snapshot.duration,
+                    app.settings.watched_threshold_percent,
                 ) {
                     Ok(history) => {
                         app.history = history;
@@ -879,7 +986,7 @@ pub fn apply_continue_context(
     app.sidebar_anime_idx = None;
     app.sidebar_subject_id = Some(details.id);
     app.current_poster = None;
-    app.poster_fetch_pending = Some(details.id);
+    app.poster_fetch_pending = app.settings.show_posters.then_some(details.id);
     app.selected_season_index = Some(resolved.season_index);
     app.season_list_state.select(Some(resolved.season_index));
     app.selected_dubbing_index = Some(resolved.dubbing_index);
@@ -913,7 +1020,7 @@ pub fn apply_library_continue_context(
     app.studio_anime_ids = vec![details.id; sources.ashdi.len()];
     app.current_poster = None;
     app.sidebar_subject_id = Some(details.id);
-    app.poster_fetch_pending = Some(details.id);
+    app.poster_fetch_pending = app.settings.show_posters.then_some(details.id);
     app.selected_season_index = Some(resolved.season_index);
     app.season_list_state.select(Some(resolved.season_index));
     app.selected_dubbing_index = Some(resolved.dubbing_index);
@@ -941,6 +1048,14 @@ fn anime_item_from_details(details: &api::AnimeDetails) -> api::AnimeItem {
         genres: details.genres.clone(),
         dubbing_studios: details.dubbing_studios.clone(),
     }
+}
+
+fn should_add_details_to_search(
+    mode: AppMode,
+    already_present: bool,
+    has_anilist_id: bool,
+) -> bool {
+    mode == AppMode::Normal && !already_present && has_anilist_id
 }
 
 fn apply_search_results(
@@ -1155,5 +1270,21 @@ mod staged_source_loading_tests {
             12
         );
         assert_eq!(sources.ashdi[0].episodes.last().unwrap().episode_number, 24);
+    }
+
+    #[test]
+    fn library_metadata_never_extends_search_results() {
+        assert!(should_add_details_to_search(AppMode::Normal, false, true));
+        assert!(!should_add_details_to_search(AppMode::Library, false, true));
+        assert!(!should_add_details_to_search(
+            AppMode::LibrarySeason,
+            false,
+            true
+        ));
+        assert!(!should_add_details_to_search(
+            AppMode::LibraryEpisode,
+            false,
+            true
+        ));
     }
 }

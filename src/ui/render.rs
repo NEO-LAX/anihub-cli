@@ -1,19 +1,23 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph},
 };
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 
 use crate::api;
-use crate::storage::AnimeStatus;
-use crate::ui::app::{AppMode, AppState, FocusPanel, LibraryFilter, PrimaryTab, StatusKind};
+use crate::storage::{AnimeStatus, LibraryReleaseKind};
+use crate::ui::app::{
+    AppMode, AppState, FocusPanel, LibraryFilter, PrimaryTab, SettingsChoiceKind, SettingsInput,
+    SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
+};
 
 const COLOR_PRIMARY: Color = Color::Rgb(147, 51, 234);
 const COLOR_SECONDARY: Color = Color::Rgb(168, 85, 247);
 const COLOR_BG_DARK: Color = Color::Rgb(17, 24, 39);
+const COLOR_BG_TRANSPARENT: Color = Color::Reset;
 const COLOR_TEXT: Color = Color::Rgb(243, 244, 246);
 const COLOR_HIGHLIGHT: Color = Color::Rgb(59, 130, 246);
 const COLOR_ERROR: Color = Color::Rgb(239, 68, 68);
@@ -21,24 +25,35 @@ const COLOR_DIM: Color = Color::Rgb(107, 114, 128);
 
 pub fn render(f: &mut Frame, app: &mut AppState) {
     let size = f.area();
+    // One tab row plus a compact context field. Breadcrumbs intentionally stay
+    // out of the chrome: the active columns already show the same hierarchy.
+    let header_h: u16 = if size.height >= 16 { 4 } else { 3 };
+    let footer_h: u16 = if size.height >= 12 { 2 } else { 1 };
 
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(header_h),
             Constraint::Min(0),
-            Constraint::Length(if size.height >= 12 { 2 } else { 1 }),
+            Constraint::Length(footer_h),
         ])
         .split(size);
+
+    // Respect the terminal's own background/opacity instead of painting an
+    // opaque full-frame wash.
+    f.render_widget(
+        Block::default().style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+        size,
+    );
 
     render_header(f, app, main_chunks[0]);
 
     if app.mode == AppMode::Settings {
-        render_settings_placeholder(f, main_chunks[1]);
+        render_settings(f, app, main_chunks[1]);
     } else if size.width >= 110 {
         let body_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
             .split(main_chunks[1]);
         render_sidebar(f, app, body_chunks[0]);
         render_lists(f, app, body_chunks[1]);
@@ -48,18 +63,23 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
     render_status_bar(f, app, main_chunks[2]);
 
     if let Some((message, StatusKind::Error)) = app.status_message.clone() {
-        let msg = format!("{}\n\nEsc — закрити", message);
-        render_popup(f, "Помилка", &msg, COLOR_ERROR);
+        render_error_popup(f, &message);
     } else if let Some((title, _)) = app.moonanime_browser_prompt.clone() {
-        let msg = format!(
-            "«{title}»\n\nЦей епізод відкриється напряму в MoonAnime embed.\n\nEnter — відкрити    Esc — скасувати"
-        );
-        render_popup(f, "MoonAnime", &msg, COLOR_HIGHLIGHT);
+        render_moonanime_popup(f, &title);
     } else if app.status_editor.is_some() {
         render_status_editor_popup(f, app);
+    } else if app.clear_library_confirmation {
+        render_clear_library_popup(f);
+    } else if app.settings_update_popup {
+        render_settings_update_popup(f, app);
+    } else if app.settings_input.is_some() {
+        render_settings_text_popup(f, app);
+    } else if app.settings_threshold.is_some() {
+        render_settings_threshold_popup(f, app);
+    } else if app.settings_choice.is_some() {
+        render_settings_choice_popup(f, app);
     } else if let Some((_, anime_title)) = app.pending_delete_confirmation.clone() {
-        let msg = format!("Видалити прогрес для\n{}\n\n[y/n]", anime_title);
-        render_popup(f, "Підтвердження", &msg, COLOR_ERROR);
+        render_delete_popup(f, &anime_title);
     } else if app.show_help {
         render_help_popup(f);
     }
@@ -68,113 +88,149 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
 fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(2)])
         .split(area);
 
+    let mut top: Vec<Span> = Vec::new();
+    for (index, tab) in PrimaryTab::ALL.iter().enumerate() {
+        if index > 0 {
+            top.push(Span::styled(" | ", Style::default().fg(COLOR_DIM)));
+        }
+        let active = *tab == app.primary_tab();
+        top.push(Span::styled(
+            format!(" {} · {} ", index + 1, tab.label()),
+            if active {
+                Style::default()
+                    .fg(COLOR_TEXT)
+                    .bg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_DIM)
+            },
+        ));
+    }
     f.render_widget(
-        Paragraph::new(Span::styled(
-            "ANIHUB-CLI",
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .alignment(Alignment::Center),
+        Paragraph::new(Line::from(top))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
         rows[0],
     );
 
-    let tabs = PrimaryTab::ALL
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            let active = *tab == app.primary_tab();
-            Span::styled(
-                format!("  {} {}  ", index + 1, tab.label()),
-                if active {
-                    Style::default()
-                        .fg(COLOR_SECONDARY)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    let editing = app.mode == AppMode::SearchInput || app.library_search_editing;
+    let (title, context, alignment) = match app.primary_tab() {
+        PrimaryTab::Search => (
+            " Пошук · / ",
+            search_header_context(app),
+            // Left while typing so the cursor matches the glyph under it;
+            // center when idle so the field looks framed and balanced.
+            if editing {
+                Alignment::Left
+            } else {
+                Alignment::Center
+            },
+        ),
+        PrimaryTab::Library
+            if app.library_search_editing || !app.library_search_query.is_empty() =>
+        {
+            (
+                " Пошук у бібліотеці · / ",
+                library_search_header_context(app),
+                if app.library_search_editing {
+                    Alignment::Left
                 } else {
-                    Style::default().fg(COLOR_DIM)
+                    Alignment::Center
                 },
             )
-        })
-        .collect::<Vec<_>>();
-    f.render_widget(
-        Paragraph::new(Line::from(tabs))
-            .alignment(Alignment::Center)
-            .style(Style::default().bg(COLOR_BG_DARK)),
-        rows[1],
-    );
-
-    let (title, context, alignment) = match app.primary_tab() {
-        PrimaryTab::Search => (" Пошук ", search_header_context(app), Alignment::Left),
+        }
         PrimaryTab::Library => (
-            " Категорії · Tab / Shift+Tab ",
+            " Категорії · Tab ",
             library_filter_context(app),
             Alignment::Center,
         ),
         PrimaryTab::Settings => (
-            " Налаштування ",
-            Line::from(Span::styled(
-                "Розділ поки в розробці",
-                Style::default().fg(COLOR_DIM),
-            )),
+            " Вкладки · Tab ",
+            settings_tabs_context(app),
             Alignment::Center,
         ),
     };
-    f.render_widget(
-        Paragraph::new(context)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_alignment(Alignment::Center)
-                    .border_style(Style::default().fg(COLOR_DIM)),
-            )
-            .alignment(alignment)
-            .style(Style::default().bg(COLOR_BG_DARK)),
-        rows[2],
-    );
 
-    let mut breadcrumb = match app.primary_tab() {
-        PrimaryTab::Search => {
-            let path = search_breadcrumb(app);
-            if path.is_empty() {
-                "Пошук".to_string()
-            } else {
-                format!("Пошук  ›  {path}")
-            }
+    let context_border = if editing { COLOR_HIGHLIGHT } else { COLOR_DIM };
+
+    let context_area = rows[1];
+    if context_area.height >= 3 {
+        f.render_widget(
+            Paragraph::new(context)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .title_alignment(Alignment::Center)
+                        .border_style(Style::default().fg(context_border))
+                        .padding(Padding::horizontal(1))
+                        .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+                )
+                .alignment(alignment)
+                .style(Style::default().bg(COLOR_BG_TRANSPARENT).fg(COLOR_TEXT)),
+            context_area,
+        );
+        if editing {
+            // Cursor sits after the left border + one padding space.
+            let visible = active_search_cursor(app);
+            #[allow(clippy::cast_possible_truncation)]
+            let col = 1u16
+                .saturating_add(1)
+                .saturating_add(visible as u16)
+                .min(context_area.width.saturating_sub(2));
+            f.set_cursor_position((context_area.x + col, context_area.y + 1));
         }
-        PrimaryTab::Library => format!("Бібліотека  ›  {}", library_breadcrumb(app)),
-        PrimaryTab::Settings => "Налаштування".to_string(),
-    };
-    if let Some(now) = &app.now_playing {
-        breadcrumb.push_str(&format!(
-            "   ·   ▶ S{}E{} · {}",
-            now.season,
-            now.episode,
-            format_elapsed_timestamp(now.position)
-        ));
+    } else {
+        f.render_widget(
+            Paragraph::new(context)
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+            context_area,
+        );
+        if editing {
+            let visible = active_search_cursor(app);
+            #[allow(clippy::cast_possible_truncation)]
+            let col = visible as u16;
+            f.set_cursor_position((
+                context_area.x + col.min(context_area.width.saturating_sub(1)),
+                context_area.y,
+            ));
+        }
     }
-    f.render_widget(
-        Paragraph::new(breadcrumb)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(COLOR_DIM)),
-        rows[3],
-    );
+}
 
-    if app.mode == AppMode::SearchInput {
-        #[allow(clippy::cast_possible_truncation)]
-        f.set_cursor_position((
-            rows[2].x + (4 + app.search_cursor as u16).min(rows[2].width.saturating_sub(2)),
-            rows[2].y + 1,
+fn active_search_cursor(app: &AppState) -> usize {
+    if app.library_search_editing {
+        app.library_search_cursor
+    } else {
+        app.search_cursor
+    }
+}
+
+fn settings_tabs_context(app: &AppState) -> Line<'static> {
+    let tabs = [SettingsTab::General, SettingsTab::About];
+    let mut spans = Vec::new();
+    for (index, tab) in tabs.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  |  ", Style::default().fg(COLOR_DIM)));
+        }
+        let active = tab == app.settings_tab;
+        spans.push(Span::styled(
+            format!(" {} ", tab.label()),
+            if active {
+                Style::default()
+                    .fg(COLOR_TEXT)
+                    .bg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_DIM)
+            },
         ));
     }
+    Line::from(spans)
 }
 
 fn search_header_context(app: &AppState) -> Line<'static> {
@@ -183,40 +239,164 @@ fn search_header_context(app: &AppState) -> Line<'static> {
     } else {
         app.last_search_query.as_str()
     };
-    let mut spans = vec![Span::styled("🔎 ", Style::default().fg(COLOR_SECONDARY))];
     if query.is_empty() {
-        spans.push(Span::styled(
-            "Натисніть / та введіть назву аніме",
+        Line::from(Span::styled(
+            if app.mode == AppMode::SearchInput {
+                "введіть назву аніме…"
+            } else {
+                "Введіть назву аніме…"
+            },
             Style::default().fg(COLOR_DIM),
-        ));
+        ))
     } else {
-        spans.push(Span::styled(
+        Line::from(Span::styled(
             query.to_string(),
-            Style::default().fg(COLOR_TEXT),
-        ));
+            Style::default()
+                .fg(COLOR_TEXT)
+                .add_modifier(if app.mode == AppMode::SearchInput {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ))
     }
-    Line::from(spans)
+}
+
+fn library_search_header_context(app: &AppState) -> Line<'static> {
+    if app.library_search_query.is_empty() {
+        Line::from(Span::styled(
+            "введіть назву аніме у бібліотеці…",
+            Style::default().fg(COLOR_DIM),
+        ))
+    } else {
+        Line::from(Span::styled(
+            app.library_search_query.clone(),
+            Style::default()
+                .fg(COLOR_TEXT)
+                .add_modifier(if app.library_search_editing {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ))
+    }
 }
 
 fn library_filter_context(app: &AppState) -> Line<'static> {
     let spans = LibraryFilter::ALL
         .iter()
-        .map(|filter| {
-            let text = format!("  {}  ", filter.label());
-            if *filter == app.library_filter {
-                Span::styled(
-                    text,
-                    Style::default()
-                        .fg(COLOR_TEXT)
-                        .bg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                )
+        .flat_map(|filter| {
+            let active = *filter == app.library_filter;
+            let label = filter.label();
+            let style = if active {
+                Style::default()
+                    .fg(COLOR_TEXT)
+                    .bg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Span::styled(text, Style::default().fg(COLOR_DIM))
-            }
+                Style::default().fg(COLOR_DIM)
+            };
+            [
+                Span::styled(format!("  {label}  "), style),
+                Span::styled("  ", Style::default().fg(COLOR_DIM)),
+            ]
         })
         .collect::<Vec<_>>();
     Line::from(spans)
+}
+
+fn search_sidebar_tracking_context(app: &AppState) -> (Vec<u32>, Option<u32>) {
+    if app.focus == FocusPanel::SearchList {
+        if let Some(group_index) = app.selected_group_index {
+            let mut anime_ids = app
+                .franchise_groups
+                .get(group_index)
+                .into_iter()
+                .flatten()
+                .filter_map(|index| app.search_results.get(*index).map(|anime| anime.id))
+                .collect::<Vec<_>>();
+            let mainline_ids = app
+                .franchise_catalogs
+                .get(group_index)
+                .into_iter()
+                .flat_map(|catalog| catalog.releases.iter())
+                .filter(|release| {
+                    release.availability == api::ReleaseAvailability::Available
+                        && release.classification == api::ReleaseClassification::MainlineSeason
+                })
+                .filter_map(|release| release.anihub_id)
+                .collect::<Vec<_>>();
+            if !mainline_ids.is_empty() {
+                anime_ids = mainline_ids;
+            }
+            anime_ids.sort_unstable();
+            anime_ids.dedup();
+            let totals = app
+                .franchise_catalogs
+                .get(group_index)
+                .into_iter()
+                .flat_map(|catalog| catalog.releases.iter())
+                .filter(|release| {
+                    release.classification == api::ReleaseClassification::MainlineSeason
+                        && release.availability == api::ReleaseAvailability::Available
+                })
+                .filter_map(|release| release.episodes_count)
+                .collect::<Vec<_>>();
+            let total = (!totals.is_empty()).then(|| totals.into_iter().sum());
+            return (anime_ids, total);
+        }
+    }
+
+    if let Some(release) = selected_release_for_sidebar(app) {
+        let anime_ids = release.anihub_id.into_iter().collect();
+        return (anime_ids, release.episodes_count);
+    }
+
+    let anime_ids = app
+        .sidebar_subject()
+        .or_else(|| {
+            app.selected_result_index
+                .and_then(|index| app.search_results.get(index).map(|anime| anime.id))
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let total = anime_ids.first().and_then(|id| {
+        app.details_cache
+            .get(id)
+            .and_then(|details| details.episodes_count)
+            .or_else(|| {
+                app.search_results
+                    .iter()
+                    .find(|anime| anime.id == *id)
+                    .and_then(|anime| anime.episodes_count)
+            })
+    });
+    (anime_ids, total)
+}
+
+fn library_sidebar_tracking_context(
+    app: &AppState,
+) -> (Vec<u32>, Option<AnimeStatus>, Option<u32>) {
+    let Some(anime) = app.library_selected_anime() else {
+        return (Vec::new(), None, None);
+    };
+    let totals = anime
+        .anime_ids
+        .iter()
+        .filter_map(|anime_id| {
+            app.details_cache
+                .get(anime_id)
+                .and_then(|details| details.episodes_count)
+        })
+        .collect::<Vec<_>>();
+    let total = if totals.is_empty() {
+        app.current_details
+            .as_ref()
+            .and_then(|details| details.episodes_count)
+    } else {
+        Some(totals.into_iter().sum())
+    };
+    (anime.anime_ids.clone(), Some(anime.status), total)
 }
 
 fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
@@ -245,6 +425,19 @@ fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
                 .position(|anime| anime.id == anime_id)
         })
         .or(app.selected_result_index);
+    if display_idx.is_none()
+        && selected_release_for_sidebar(app).is_none()
+        && sidebar_details_override(app).is_none()
+    {
+        render_centered_sidebar_message(
+            f,
+            inner,
+            app.activity_message
+                .as_deref()
+                .unwrap_or("Оберіть тайтл зі списку"),
+        );
+        return;
+    }
     // Якщо поточний сезон — аніме не з пошуку (напр. S4 без ukr dub на сайті),
     // беремо `has_eng` з current_details, а не з search_results[representative].
     let has_eng = if selected_release_for_sidebar(app).is_some() {
@@ -260,7 +453,7 @@ fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     let title_h: u16 = if has_eng { 2 } else { 1 };
 
     if app.current_poster.is_some() && inner.height > title_h + 5 {
-        let poster_h = ((inner.height.saturating_sub(title_h + 2)) * 40 / 100).max(3);
+        let poster_h = sidebar_poster_height(inner, title_h);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -320,7 +513,7 @@ fn render_sidebar_title_area(
     if let Some(release) = selected_release_for_sidebar(app) {
         lines.push(
             Line::from(Span::styled(
-                release.title.clone(),
+                truncate_with_ellipsis(&release.title, area.width as usize),
                 Style::default()
                     .fg(COLOR_SECONDARY)
                     .add_modifier(Modifier::BOLD),
@@ -330,7 +523,7 @@ fn render_sidebar_title_area(
     } else if let Some(d) = sidebar_details_override(app) {
         lines.push(
             Line::from(Span::styled(
-                d.title_ukrainian.clone(),
+                truncate_with_ellipsis(&d.title_ukrainian, area.width as usize),
                 Style::default()
                     .fg(COLOR_SECONDARY)
                     .add_modifier(Modifier::BOLD),
@@ -339,15 +532,18 @@ fn render_sidebar_title_area(
         );
         if let Some(eng) = &d.title_english {
             lines.push(
-                Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
-                    .alignment(Alignment::Center),
+                Line::from(Span::styled(
+                    truncate_with_ellipsis(eng, area.width as usize),
+                    Style::default().fg(COLOR_DIM),
+                ))
+                .alignment(Alignment::Center),
             );
         }
     } else if let Some(idx) = display_idx {
         if let Some(item) = app.search_results.get(idx) {
             lines.push(
                 Line::from(Span::styled(
-                    item.title_ukrainian.as_str(),
+                    truncate_with_ellipsis(&item.title_ukrainian, area.width as usize),
                     Style::default()
                         .fg(COLOR_SECONDARY)
                         .add_modifier(Modifier::BOLD),
@@ -356,8 +552,11 @@ fn render_sidebar_title_area(
             );
             if let Some(eng) = &item.title_english {
                 lines.push(
-                    Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
-                        .alignment(Alignment::Center),
+                    Line::from(Span::styled(
+                        truncate_with_ellipsis(eng, area.width as usize),
+                        Style::default().fg(COLOR_DIM),
+                    ))
+                    .alignment(Alignment::Center),
                 );
             }
         }
@@ -385,7 +584,7 @@ fn render_sidebar_details_area(
         if include_title {
             text.push(
                 Line::from(Span::styled(
-                    release.title.clone(),
+                    truncate_with_ellipsis(&release.title, area.width as usize),
                     Style::default()
                         .fg(COLOR_SECONDARY)
                         .add_modifier(Modifier::BOLD),
@@ -394,66 +593,44 @@ fn render_sidebar_details_area(
             );
             text.push(mk_sep());
         }
-        text.push(
-            Line::from(vec![
-                Span::styled("Тип: ", Style::default().fg(COLOR_DIM)),
-                Span::styled(release.anime_type.clone(), Style::default().fg(COLOR_TEXT)),
-            ])
-            .alignment(Alignment::Center),
-        );
-        text.push(
-            Line::from(vec![
-                Span::styled("Рік: ", Style::default().fg(COLOR_DIM)),
-                Span::styled(
-                    release
-                        .year
-                        .map(|year| year.to_string())
-                        .unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(COLOR_TEXT),
-                ),
-            ])
-            .alignment(Alignment::Center),
-        );
-        if let Some(rating) = release.rating {
-            text.push(
-                Line::from(vec![
-                    Span::styled("Рейтинг: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(
-                        format!("{rating:.1} ⭐"),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ])
-                .alignment(Alignment::Center),
-            );
-        }
-        if let Some(episodes) = release.episodes_count {
-            let episodes = release
+        let episodes = release.episodes_count.map(|episodes| {
+            release
                 .available_episodes
                 .filter(|available| *available < episodes)
                 .map_or_else(
                     || episodes.to_string(),
                     |available| format!("{available}/{episodes}"),
-                );
+                )
+        });
+        text.push(compact_metadata_line(
+            &release.anime_type,
+            release.year,
+            release.rating,
+            episodes,
+        ));
+        let (anime_ids, total) = search_sidebar_tracking_context(app);
+        text.push(mk_sep());
+        text.extend(tracking_lines(app, &anime_ids, None, total));
+        if release.availability == api::ReleaseAvailability::Unavailable {
             text.push(
-                Line::from(vec![
-                    Span::styled("Серій: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(episodes, Style::default().fg(COLOR_TEXT)),
-                ])
+                Line::from(Span::styled(
+                    "⚠ Недоступно на AniHub",
+                    Style::default()
+                        .fg(COLOR_ERROR)
+                        .add_modifier(Modifier::BOLD),
+                ))
                 .alignment(Alignment::Center),
             );
-        }
-        if release.availability == api::ReleaseAvailability::Unavailable {
-            text.push(Line::from(Span::styled(
-                "Недоступно на AniHub",
-                Style::default().fg(COLOR_DIM),
-            )));
         }
         if let Some(genres) = &release.genres {
             if !genres.is_empty() {
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
                     Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(genres.join(" · "), Style::default().fg(COLOR_HIGHLIGHT)),
+                    Span::styled(
+                        summarized_genres(genres),
+                        Style::default().fg(COLOR_HIGHLIGHT),
+                    ),
                 ]));
             }
         }
@@ -470,7 +647,7 @@ fn render_sidebar_details_area(
         if include_title {
             text.push(
                 Line::from(Span::styled(
-                    d.title_ukrainian.clone(),
+                    truncate_with_ellipsis(&d.title_ukrainian, area.width as usize),
                     Style::default()
                         .fg(COLOR_SECONDARY)
                         .add_modifier(Modifier::BOLD),
@@ -479,56 +656,25 @@ fn render_sidebar_details_area(
             );
             if let Some(eng) = &d.title_english {
                 text.push(
-                    Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
-                        .alignment(Alignment::Center),
+                    Line::from(Span::styled(
+                        truncate_with_ellipsis(eng, area.width as usize),
+                        Style::default().fg(COLOR_DIM),
+                    ))
+                    .alignment(Alignment::Center),
                 );
             }
             text.push(mk_sep());
         }
 
-        text.push(
-            Line::from(vec![
-                Span::styled("Тип: ", Style::default().fg(COLOR_DIM)),
-                Span::styled(d.anime_type.clone(), Style::default().fg(COLOR_TEXT)),
-            ])
-            .alignment(Alignment::Center),
-        );
-        text.push(
-            Line::from(vec![
-                Span::styled("Рік: ", Style::default().fg(COLOR_DIM)),
-                Span::styled(
-                    d.year
-                        .map(|y| y.to_string())
-                        .unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(COLOR_TEXT),
-                ),
-            ])
-            .alignment(Alignment::Center),
-        );
-
-        if let Some(rating) = d.rating {
-            text.push(
-                Line::from(vec![
-                    Span::styled("Рейтинг: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(
-                        format!("{:.1} ⭐", rating),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ])
-                .alignment(Alignment::Center),
-            );
-        }
-        if let Some(ep_count) = d.episodes_count {
-            text.push(
-                Line::from(vec![
-                    Span::styled("Серій: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(ep_count.to_string(), Style::default().fg(COLOR_TEXT)),
-                ])
-                .alignment(Alignment::Center),
-            );
-        }
+        text.push(compact_metadata_line(
+            &d.anime_type,
+            d.year,
+            d.rating,
+            d.episodes_count.map(|episodes| episodes.to_string()),
+        ));
+        let (anime_ids, total) = search_sidebar_tracking_context(app);
+        text.push(mk_sep());
+        text.extend(tracking_lines(app, &anime_ids, None, total));
 
         let has_extra = d.genres.as_ref().is_some_and(|g| !g.is_empty())
             || d.dubbing_studios.as_ref().is_some_and(|s| !s.is_empty());
@@ -555,7 +701,10 @@ fn render_sidebar_details_area(
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
                     Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(genres.join(" · "), Style::default().fg(COLOR_HIGHLIGHT)),
+                    Span::styled(
+                        summarized_genres(genres),
+                        Style::default().fg(COLOR_HIGHLIGHT),
+                    ),
                 ]));
             }
         }
@@ -564,7 +713,7 @@ fn render_sidebar_details_area(
             if include_title {
                 text.push(
                     Line::from(Span::styled(
-                        item.title_ukrainian.as_str(),
+                        truncate_with_ellipsis(&item.title_ukrainian, area.width as usize),
                         Style::default()
                             .fg(COLOR_SECONDARY)
                             .add_modifier(Modifier::BOLD),
@@ -573,62 +722,15 @@ fn render_sidebar_details_area(
                 );
                 if let Some(eng) = &item.title_english {
                     text.push(
-                        Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
-                            .alignment(Alignment::Center),
+                        Line::from(Span::styled(
+                            truncate_with_ellipsis(eng, area.width as usize),
+                            Style::default().fg(COLOR_DIM),
+                        ))
+                        .alignment(Alignment::Center),
                     );
                 }
                 text.push(mk_sep());
             }
-
-            // Кількість сезонів у групі (тільки в SearchList)
-            if sidebar_is_representative(app) {
-                if let Some(g_idx) = app.selected_group_index {
-                    if let Some(group) = app.franchise_groups.get(g_idx) {
-                        let (tv, other) = count_seasons(&app.search_results, group);
-                        if tv > 1 || other > 0 {
-                            let label = if tv > 1 && other > 0 {
-                                format!("{} сез. + {} спец.", tv, other)
-                            } else if tv > 1 {
-                                format!("{} сезони", tv)
-                            } else {
-                                format!("1 сез. + {} спец.", other)
-                            };
-                            text.push(
-                                Line::from(vec![
-                                    Span::styled("Сезонів: ", Style::default().fg(COLOR_DIM)),
-                                    Span::styled(
-                                        label,
-                                        Style::default()
-                                            .fg(COLOR_SECONDARY)
-                                            .add_modifier(Modifier::BOLD),
-                                    ),
-                                ])
-                                .alignment(Alignment::Center),
-                            );
-                        }
-                    }
-                }
-            }
-
-            text.push(
-                Line::from(vec![
-                    Span::styled("Тип: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(item.anime_type.as_str(), Style::default().fg(COLOR_TEXT)),
-                ])
-                .alignment(Alignment::Center),
-            );
-            text.push(
-                Line::from(vec![
-                    Span::styled("Рік: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(
-                        item.year
-                            .map(|y| y.to_string())
-                            .unwrap_or_else(|| "—".to_string()),
-                        Style::default().fg(COLOR_TEXT),
-                    ),
-                ])
-                .alignment(Alignment::Center),
-            );
 
             let details = app.details_cache.get(&item.id).or_else(|| {
                 if sidebar_is_representative(app) {
@@ -637,32 +739,21 @@ fn render_sidebar_details_area(
                     None
                 }
             });
+            text.push(compact_metadata_line(
+                &item.anime_type,
+                item.year,
+                details.as_ref().and_then(|details| details.rating),
+                details
+                    .as_ref()
+                    .and_then(|details| details.episodes_count)
+                    .or(item.episodes_count)
+                    .map(|episodes| episodes.to_string()),
+            ));
+            let (anime_ids, total) = search_sidebar_tracking_context(app);
+            text.push(mk_sep());
+            text.extend(tracking_lines(app, &anime_ids, None, total));
 
             if let Some(d) = details {
-                if let Some(rating) = d.rating {
-                    text.push(
-                        Line::from(vec![
-                            Span::styled("Рейтинг: ", Style::default().fg(COLOR_DIM)),
-                            Span::styled(
-                                format!("{:.1} ⭐", rating),
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ])
-                        .alignment(Alignment::Center),
-                    );
-                }
-                if let Some(ep_count) = d.episodes_count {
-                    text.push(
-                        Line::from(vec![
-                            Span::styled("Серій: ", Style::default().fg(COLOR_DIM)),
-                            Span::styled(ep_count.to_string(), Style::default().fg(COLOR_TEXT)),
-                        ])
-                        .alignment(Alignment::Center),
-                    );
-                }
-
                 let has_extra = d.genres.as_ref().is_some_and(|g| !g.is_empty())
                     || d.dubbing_studios.as_ref().is_some_and(|s| !s.is_empty());
                 if has_extra {
@@ -688,16 +779,29 @@ fn render_sidebar_details_area(
                         text.push(Line::from(""));
                         text.push(Line::from(vec![
                             Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
-                            Span::styled(genres.join(" · "), Style::default().fg(COLOR_HIGHLIGHT)),
+                            Span::styled(
+                                summarized_genres(genres),
+                                Style::default().fg(COLOR_HIGHLIGHT),
+                            ),
                         ]));
                     }
                 }
+            } else if app.loading {
+                text.push(
+                    Line::from(Span::styled(
+                        "Завантаження деталей…",
+                        Style::default().fg(COLOR_DIM),
+                    ))
+                    .alignment(Alignment::Center),
+                );
             }
         }
     } else {
         text.push(
             Line::from(Span::styled(
-                "Виберіть аніме зі списку...",
+                app.activity_message
+                    .as_deref()
+                    .unwrap_or("Оберіть тайтл зі списку"),
                 Style::default().fg(COLOR_DIM),
             ))
             .alignment(Alignment::Center),
@@ -758,7 +862,7 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
             .style(
                 Style::default()
                     .fg(COLOR_SECONDARY)
-                    .bg(COLOR_BG_DARK)
+                    .bg(COLOR_BG_TRANSPARENT)
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(Alignment::Center),
@@ -766,168 +870,156 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
     );
 
     if rows.len() >= 2 {
+        // "anihub-cli | vX" — hub accented in app purple.
+        let brand_w = format!(" anihub-cli | v{} ", env!("CARGO_PKG_VERSION"))
+            .chars()
+            .count()
+            .max(18) as u16;
+
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(20), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(brand_w),
+                Constraint::Min(1),
+                Constraint::Length(brand_w),
+            ])
             .split(rows[1]);
-        let (selected, total) = app.active_list_position();
-        let position = if total > 0 {
-            format!(
-                " v{}  ·  {}/{}",
-                env!("CARGO_PKG_VERSION"),
-                selected + 1,
-                total,
-            )
-        } else {
-            format!(" v{}", env!("CARGO_PKG_VERSION"))
-        };
+
         f.render_widget(
-            Paragraph::new(position)
-                .style(Style::default().fg(COLOR_DIM).bg(COLOR_BG_DARK))
-                .alignment(Alignment::Left),
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " ani",
+                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "hub",
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "-cli",
+                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" | v{} ", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(COLOR_DIM),
+                ),
+            ]))
+            .style(Style::default().bg(COLOR_BG_TRANSPARENT))
+            .alignment(Alignment::Left),
             columns[0],
         );
+        // Centered framed keybinds: │ Enter Далі  ·  e Статус │
         f.render_widget(
-            Paragraph::new(context_shortcuts(app))
-                .style(Style::default().fg(COLOR_DIM).bg(COLOR_BG_DARK))
+            Paragraph::new(framed_shortcuts_line(&context_shortcuts(app)))
+                .style(Style::default().bg(COLOR_BG_TRANSPARENT))
                 .alignment(Alignment::Center),
             columns[1],
+        );
+        // Symmetric empty side keeps the bind strip visually centered.
+        f.render_widget(
+            Paragraph::new("").style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+            columns[2],
         );
     }
 }
 
+/// Build `│  key Action  ·  key Action  │` with purple rails.
+fn framed_shortcuts_line(shortcuts: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> =
+        vec![Span::styled("│ ", Style::default().fg(COLOR_PRIMARY))];
+    let parts: Vec<&str> = shortcuts
+        .split("  ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_DIM)));
+        }
+        // First token is the key chord, rest is the label.
+        let mut tokens = part.splitn(2, ' ');
+        let key = tokens.next().unwrap_or("");
+        let label = tokens.next().unwrap_or("");
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(COLOR_SECONDARY)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !label.is_empty() {
+            spans.push(Span::styled(
+                format!(" {label}"),
+                Style::default().fg(COLOR_DIM),
+            ));
+        }
+    }
+    spans.push(Span::styled(" │", Style::default().fg(COLOR_PRIMARY)));
+    Line::from(spans)
+}
+
 fn context_shortcuts(app: &AppState) -> String {
     if app.mode == AppMode::Settings {
-        return " 1 Пошук   2 Бібліотека   Esc Назад   Ctrl+C Вихід ".to_string();
+        if app.settings_update_popup {
+            return "Enter Дія  Esc Закрити  Ctrl+C Вихід".to_string();
+        }
+        if app.settings_input.is_some() {
+            return "Enter Зберегти  Esc Скасувати  Ctrl+C Вихід".to_string();
+        }
+        return "↑↓ Вибір  Space Змінити  Enter Дія  Tab Вкладка  Esc Назад".to_string();
     }
     if app.mode == AppMode::SearchInput {
-        return " Enter Пошук   ←/→ Курсор   Esc Скасувати   Ctrl+C Вихід ".to_string();
+        return "Enter Знайти  Esc Скасувати  Alt+2 Бібліотека  Ctrl+C Вихід".to_string();
+    }
+    if app.library_search_editing {
+        return "Enter Застосувати  Esc Очистити  Tab Категорія  Ctrl+C Вихід".to_string();
     }
     if app.is_library_mode() {
         return match app.mode {
             AppMode::Library => {
-                " Tab Категорія   Enter Відкрити   e Статус   c Продовжити ".to_string()
+                "Tab Категорія  Enter Відкрити  e Статус  c Продовжити  / Пошук бібліотеки"
+                    .to_string()
             }
             AppMode::LibrarySeason | AppMode::LibraryDubbing => {
-                " Tab Категорія   Enter Далі   Space Переглянуто   e Статус   Esc Назад "
-                    .to_string()
+                "Enter Далі  Space Переглянуто  e Статус  Esc Назад".to_string()
             }
             AppMode::LibraryEpisode => {
                 if app
                     .selected_dubbing_choice()
                     .is_some_and(|choice| choice.is_moonanime())
                 {
-                    " Tab Категорія   Enter Відкрити embed   e Статус   Esc Назад ".to_string()
+                    "Enter Embed  e Статус  Esc Назад".to_string()
                 } else {
-                    " Tab Категорія   Enter Відтворити   Space Переглянуто   Backspace Таймкод   e Статус "
-                        .to_string()
+                    "Enter Відтворити  Space Переглянуто  Backspace Таймкод  e Статус".to_string()
                 }
             }
             _ => String::new(),
         };
     }
     match app.focus {
-        FocusPanel::SearchList => " Enter Випуски   e Статус   c Продовжити   / Пошук ".to_string(),
+        FocusPanel::SearchList => {
+            "Enter Далі  e Статус  c Продовжити  / Пошук  2 Бібліотека".to_string()
+        }
         FocusPanel::ReleaseList
             if app.has_release_catalog() && !app.selected_release_available() =>
         {
-            " Недоступно на AniHub   Esc Назад ".to_string()
+            "Недоступно на AniHub  Esc Назад".to_string()
         }
         FocusPanel::ReleaseList | FocusPanel::DubbingList => {
-            " Enter Далі   Space Переглянуто   e Статус   Esc Назад ".to_string()
+            "Enter Далі  Space Переглянуто  e Статус  Esc Назад".to_string()
         }
         FocusPanel::EpisodeList => {
             if app
                 .selected_dubbing_choice()
                 .is_some_and(|choice| choice.is_moonanime())
             {
-                " Enter Відкрити embed   e Статус   Esc Назад ".to_string()
+                "Enter Embed  e Статус  Esc Назад".to_string()
             } else {
-                " Enter Відтворити   Space Переглянуто   Backspace Таймкод   e Статус ".to_string()
+                "Enter Відтворити  Space Переглянуто  Backspace Таймкод  e Статус".to_string()
             }
         }
     }
-}
-
-fn search_breadcrumb(app: &AppState) -> String {
-    let mut parts = Vec::new();
-    if let Some(group_index) = app.selected_group_index {
-        if let Some(catalog) = app.franchise_catalogs.get(group_index) {
-            parts.push(catalog.canonical_title.clone());
-        } else if let Some(group) = app.franchise_groups.get(group_index) {
-            parts.push(api::franchise_display_name(&app.search_results, group).to_string());
-        }
-        let anime_ids = app
-            .franchise_groups
-            .get(group_index)
-            .into_iter()
-            .flatten()
-            .filter_map(|index| app.search_results.get(*index).map(|anime| anime.id))
-            .collect::<Vec<_>>();
-        if let Some(status) = anime_status_for_ids(app, &anime_ids) {
-            parts.push(status.label().to_string());
-        }
-    }
-    if app.focus != FocusPanel::SearchList {
-        if let (Some(catalog), Some(release)) =
-            (app.selected_franchise_catalog(), app.selected_release())
-        {
-            parts.push(release_label(catalog, release));
-        } else if let Some(season) = app.selected_season_num() {
-            parts.push(format!("Сезон {}", season));
-        }
-    }
-    if matches!(app.focus, FocusPanel::DubbingList | FocusPanel::EpisodeList) {
-        if let Some(choice) = app.selected_dubbing_choice() {
-            let suffix = if choice.is_moonanime() {
-                " [MoonAnime]"
-            } else {
-                ""
-            };
-            parts.push(format!("{}{}", choice.studio_name(), suffix));
-        }
-    }
-    if app.focus == FocusPanel::EpisodeList {
-        if let Some(episode) = app
-            .selected_episode_index
-            .and_then(|index| app.selected_episode_choices().get(index).copied())
-        {
-            parts.push(format!("Серія {}", episode.episode_number()));
-        }
-    }
-    parts.join(" › ")
-}
-
-fn library_breadcrumb(app: &AppState) -> String {
-    let mut parts = vec![format!("[{}]", app.library_filter.label())];
-    if let Some(anime) = app.library_selected_anime() {
-        parts.push(anime.anime_title.clone());
-        parts.push(anime.status.label().to_string());
-    }
-    if app.mode != AppMode::Library {
-        if let Some(season) = app.selected_season_num() {
-            parts.push(format!("Сезон {}", season));
-        }
-    }
-    if matches!(app.mode, AppMode::LibraryDubbing | AppMode::LibraryEpisode) {
-        if let Some(choice) = app.selected_dubbing_choice() {
-            let suffix = if choice.is_moonanime() {
-                " [MoonAnime]"
-            } else {
-                ""
-            };
-            parts.push(format!("{}{}", choice.studio_name(), suffix));
-        }
-    }
-    if app.mode == AppMode::LibraryEpisode {
-        if let Some(episode) = app
-            .selected_episode_index
-            .and_then(|index| app.selected_episode_choices().get(index).copied())
-        {
-            parts.push(format!("Серія {}", episode.episode_number()));
-        }
-    }
-    parts.join(" › ")
 }
 
 fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
@@ -1021,60 +1113,32 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             );
             let rep = &app.search_results[representative_index];
             let (tv, other) = count_seasons(&app.search_results, group);
-            let title = if let Some(summary) = app
-                .franchise_catalogs
-                .get(group_index)
-                .and_then(catalog_summary)
-            {
-                format!("{} ({})", name, summary)
-            } else if tv > 1 && other > 0 {
-                format!("{} ({} сез. + {} спец.)", name, tv, other)
-            } else if tv > 1 {
-                format!("{} ({} сез.)", name, tv)
-            } else {
-                match rep.year {
-                    Some(y) => format!("{} ({})", name, y),
-                    None => name.to_string(),
-                }
-            };
-            let mut marker = String::new();
-            let group_ids = group
-                .iter()
-                .filter_map(|index| app.search_results.get(*index).map(|anime| anime.id))
-                .collect::<Vec<_>>();
-            if let Some(status) = anime_status_for_ids(app, &group_ids) {
-                marker.push_str(anime_status_marker(status));
+            let mut metadata = Vec::new();
+            if tv > 0 {
+                metadata.push(season_count_label(tv));
+            } else if other > 0 {
+                metadata.push(format!("{other} дод."));
             }
-            if franchise_is_complete(app, group) && !marker.contains('✓') {
-                marker.push('✓');
+            let episodes = rep.episodes_count.or_else(|| {
+                app.details_cache
+                    .get(&rep.id)
+                    .and_then(|details| details.episodes_count)
+            });
+            if let Some(episodes) = episodes {
+                metadata.push(format!("{episodes} сер."));
+            } else if let Some(year) = rep.year {
+                metadata.push(year.to_string());
             }
-            let mut lines = vec![Line::from(with_right_marker(&title, &marker, list_width))];
-            if let Some(progress) = latest_progress_for_group(app, group) {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "⏱ Сезон {} · Серія {} · {}",
-                        progress.season,
-                        progress.episode,
-                        format_timestamp(progress.timestamp)
-                    ),
-                    Style::default().fg(COLOR_HIGHLIGHT),
-                )));
-            }
-            if let Some(eng) = &rep.title_english {
-                lines.push(Line::from(Span::styled(
-                    eng.clone(),
-                    Style::default().fg(COLOR_DIM),
-                )));
-            }
-            items.push(ListItem::new(lines));
+            let title = label_with_metadata(name, &metadata);
+            items.push(ListItem::new(truncate_with_ellipsis(&title, list_width)));
         }
         if items.is_empty() {
             let message = if app.activity_message.is_some() {
                 "Шукаємо…"
             } else if app.last_search_query.is_empty() {
-                "Натисніть / та введіть назву аніме"
+                "Порожньо · / — пошук · 2 — бібліотека · ? — довідка"
             } else {
-                "За цим запитом нічого не знайдено"
+                "Нічого не знайдено · / — інший запит"
             };
             items.push(ListItem::new(Line::from(Span::styled(
                 message,
@@ -1133,14 +1197,12 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 .iter()
                 .map(|&sn| {
                     let count = app.dubbing_choices_for_season(sn).len();
-                    let year_str = season_year(app, sn)
-                        .map(|y| format!(" · {}", y))
-                        .unwrap_or_default();
-                    let label = if count > 1 {
-                        format!("Сезон {}{} ({} озвучок)", sn, year_str, count)
-                    } else {
-                        format!("Сезон {}{}", sn, year_str)
-                    };
+                    let year_str = season_year(app, sn).map(|y| y.to_string());
+                    let mut metadata = year_str.into_iter().collect::<Vec<_>>();
+                    if count > 1 {
+                        metadata.push(format!("{count} озвучок"));
+                    }
+                    let label = label_with_metadata(&format!("Сезон {sn}"), &metadata);
                     let marker = season_marker_for_search(app, sn);
                     ListItem::new(with_right_marker(
                         &label,
@@ -1159,17 +1221,11 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             app.dubbing_choices_for_season(sn)
                 .iter()
                 .map(|choice| {
-                    let provider = if choice.is_moonanime() {
-                        " [MoonAnime]"
-                    } else {
-                        ""
-                    };
-                    ListItem::new(format!(
-                        "{}{} ({} серій)",
-                        choice.studio_name(),
-                        provider,
-                        choice.episodes_count()
-                    ))
+                    let mut metadata = vec![format!("{} сер.", choice.episodes_count())];
+                    if choice.is_moonanime() {
+                        metadata.push("MoonAnime".to_string());
+                    }
+                    ListItem::new(label_with_metadata(choice.studio_name(), &metadata))
                 })
                 .collect()
         } else {
@@ -1232,7 +1288,8 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                             .or_else(|| ep.title.rfind('(').map(|p| ep.title[p..].trim()))
                             .unwrap_or("");
                         if !suffix.is_empty() {
-                            let mut label = format!("Серія {} ({})", ep_label, suffix);
+                            let label = format!("Серія {} ({})", ep_label, suffix);
+                            let mut metadata = Vec::new();
                             if let Some(t) = episode_owner.and_then(|anime_id| {
                                 episode_progress_timestamp(
                                     app,
@@ -1241,9 +1298,9 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                                     ep.episode_number,
                                 )
                             }) {
-                                label.push_str(&format!(" · ⏱ {}", format_elapsed_timestamp(t)));
+                                metadata.push(format!("⏱ {}", format_elapsed_timestamp(t)));
                             }
-                            let marker = if episode_owner.is_some_and(|anime_id| {
+                            if episode_owner.is_some_and(|anime_id| {
                                 episode_is_watched(
                                     app,
                                     anime_id,
@@ -1251,18 +1308,13 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                                     ep.episode_number,
                                 )
                             }) {
-                                "✓"
-                            } else {
-                                ""
-                            };
-                            return ListItem::new(with_right_marker(
-                                &label,
-                                marker,
-                                list_chunks[idx].width.saturating_sub(6) as usize,
-                            ));
+                                metadata.push("✓".to_string());
+                            }
+                            return ListItem::new(label_with_metadata(&label, &metadata));
                         }
                     }
-                    let mut label = format!("Серія {}", ep_label);
+                    let label = format!("Серія {}", ep_label);
+                    let mut metadata = Vec::new();
                     if let Some(t) = episode_owner.and_then(|anime_id| {
                         episode_progress_timestamp(
                             app,
@@ -1271,20 +1323,14 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                             ep.episode_number,
                         )
                     }) {
-                        label.push_str(&format!(" · ⏱ {}", format_elapsed_timestamp(t)));
+                        metadata.push(format!("⏱ {}", format_elapsed_timestamp(t)));
                     }
-                    let marker = if episode_owner.is_some_and(|anime_id| {
+                    if episode_owner.is_some_and(|anime_id| {
                         episode_is_watched(app, anime_id, studio.season_number, ep.episode_number)
                     }) {
-                        "✓"
-                    } else {
-                        ""
-                    };
-                    ListItem::new(with_right_marker(
-                        &label,
-                        marker,
-                        list_chunks[idx].width.saturating_sub(6) as usize,
-                    ))
+                        metadata.push("✓".to_string());
+                    }
+                    ListItem::new(label_with_metadata(&label, &metadata))
                 })
                 .collect()
         } else {
@@ -1307,6 +1353,17 @@ fn render_library_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    if app.library_selected_anime().is_none() {
+        render_centered_sidebar_message(
+            f,
+            inner,
+            app.activity_message
+                .as_deref()
+                .unwrap_or("Оберіть тайтл зі списку"),
+        );
+        return;
+    }
+
     let has_eng = app
         .current_details
         .as_ref()
@@ -1315,7 +1372,7 @@ fn render_library_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     let title_h: u16 = if has_eng { 2 } else { 1 };
 
     if app.current_poster.is_some() && inner.height > title_h + 5 {
-        let poster_h = ((inner.height.saturating_sub(title_h + 2)) * 40 / 100).max(3);
+        let poster_h = sidebar_poster_height(inner, title_h);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1404,67 +1461,92 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         .constraints(constraints)
         .split(area);
 
-    let mut anime_items: Vec<ListItem> = app
-        .library_items
-        .iter()
-        .map(|item| {
-            let marker = anime_status_marker(item.status).to_string();
-            let line_1 = with_right_marker(
-                &item.anime_title,
-                &marker,
-                chunks[0].width.saturating_sub(6) as usize,
-            );
-            let line_2 = if item.seasons.is_empty() {
-                item.status.label().to_string()
-            } else {
-                format!(
-                    "{} · Сезон {} · Серія {} · ⏱ {}",
-                    item.status.label(),
-                    item.latest_progress.season,
-                    item.latest_progress.episode,
-                    format_timestamp(item.latest_progress.timestamp),
-                )
-            };
-            ListItem::new(vec![
-                Line::from(line_1),
-                Line::from(Span::styled(line_2, Style::default().fg(COLOR_DIM))),
-            ])
-        })
-        .collect();
-    if anime_items.is_empty() {
-        anime_items.push(ListItem::new(vec![
-            Line::from(Span::styled(
-                format!("У розділі «{}» поки порожньо", app.library_filter.label()),
-                Style::default().fg(COLOR_DIM),
-            )),
-            Line::from(Span::styled(
-                "Tab / Shift+Tab — змінити категорію",
-                Style::default().fg(COLOR_HIGHLIGHT),
-            )),
-        ]));
-    }
     let library_title = format!(" {} ", app.library_filter.label());
-    let anime_list = create_list(&library_title, anime_items, app.mode == AppMode::Library);
-    f.render_stateful_widget(anime_list, chunks[0], &mut app.library_anime_list_state);
+    if app.library_items.is_empty() {
+        let border_style = if app.mode == AppMode::Library {
+            Style::default().fg(COLOR_HIGHLIGHT)
+        } else {
+            Style::default().fg(COLOR_DIM)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(library_title)
+            .title_alignment(Alignment::Center)
+            .border_style(border_style);
+        let inner = block.inner(chunks[0]);
+        f.render_widget(block, chunks[0]);
+
+        let message = if app.library_search_query.is_empty() {
+            format!("У категорії «{}» поки порожньо", app.library_filter.label())
+        } else {
+            format!("Нічого не знайдено за «{}»", app.library_search_query)
+        };
+        let centered = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(inner);
+        f.render_widget(
+            Paragraph::new(Span::styled(message, Style::default().fg(COLOR_DIM)))
+                .alignment(Alignment::Center),
+            centered[1],
+        );
+    } else {
+        let anime_items: Vec<ListItem> = app
+            .library_items
+            .iter()
+            .map(|item| {
+                let seasons = item
+                    .seasons
+                    .iter()
+                    .filter(|release| release.kind == LibraryReleaseKind::Season)
+                    .count();
+                let extras = item.seasons.len().saturating_sub(seasons);
+                let mut metadata = Vec::new();
+                if seasons > 0 {
+                    metadata.push(season_count_label(seasons));
+                }
+                if extras > 0 {
+                    metadata.push(format!("{extras} дод."));
+                }
+                ListItem::new(label_with_metadata(&item.anime_title, &metadata))
+            })
+            .collect();
+        let anime_list = create_list(&library_title, anime_items, app.mode == AppMode::Library);
+        f.render_stateful_widget(anime_list, chunks[0], &mut app.library_anime_list_state);
+    }
 
     if chunks.len() >= 2 {
         let season_items: Vec<ListItem> = app
-            .library_season_numbers()
-            .iter()
-            .map(|&season_num| {
-                let count = app.dubbing_choices_for_season(season_num).len();
-                let year_str = season_year(app, season_num)
-                    .map(|y| format!(" · {}", y))
-                    .unwrap_or_default();
-                let label = if count > 1 {
-                    format!("Сезон {}{} ({} озвучок)", season_num, year_str, count)
-                } else {
-                    format!("Сезон {}{}", season_num, year_str)
+            .library_selected_anime()
+            .into_iter()
+            .flat_map(|anime| anime.seasons.iter())
+            .map(|release| {
+                let count = app.dubbing_choices_for_season(release.season).len();
+                let mut metadata = release
+                    .episodes_count
+                    .map(|count| format!("{count} сер."))
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if count > 1 {
+                    metadata.push(format!("{count} озвучок"));
+                }
+                let release_label = match release.kind {
+                    LibraryReleaseKind::Season => match release.part {
+                        Some(part) if part > 1 => {
+                            format!("Сезон {} · Частина {part}", release.season)
+                        }
+                        _ => format!("Сезон {}", release.season),
+                    },
+                    LibraryReleaseKind::Movie => format!("Фільм · {}", release.title),
+                    LibraryReleaseKind::Special => format!("Спецвипуск · {}", release.title),
+                    LibraryReleaseKind::Extra => format!("Додатково · {}", release.title),
                 };
-                let marker = if app
-                    .library_selected_anime_id()
-                    .is_some_and(|anime_id| season_is_complete(app, anime_id, season_num))
-                {
+                let label = label_with_metadata(&release_label, &metadata);
+                let marker = if season_is_complete(app, release.anime_id, release.season) {
                     "✓"
                 } else {
                     ""
@@ -1476,7 +1558,11 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 ))
             })
             .collect();
-        let season_list = create_list(" Сезони ", season_items, app.mode == AppMode::LibrarySeason);
+        let season_list = create_list(
+            " Випуски ",
+            season_items,
+            app.mode == AppMode::LibrarySeason,
+        );
         f.render_stateful_widget(season_list, chunks[1], &mut app.season_list_state);
     }
 
@@ -1485,17 +1571,11 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             app.dubbing_choices_for_season(sn)
                 .iter()
                 .map(|choice| {
-                    let provider = if choice.is_moonanime() {
-                        " [MoonAnime]"
-                    } else {
-                        ""
-                    };
-                    ListItem::new(format!(
-                        "{}{} ({} серій)",
-                        choice.studio_name(),
-                        provider,
-                        choice.episodes_count()
-                    ))
+                    let mut metadata = vec![format!("{} сер.", choice.episodes_count())];
+                    if choice.is_moonanime() {
+                        metadata.push("MoonAnime".to_string());
+                    }
+                    ListItem::new(label_with_metadata(choice.studio_name(), &metadata))
                 })
                 .collect()
         } else {
@@ -1536,7 +1616,8 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 .episodes
                 .iter()
                 .map(|episode| {
-                    let mut label = format!("Серія {}", episode.episode_number);
+                    let label = format!("Серія {}", episode.episode_number);
+                    let mut metadata = Vec::new();
                     if let Some(t) = anime_id.and_then(|id| {
                         episode_progress_timestamp(
                             app,
@@ -1545,20 +1626,14 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                             episode.episode_number,
                         )
                     }) {
-                        label.push_str(&format!(" · ⏱ {}", format_elapsed_timestamp(t)));
+                        metadata.push(format!("⏱ {}", format_elapsed_timestamp(t)));
                     }
-                    let marker = if anime_id.is_some_and(|id| {
+                    if anime_id.is_some_and(|id| {
                         episode_is_watched(app, id, studio.season_number, episode.episode_number)
                     }) {
-                        "✓"
-                    } else {
-                        ""
-                    };
-                    ListItem::new(with_right_marker(
-                        &label,
-                        marker,
-                        chunks[3].width.saturating_sub(6) as usize,
-                    ))
+                        metadata.push("✓".to_string());
+                    }
+                    ListItem::new(label_with_metadata(&label, &metadata))
                 })
                 .collect()
         } else {
@@ -1578,7 +1653,7 @@ fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) 
     if let Some(details) = &app.current_details {
         lines.push(
             Line::from(Span::styled(
-                details.title_ukrainian.as_str(),
+                truncate_with_ellipsis(&details.title_ukrainian, area.width as usize),
                 Style::default()
                     .fg(COLOR_SECONDARY)
                     .add_modifier(Modifier::BOLD),
@@ -1587,14 +1662,17 @@ fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) 
         );
         if let Some(eng) = &details.title_english {
             lines.push(
-                Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
-                    .alignment(Alignment::Center),
+                Line::from(Span::styled(
+                    truncate_with_ellipsis(eng, area.width as usize),
+                    Style::default().fg(COLOR_DIM),
+                ))
+                .alignment(Alignment::Center),
             );
         }
     } else if let Some(anime) = app.library_selected_anime() {
         lines.push(
             Line::from(Span::styled(
-                anime.anime_title.as_str(),
+                truncate_with_ellipsis(&anime.anime_title, area.width as usize),
                 Style::default()
                     .fg(COLOR_SECONDARY)
                     .add_modifier(Modifier::BOLD),
@@ -1624,7 +1702,7 @@ fn render_library_sidebar_details_area(
         if include_title {
             text.push(
                 Line::from(Span::styled(
-                    details.title_ukrainian.as_str(),
+                    truncate_with_ellipsis(&details.title_ukrainian, area.width as usize),
                     Style::default()
                         .fg(COLOR_SECONDARY)
                         .add_modifier(Modifier::BOLD),
@@ -1633,57 +1711,25 @@ fn render_library_sidebar_details_area(
             );
             if let Some(eng) = &details.title_english {
                 text.push(
-                    Line::from(Span::styled(eng.clone(), Style::default().fg(COLOR_DIM)))
-                        .alignment(Alignment::Center),
+                    Line::from(Span::styled(
+                        truncate_with_ellipsis(eng, area.width as usize),
+                        Style::default().fg(COLOR_DIM),
+                    ))
+                    .alignment(Alignment::Center),
                 );
             }
             text.push(mk_sep());
         }
 
-        text.push(
-            Line::from(vec![
-                Span::styled("Тип: ", Style::default().fg(COLOR_DIM)),
-                Span::styled(details.anime_type.as_str(), Style::default().fg(COLOR_TEXT)),
-            ])
-            .alignment(Alignment::Center),
-        );
-        text.push(
-            Line::from(vec![
-                Span::styled("Рік: ", Style::default().fg(COLOR_DIM)),
-                Span::styled(
-                    details
-                        .year
-                        .map(|y| y.to_string())
-                        .unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(COLOR_TEXT),
-                ),
-            ])
-            .alignment(Alignment::Center),
-        );
-
-        if let Some(rating) = details.rating {
-            text.push(
-                Line::from(vec![
-                    Span::styled("Рейтинг: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(
-                        format!("{:.1} ⭐", rating),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ])
-                .alignment(Alignment::Center),
-            );
-        }
-        if let Some(ep_count) = details.episodes_count {
-            text.push(
-                Line::from(vec![
-                    Span::styled("Серій: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(ep_count.to_string(), Style::default().fg(COLOR_TEXT)),
-                ])
-                .alignment(Alignment::Center),
-            );
-        }
+        text.push(compact_metadata_line(
+            &details.anime_type,
+            details.year,
+            details.rating,
+            details.episodes_count.map(|episodes| episodes.to_string()),
+        ));
+        let (anime_ids, status, total) = library_sidebar_tracking_context(app);
+        text.push(mk_sep());
+        text.extend(tracking_lines(app, &anime_ids, status, total));
 
         let has_extra = details.genres.as_ref().is_some_and(|g| !g.is_empty())
             || details
@@ -1713,39 +1759,43 @@ fn render_library_sidebar_details_area(
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
                     Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(genres.join(" · "), Style::default().fg(COLOR_HIGHLIGHT)),
+                    Span::styled(
+                        summarized_genres(genres),
+                        Style::default().fg(COLOR_HIGHLIGHT),
+                    ),
                 ]));
             }
         }
-
-        if let Some(anime) = app.library_selected_anime() {
-            let latest = &anime.latest_progress;
-            text.push(mk_sep());
+    } else if let Some(anime) = app.library_selected_anime() {
+        if include_title {
             text.push(
-                Line::from(vec![
-                    Span::styled("Останнє: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(
-                        format!("Сезон {} · Серія {}", latest.season, latest.episode),
-                        Style::default().fg(COLOR_TEXT),
-                    ),
-                ])
+                Line::from(Span::styled(
+                    truncate_with_ellipsis(&anime.anime_title, area.width as usize),
+                    Style::default()
+                        .fg(COLOR_SECONDARY)
+                        .add_modifier(Modifier::BOLD),
+                ))
                 .alignment(Alignment::Center),
             );
+            text.push(mk_sep());
+        }
+        if app.loading {
             text.push(
-                Line::from(vec![
-                    Span::styled("Таймінг: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(
-                        format!("⏱ {}", format_timestamp(latest.timestamp)),
-                        Style::default().fg(COLOR_TEXT),
-                    ),
-                ])
+                Line::from(Span::styled(
+                    "Завантаження деталей…",
+                    Style::default().fg(COLOR_DIM),
+                ))
                 .alignment(Alignment::Center),
             );
         }
+        let (anime_ids, status, total) = library_sidebar_tracking_context(app);
+        text.extend(tracking_lines(app, &anime_ids, status, total));
     } else {
         text.push(
             Line::from(Span::styled(
-                "Виберіть аніме зі списку...",
+                app.activity_message
+                    .as_deref()
+                    .unwrap_or("Оберіть тайтл зі списку"),
                 Style::default().fg(COLOR_DIM),
             ))
             .alignment(Alignment::Center),
@@ -1765,6 +1815,25 @@ fn format_timestamp(seconds: f64) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
+fn render_centered_sidebar_message(f: &mut Frame, area: Rect, message: &str) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_with_ellipsis(message, area.width as usize),
+            Style::default().fg(COLOR_DIM),
+        ))
+        .alignment(Alignment::Center),
+        rows[1],
+    );
+}
+
 fn format_elapsed_timestamp(seconds: f64) -> String {
     let total = seconds.max(0.0) as u64;
     if total >= 60 {
@@ -1772,6 +1841,167 @@ fn format_elapsed_timestamp(seconds: f64) -> String {
     } else {
         format!("{}с", total)
     }
+}
+
+fn label_with_metadata(label: &str, metadata: &[String]) -> String {
+    if metadata.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label} [{}]", metadata.join(" · "))
+    }
+}
+
+fn sidebar_poster_height(inner: Rect, title_height: u16) -> u16 {
+    // Keep the poster compact so its reserved row does not push status and
+    // metadata halfway down a tall terminal.
+    let width_based = inner.width / 2;
+    let height_based = inner.height.saturating_sub(title_height + 8);
+    width_based.min(height_based).max(3)
+}
+
+fn season_count_label(count: usize) -> String {
+    let suffix = if count % 10 == 1 && count % 100 != 11 {
+        "сезон"
+    } else if (2..=4).contains(&(count % 10)) && !(12..=14).contains(&(count % 100)) {
+        "сезони"
+    } else {
+        "сезонів"
+    };
+    format!("{count} {suffix}")
+}
+
+fn truncate_with_ellipsis(text: &str, width: usize) -> String {
+    let length = text.chars().count();
+    if length <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    format!("{}…", text.chars().take(width - 1).collect::<String>())
+}
+
+fn compact_metadata_line(
+    anime_type: &str,
+    year: Option<u32>,
+    rating: Option<f32>,
+    episodes: Option<String>,
+) -> Line<'static> {
+    let mut values: Vec<(String, Style)> =
+        vec![(anime_type.to_uppercase(), Style::default().fg(COLOR_TEXT))];
+    if let Some(year) = year {
+        values.push((year.to_string(), Style::default().fg(COLOR_TEXT)));
+    }
+    if let Some(rating) = rating {
+        values.push((
+            format!("★ {rating:.1}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(episodes) = episodes {
+        values.push((format!("{episodes} сер."), Style::default().fg(COLOR_TEXT)));
+    }
+
+    let mut spans = Vec::new();
+    for (index, (value, style)) in values.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(COLOR_DIM)));
+        }
+        spans.push(Span::styled(value, style));
+    }
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+fn summarized_genres(genres: &[String]) -> String {
+    const VISIBLE_GENRES: usize = 4;
+    let visible = genres
+        .iter()
+        .take(VISIBLE_GENRES)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let hidden = genres.len().saturating_sub(VISIBLE_GENRES);
+    if hidden > 0 {
+        format!("{visible} · +{hidden}")
+    } else {
+        visible
+    }
+}
+
+fn latest_progress_for_ids<'a>(
+    app: &'a AppState,
+    anime_ids: &[u32],
+) -> Option<&'a crate::storage::WatchProgress> {
+    app.history
+        .progress
+        .values()
+        .filter(|progress| anime_ids.contains(&progress.anime_id))
+        .max_by_key(|progress| progress.updated_at)
+}
+
+fn watched_episode_count(app: &AppState, anime_ids: &[u32]) -> usize {
+    app.history
+        .progress
+        .values()
+        .filter(|progress| progress.watched && anime_ids.contains(&progress.anime_id))
+        .map(|progress| (progress.anime_id, progress.season, progress.episode))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+fn tracking_lines(
+    app: &AppState,
+    anime_ids: &[u32],
+    explicit_status: Option<AnimeStatus>,
+    total_episodes: Option<u32>,
+) -> Vec<Line<'static>> {
+    if anime_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let status = explicit_status
+        .or_else(|| anime_status_for_ids(app, anime_ids))
+        .unwrap_or(AnimeStatus::NotAdded);
+    let watched = watched_episode_count(app, anime_ids);
+    let watched_label = total_episodes.map_or_else(
+        || format!("✓ {watched} сер."),
+        |total| format!("✓ {watched}/{total} сер."),
+    );
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} {}", anime_status_marker(status), status.label())
+                    .trim_start()
+                    .to_string(),
+                Style::default()
+                    .fg(COLOR_SECONDARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(COLOR_DIM)),
+            Span::styled(watched_label, Style::default().fg(COLOR_TEXT)),
+        ])
+        .alignment(Alignment::Center),
+    ];
+    if let Some(progress) = latest_progress_for_ids(app, anime_ids) {
+        lines.push(
+            Line::from(Span::styled(
+                format!(
+                    "⏱ S{}E{} · {}",
+                    progress.season,
+                    progress.episode,
+                    format_timestamp(progress.timestamp)
+                ),
+                Style::default().fg(COLOR_HIGHLIGHT),
+            ))
+            .alignment(Alignment::Center),
+        );
+    }
+    lines
 }
 
 fn with_right_marker(left: &str, marker: &str, width: usize) -> String {
@@ -1783,32 +2013,6 @@ fn with_right_marker(left: &str, marker: &str, width: usize) -> String {
     let marker_len = marker.chars().count();
     let spaces = width.saturating_sub(left_len + marker_len).max(1);
     format!("{left}{}{marker}", " ".repeat(spaces))
-}
-
-fn latest_progress_for_group<'a>(
-    app: &'a AppState,
-    group: &[usize],
-) -> Option<&'a crate::storage::WatchProgress> {
-    let mut anime_ids = Vec::with_capacity(group.len());
-    for &idx in group {
-        if let Some(item) = app.search_results.get(idx) {
-            anime_ids.push(item.id);
-        }
-    }
-    app.history
-        .progress
-        .values()
-        .filter(|progress| anime_ids.contains(&progress.anime_id))
-        .max_by_key(|progress| progress.updated_at)
-}
-
-fn franchise_is_complete(app: &AppState, group: &[usize]) -> bool {
-    !group.is_empty()
-        && group.iter().all(|&idx| {
-            app.search_results
-                .get(idx)
-                .is_some_and(|item| anime_is_complete(app, item.id))
-        })
 }
 
 fn season_marker_for_search(app: &AppState, season_num: u32) -> Option<&str> {
@@ -1841,25 +2045,6 @@ fn selected_search_anime_id(app: &AppState) -> Option<u32> {
     })
 }
 
-fn anime_is_complete(app: &AppState, anime_id: u32) -> bool {
-    let source_key = app.source_key_for_anime_id(anime_id);
-    let Some(sources) = app.sources_cache.get(&source_key) else {
-        return false;
-    };
-
-    let mut seasons: Vec<u32> = sources
-        .ashdi
-        .iter()
-        .map(|studio| studio.season_number)
-        .collect();
-    seasons.sort();
-    seasons.dedup();
-    !seasons.is_empty()
-        && seasons
-            .into_iter()
-            .all(|season_num| season_is_complete(app, anime_id, season_num))
-}
-
 fn anime_status_for_ids(app: &AppState, anime_ids: &[u32]) -> Option<AnimeStatus> {
     if let Some(status) = anime_ids
         .iter()
@@ -1877,8 +2062,6 @@ fn anime_status_for_ids(app: &AppState, anime_ids: &[u32]) -> Option<AnimeStatus
         .collect::<Vec<_>>();
     if progress.is_empty() {
         None
-    } else if progress.iter().all(|progress| progress.watched) {
-        Some(AnimeStatus::Completed)
     } else {
         Some(AnimeStatus::Watching)
     }
@@ -1896,6 +2079,14 @@ const fn anime_status_marker(status: AnimeStatus) -> &'static str {
 }
 
 fn season_is_complete(app: &AppState, anime_id: u32, season_num: u32) -> bool {
+    if app
+        .history
+        .library
+        .get(&anime_id)
+        .is_some_and(|record| record.status == AnimeStatus::Completed)
+    {
+        return true;
+    }
     let source_key = api::EpisodeSourcesKey::new(anime_id, season_num);
     let Some(sources) = app.sources_cache.get(&source_key) else {
         return false;
@@ -1963,12 +2154,19 @@ fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -
     } else {
         Style::default().fg(COLOR_DIM)
     };
+    let title_style = if is_focused {
+        Style::default()
+            .fg(COLOR_SECONDARY)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_DIM)
+    };
 
     List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
+                .title(Span::styled(title, title_style))
                 .border_style(border_style)
                 .title_alignment(Alignment::Center),
         )
@@ -1981,30 +2179,604 @@ fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -
         .highlight_symbol(">> ")
 }
 
-fn render_settings_placeholder(f: &mut Frame, area: Rect) {
+fn render_settings(f: &mut Frame, app: &AppState, area: Rect) {
+    match app.settings_tab {
+        SettingsTab::General => render_general_settings(f, app, area),
+        SettingsTab::About => render_about_settings(f, app, area),
+    }
+}
+
+fn settings_item(label: &str, value: &str, width: usize) -> ListItem<'static> {
+    let value_width = value.chars().count();
+    let label_width = width.saturating_sub(value_width + 3).max(8);
+    let label = truncate_with_ellipsis(label, label_width);
+    ListItem::new(with_right_marker(&label, value, width))
+}
+
+fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_DIM))
-        .title(" Налаштування ")
-        .title_alignment(Alignment::Center);
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Цей розділ поки в розробці",
-                Style::default()
-                    .fg(COLOR_SECONDARY)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "1 / 2 — перейти до пошуку або бібліотеки",
-                Style::default().fg(COLOR_DIM),
-            )),
-        ])
+        .border_style(Style::default().fg(COLOR_HIGHLIGHT))
+        .title(" Основні ")
+        .title_alignment(Alignment::Center)
+        .padding(Padding::horizontal(2));
+    let inner_width = block.inner(area).width.saturating_sub(4) as usize;
+    let on_off = |enabled| {
+        if enabled {
+            "увімкнено"
+        } else {
+            "вимкнено"
+        }
+    };
+    let threshold = format_threshold_value(app.settings.watched_threshold_percent);
+    let items = vec![
+        settings_item(
+            "Авто-продовження наступної серії",
+            on_off(app.settings.autoplay_next),
+            inner_width,
+        ),
+        settings_item(
+            "Resume з таймкоду",
+            on_off(app.settings.resume_from_timestamp),
+            inner_width,
+        ),
+        settings_item("Позначати переглянутим", &threshold, inner_width),
+        settings_item(
+            "Стартовий екран",
+            app.settings.start_screen.label(),
+            inner_width,
+        ),
+        settings_item(
+            "Фільтр бібліотеки за замовчуванням",
+            app.settings.default_library_filter.label(),
+            inner_width,
+        ),
+        settings_item(
+            "Показувати постери",
+            on_off(app.settings.show_posters),
+            inner_width,
+        ),
+        settings_item("Шлях до mpv", &app.settings.mpv_path, inner_width),
+        settings_item(
+            "Додаткові аргументи mpv",
+            if app.settings.mpv_extra_args.is_empty() {
+                "—"
+            } else {
+                &app.settings.mpv_extra_args
+            },
+            inner_width,
+        ),
+    ];
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(
+        app.settings_selected.min(items.len().saturating_sub(1)),
+    ));
+    let list = List::new(items)
         .block(block)
+        .highlight_symbol(">> ")
+        .highlight_style(
+            Style::default()
+                .bg(COLOR_PRIMARY)
+                .fg(COLOR_TEXT)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(5)])
+        .split(area);
+    let action_width = chunks[0].width.saturating_sub(8) as usize;
+    let actions = vec![
+        settings_item("Тека даних", "", action_width),
+        settings_item("GitHub", "", action_width),
+        settings_item("Перевірити оновлення", "", action_width),
+        settings_item("Очистити бібліотеку", "", action_width),
+    ];
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(app.settings_selected.min(actions.len() - 1)));
+    f.render_stateful_widget(
+        List::new(actions)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Дії ")
+                    .title_alignment(Alignment::Center)
+                    .border_style(Style::default().fg(COLOR_HIGHLIGHT))
+                    .padding(Padding::horizontal(2)),
+            )
+            .highlight_symbol(">> ")
+            .highlight_style(
+                Style::default()
+                    .bg(COLOR_PRIMARY)
+                    .fg(COLOR_TEXT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        chunks[0],
+        &mut state,
+    );
+
+    let diagnostics = vec![
+        Line::from(vec![
+            Span::styled("Версія: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(env!("CARGO_PKG_VERSION"), Style::default().fg(COLOR_TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("GitHub: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                crate::settings::GITHUB_URL,
+                Style::default().fg(COLOR_HIGHLIGHT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("History: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                app.settings_store.history_path().display().to_string(),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Settings: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                app.settings_store.settings_path().display().to_string(),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("mpv: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                if app.mpv_available {
+                    "знайдено"
+                } else {
+                    "не знайдено"
+                },
+                Style::default().fg(if app.mpv_available {
+                    Color::Green
+                } else {
+                    COLOR_ERROR
+                }),
+            ),
+            Span::styled(" · image: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(app.image_protocol.clone(), Style::default().fg(COLOR_TEXT)),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(diagnostics)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Про / шляхи ")
+                    .title_alignment(Alignment::Center)
+                    .border_style(Style::default().fg(COLOR_DIM))
+                    .padding(Padding::horizontal(2)),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        chunks[1],
+    );
+}
+
+fn format_threshold_value(percent: Option<u8>) -> String {
+    match percent {
+        None => "вимкнено".to_string(),
+        Some(value) => format!(
+            "{} {}%",
+            threshold_bar(Some(value), THRESHOLD_BAR_WIDTH),
+            value
+        ),
+    }
+}
+
+fn threshold_bar(percent: Option<u8>, width: usize) -> String {
+    let width = width.max(4);
+    match percent {
+        None => format!("[{}]", "-".repeat(width)),
+        Some(value) => {
+            let filled = ((u16::from(value) * width as u16) / 100).min(width as u16) as usize;
+            format!("[{}{}]", "=".repeat(filled), "-".repeat(width - filled))
+        }
+    }
+}
+
+fn render_settings_choice_popup(f: &mut Frame, app: &AppState) {
+    let Some(editor) = app.settings_choice.as_ref() else {
+        return;
+    };
+    let labels = editor.kind.option_labels();
+    let rows = labels.len() as u16;
+    let height = rows.saturating_add(5).max(8);
+    let actions = [
+        ("↑/↓", "Вибір", COLOR_SECONDARY),
+        ("Enter", "OK", COLOR_HIGHLIGHT),
+        ("Esc", "", COLOR_DIM),
+    ];
+    let min_width = match editor.kind {
+        SettingsChoiceKind::StartScreen => 36,
+        SettingsChoiceKind::LibraryFilter => 40,
+    };
+    let area = centered_fixed(f.area(), dialog_width_for(min_width, &actions), height);
+    let block = dialog_block(editor.kind.title(), COLOR_PRIMARY, COLOR_SECONDARY);
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(rows),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let label_w = labels
+        .iter()
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let selected = index == editor.selected;
+            let radio = if selected { "●" } else { "○" };
+            let style = if selected {
+                Style::default()
+                    .fg(COLOR_TEXT)
+                    .bg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_DIM)
+            };
+            Line::from(Span::styled(
+                format!(" {radio}  {} ", pad_display(label, label_w)),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        layout[1],
+    );
+    f.render_widget(
+        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
+        layout[3],
+    );
+}
+
+fn render_settings_text_popup(f: &mut Frame, app: &AppState) {
+    let Some(kind) = app.settings_input else {
+        return;
+    };
+    let (title, hint) = match kind {
+        SettingsInput::MpvPath => (" Шлях до mpv ", "Порожнє значення скинеться на «mpv»"),
+        SettingsInput::MpvArgs => (" Аргументи mpv ", "Наприклад: --fs --hwdec=auto"),
+    };
+    let actions = [
+        ("Enter", "Зберегти", COLOR_HIGHLIGHT),
+        ("Esc", "", COLOR_DIM),
+    ];
+    let area = centered_fixed(f.area(), dialog_width_for(56, &actions), 10);
+    let block = dialog_block(title, COLOR_HIGHLIGHT, COLOR_SECONDARY);
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(COLOR_DIM)))
+            .alignment(Alignment::Center),
+        layout[0],
+    );
+
+    let value = if app.settings_input_value.is_empty() {
+        " ".to_string()
+    } else {
+        app.settings_input_value.clone()
+    };
+    let field = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_HIGHLIGHT))
+        .style(Style::default().bg(COLOR_BG_TRANSPARENT));
+    let field_inner = field.inner(layout[1]);
+    f.render_widget(field, layout[1]);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            value,
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        field_inner,
+    );
+    #[allow(clippy::cast_possible_truncation)]
+    f.set_cursor_position((
+        field_inner.x + (app.settings_input_cursor as u16).min(field_inner.width.saturating_sub(1)),
+        field_inner.y,
+    ));
+
+    f.render_widget(
+        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
+        layout[3],
+    );
+}
+
+fn render_settings_update_popup(f: &mut Frame, app: &AppState) {
+    let actions_probe = [
+        ("Enter", "Відкрити реліз", COLOR_HIGHLIGHT),
+        ("Esc", "", COLOR_DIM),
+    ];
+    let area = centered_fixed(f.area(), dialog_width_for(44, &actions_probe), 11);
+    let block = dialog_block(" Оновлення ", COLOR_PRIMARY, COLOR_SECONDARY);
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("Поточна версія: {}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(COLOR_DIM),
+        ))
         .alignment(Alignment::Center),
-        area,
+        layout[0],
+    );
+
+    let (body, actions): (Vec<Line>, Vec<(&str, &str, Color)>) = match &app.update_state {
+        UpdateState::Checking | UpdateState::Idle => (
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Перевіряємо оновлення…",
+                    Style::default()
+                        .fg(COLOR_SECONDARY)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ],
+            vec![("Esc", "", COLOR_DIM)],
+        ),
+        UpdateState::Current(version) => (
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "У вас актуальна версія",
+                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    version.clone(),
+                    Style::default().fg(COLOR_SECONDARY),
+                )),
+            ],
+            vec![("Enter", "Ще раз", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)],
+        ),
+        UpdateState::Available(update) => (
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Доступна нова версія",
+                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    update.latest_version.clone(),
+                    Style::default()
+                        .fg(COLOR_SECONDARY)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ],
+            vec![("Enter", "Реліз", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)],
+        ),
+        UpdateState::Failed(error) => (
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Не вдалося перевірити",
+                    Style::default()
+                        .fg(COLOR_ERROR)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    truncate_middle(error, 42),
+                    Style::default().fg(COLOR_DIM),
+                )),
+            ],
+            vec![("Enter", "Ще раз", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)],
+        ),
+    };
+
+    f.render_widget(Paragraph::new(body).alignment(Alignment::Center), layout[1]);
+    f.render_widget(
+        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
+        layout[3],
+    );
+}
+
+fn render_settings_threshold_popup(f: &mut Frame, app: &AppState) {
+    let Some(editor) = app.settings_threshold.as_ref() else {
+        return;
+    };
+    let actions = [("Enter", "OK", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)];
+    let area = centered_fixed(f.area(), dialog_width_for(46, &actions), 11);
+    let block = dialog_block(" Позначати переглянутим ", COLOR_PRIMARY, COLOR_SECONDARY);
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Поріг прогресу серії",
+            Style::default().fg(COLOR_DIM),
+        ))
+        .alignment(Alignment::Center),
+        layout[0],
+    );
+
+    let bar = threshold_bar(editor.percent, THRESHOLD_BAR_WIDTH);
+    let value = match editor.percent {
+        Some(p) => format!("{bar}  {p}%"),
+        None => format!("{bar}  вимкнено"),
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            value,
+            Style::default()
+                .fg(if editor.percent.is_some() {
+                    COLOR_SECONDARY
+                } else {
+                    COLOR_DIM
+                })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        layout[2],
+    );
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            if editor.percent.is_some() {
+                "←/→ крок 5%   Space — вимкнути"
+            } else {
+                "Space — увімкнути   ←/→ — виставити"
+            },
+            Style::default().fg(COLOR_DIM),
+        ))
+        .alignment(Alignment::Center),
+        layout[3],
+    );
+
+    f.render_widget(
+        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
+        layout[5],
+    );
+}
+
+fn render_moonanime_popup(f: &mut Frame, episode_title: &str) {
+    let body = vec![
+        Line::from(Span::styled(
+            truncate_middle(episode_title, 44),
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Епізод відкриється в браузері",
+            Style::default().fg(COLOR_DIM),
+        )),
+        Line::from(Span::styled(
+            "(MoonAnime embed)",
+            Style::default().fg(COLOR_DIM),
+        )),
+    ];
+    render_confirm_dialog(
+        f,
+        " MoonAnime ",
+        COLOR_HIGHLIGHT,
+        &body,
+        &[
+            ("Enter", "Відкрити", COLOR_HIGHLIGHT),
+            ("Esc", "", COLOR_DIM),
+        ],
+        48,
+        9,
+    );
+}
+
+fn render_delete_popup(f: &mut Frame, anime_title: &str) {
+    let body = vec![
+        Line::from(Span::styled(
+            "Видалити весь прогрес для",
+            Style::default().fg(COLOR_DIM),
+        )),
+        Line::from(Span::styled(
+            truncate_middle(anime_title, 42),
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Цю дію не можна скасувати.",
+            Style::default().fg(COLOR_ERROR),
+        )),
+    ];
+    render_confirm_dialog(
+        f,
+        " Підтвердження ",
+        COLOR_ERROR,
+        &body,
+        &[("Enter", "Видалити", COLOR_ERROR), ("Esc", "", COLOR_DIM)],
+        46,
+        9,
+    );
+}
+
+fn render_clear_library_popup(f: &mut Frame) {
+    let body = vec![
+        Line::from(Span::styled(
+            "Очистити всю бібліотеку?",
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Статуси, переглянуті серії та таймкоди буде видалено.",
+            Style::default().fg(COLOR_ERROR),
+        )),
+    ];
+    render_confirm_dialog(
+        f,
+        " Очистити бібліотеку ",
+        COLOR_ERROR,
+        &body,
+        &[("Enter", "Очистити", COLOR_ERROR), ("Esc", "", COLOR_DIM)],
+        58,
+        8,
+    );
+}
+
+fn render_error_popup(f: &mut Frame, message: &str) {
+    let chunks = wrap_text(message, 46);
+    let mut body = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        body.push(Line::from(Span::styled(
+            chunk,
+            Style::default().fg(COLOR_TEXT),
+        )));
+    }
+    let height = (body.len() as u16).saturating_add(4).clamp(6, 12);
+    render_confirm_dialog(
+        f,
+        " Помилка ",
+        COLOR_ERROR,
+        &body,
+        &[("Esc", "", COLOR_DIM)],
+        50,
+        height,
     );
 }
 
@@ -2012,185 +2784,290 @@ fn render_status_editor_popup(f: &mut Frame, app: &AppState) {
     let Some(editor) = app.status_editor.as_ref() else {
         return;
     };
-    let area = centered_rect(42, 55, f.area());
+    let actions = [
+        ("↑/↓", "Вибір", COLOR_SECONDARY),
+        ("Enter", "OK", COLOR_HIGHLIGHT),
+        ("Esc", "", COLOR_DIM),
+    ];
+    let area = centered_fixed(f.area(), dialog_width_for(40, &actions), 13);
+    let block = dialog_block(" Статус аніме ", COLOR_PRIMARY, COLOR_SECONDARY);
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(Span::styled(
-            " Статус аніме ",
-            Style::default()
-                .fg(COLOR_SECONDARY)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .title_alignment(Alignment::Center)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_PRIMARY));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
-            Constraint::Min(6),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(inner);
+
     f.render_widget(
-        Paragraph::new(editor.title.as_str())
+        Paragraph::new(truncate_middle(&editor.title, 42))
             .alignment(Alignment::Center)
-            .style(Style::default().fg(COLOR_TEXT)),
+            .style(Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)),
         rows[0],
     );
-    let items = AnimeStatus::ALL
+    // rows[1] = breathing room under the title
+
+    // Fixed-width labels so radio circles share one vertical column when centered.
+    let label_w = AnimeStatus::ALL
+        .iter()
+        .map(|status| status.label().chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines = AnimeStatus::ALL
         .iter()
         .enumerate()
         .map(|(index, status)| {
-            let radio = if index == editor.selected {
-                "●"
+            let selected = index == editor.selected;
+            let radio = if selected { "●" } else { "○" };
+            let label = pad_display(status.label(), label_w);
+            let style = if selected {
+                Style::default()
+                    .fg(COLOR_TEXT)
+                    .bg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                "○"
+                Style::default().fg(COLOR_DIM)
             };
-            ListItem::new(format!(" {}  {}", radio, status.label()))
+            // Leading space + radio so the marker isn't glued to the left edge.
+            Line::from(Span::styled(format!(" {radio}  {label}"), style))
         })
         .collect::<Vec<_>>();
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(editor.selected));
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .fg(COLOR_TEXT)
-            .bg(COLOR_PRIMARY)
-            .add_modifier(Modifier::BOLD),
-    );
-    f.render_stateful_widget(list, rows[1], &mut state);
-    f.render_widget(
-        Paragraph::new("↑/↓ Вибір   Enter Зберегти   Esc Скасувати")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(COLOR_DIM)),
-        rows[2],
-    );
-}
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rows[2]);
+    // rows[3] = breathing room above the footer
 
-fn render_popup(f: &mut Frame, title: &str, msg: &str, color: Color) {
-    let block = Block::default()
-        .title(Span::styled(
-            format!(" {} ", title),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color));
-    let area = centered_rect(44, 28, f.area());
-    f.render_widget(Clear, area);
-    let text = Paragraph::new(msg)
-        .block(block)
-        .alignment(Alignment::Center)
-        .wrap(ratatui::widgets::Wrap { trim: true });
-    f.render_widget(text, area);
+    f.render_widget(
+        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
+        rows[4],
+    );
 }
 
 fn render_help_popup(f: &mut Frame) {
-    let title = " Довідка (Гарячі клавіші) ";
-    let block = Block::default()
-        .title(Span::styled(
-            title,
+    let area = centered_fixed(f.area(), 68, 16);
+    let block = dialog_block(" Довідка ", COLOR_PRIMARY, COLOR_PRIMARY);
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(body[0]);
+
+    let section = |label: &'static str| {
+        Line::from(Span::styled(
+            format!(" {label} "),
             Style::default()
-                .fg(COLOR_PRIMARY)
+                .bg(COLOR_SECONDARY)
+                .fg(COLOR_BG_DARK)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |key: &'static str, desc: &'static str| {
+        Line::from(vec![
+            Span::styled(format!(" {key:<10}"), Style::default().fg(COLOR_SECONDARY)),
+            Span::styled(desc, Style::default().fg(COLOR_TEXT)),
+        ])
+    };
+
+    let left_col = vec![
+        section("Глобальні"),
+        row("1/2/3", "Вкладки"),
+        row("Alt+1/2/3", "Вкладки в пошуку"),
+        row("/", "Пошук у вкладці"),
+        row("? / h", "Довідка"),
+        row("q", "Вийти"),
+        row("Ctrl+C", "Вийти будь-де"),
+        Line::from(""),
+        section("Навігація"),
+        row("↑↓ j k", "Список"),
+        row("PgUp/Dn", "Сторінка"),
+        row("→ Enter", "Вперед"),
+        row("← Esc", "Назад"),
+    ];
+    let right_col = vec![
+        section("Дії"),
+        row("Enter", "Відтворити (mpv)"),
+        row("c", "Продовжити"),
+        row("e", "Статус аніме"),
+        row("Space", "Переглянуто"),
+        row("Backsp.", "Очистити таймкод"),
+        row("d", "Видалити прогрес"),
+        row("o", "У браузері"),
+        row("Tab", "Категорія"),
+    ];
+
+    f.render_widget(Paragraph::new(left_col), columns[0]);
+    f.render_widget(Paragraph::new(right_col), columns[1]);
+    f.render_widget(
+        Paragraph::new(action_footer_line(&[("Esc", "", COLOR_DIM)])).alignment(Alignment::Center),
+        body[1],
+    );
+}
+
+/// Shared confirm/info dialog with centered body and key-action footer.
+fn render_confirm_dialog(
+    f: &mut Frame,
+    title: &str,
+    accent: Color,
+    body: &[Line<'static>],
+    actions: &[(&str, &str, Color)],
+    width: u16,
+    height: u16,
+) {
+    let area = centered_fixed(f.area(), dialog_width_for(width, actions), height);
+    let block = dialog_block(title, accent, accent);
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(body.to_vec())
+            .alignment(Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(action_footer_line(actions)).alignment(Alignment::Center),
+        rows[1],
+    );
+}
+
+fn dialog_block(title: &str, border: Color, title_color: Color) -> Block<'_> {
+    Block::default()
+        .title(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(title_color)
                 .add_modifier(Modifier::BOLD),
         ))
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_PRIMARY))
-        .bg(COLOR_BG_DARK);
-
-    let area = centered_rect(65, 55, f.area());
-    f.render_widget(Clear, area);
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .margin(1)
-        .split(inner_area);
-
-    let left_col = vec![
-        Line::from(vec![Span::styled(
-            " Глобальні ",
-            Style::default()
-                .bg(COLOR_SECONDARY)
-                .fg(COLOR_BG_DARK)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  1/2/3  — Пошук/Бібліотека/Налаштування"),
-        Line::from("  /      — Редагувати пошук"),
-        Line::from("  ? / h  — Довідка"),
-        Line::from("  q      — Вийти"),
-        Line::from("  Ctrl+C — Вийти будь-де"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            " Навігація ",
-            Style::default()
-                .bg(COLOR_SECONDARY)
-                .fg(COLOR_BG_DARK)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  ↑ / ↓  — Список"),
-        Line::from("  j / k  — Список"),
-        Line::from("  PgUp/Dn— Сторінка"),
-        Line::from("  Home/End— Початок/кінець"),
-        Line::from("  → / ↵  — Вперед"),
-        Line::from("  ← / Esc— Назад"),
-    ];
-
-    let right_col = vec![
-        Line::from(vec![Span::styled(
-            " Дії з аніме ",
-            Style::default()
-                .bg(COLOR_SECONDARY)
-                .fg(COLOR_BG_DARK)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  Enter  — Відтворити (mpv)"),
-        Line::from("  c      — Продовжити"),
-        Line::from("  e      — Статус аніме"),
-        Line::from("  Space  — Переглянуто"),
-        Line::from("  Backsp.— Очистити таймкод"),
-        Line::from("  d      — Видалити прогрес"),
-        Line::from("  o      — Відкрити в браузері"),
-        Line::from("  Tab/⇧Tab— Категорія бібліотеки"),
-    ];
-
-    f.render_widget(Paragraph::new(left_col), chunks[0]);
-    f.render_widget(Paragraph::new(right_col), chunks[1]);
-
-    // Footer hint centered at the bottom of the popup
-    let footer_area = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            " Натисніть будь-яку клавішу щоб закрити ",
-            Style::default().fg(COLOR_DIM),
-        ))
-        .alignment(Alignment::Center),
-        footer_area,
-    );
+        .border_style(Style::default().fg(border))
+        // Transparent fill so the terminal/app behind shows through (legacy look).
+        .style(Style::default().bg(COLOR_BG_TRANSPARENT))
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
+fn action_footer_line(actions: &[(&str, &str, Color)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (key, label, color)) in actions.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(COLOR_DIM)));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default().fg(*color).add_modifier(Modifier::BOLD),
+        ));
+        if !label.is_empty() {
+            spans.push(Span::styled(
+                format!(" {label}"),
+                Style::default().fg(COLOR_DIM),
+            ));
+        }
+    }
+    Line::from(spans)
+}
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+/// Visible character width of a footer (must fit inside dialog inner width).
+fn action_footer_width(actions: &[(&str, &str, Color)]) -> u16 {
+    let mut width = 0usize;
+    for (i, (key, label, _)) in actions.iter().enumerate() {
+        if i > 0 {
+            width += 3; // " · "
+        }
+        width += key.chars().count();
+        if !label.is_empty() {
+            width += 1 + label.chars().count();
+        }
+    }
+    width as u16
+}
+
+/// Dialog outer width that fits borders + footer with a little padding.
+fn dialog_width_for(min_width: u16, actions: &[(&str, &str, Color)]) -> u16 {
+    // borders (2) + 2 cells slack so centered text never clips on the last glyph
+    min_width.max(action_footer_width(actions).saturating_add(6))
+}
+
+/// Pixel-accurate centered rect with fixed width/height, clamped to the frame.
+fn centered_fixed(frame: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(frame.width.saturating_sub(2)).max(20);
+    let height = height.min(frame.height.saturating_sub(2)).max(5);
+    let x = frame.x + frame.width.saturating_sub(width) / 2;
+    let y = frame.y + frame.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars || max_chars < 5 {
+        return text.chars().take(max_chars).collect();
+    }
+    let keep = max_chars.saturating_sub(1) / 2;
+    let left: String = text.chars().take(keep).collect();
+    let right: String = text
+        .chars()
+        .rev()
+        .take(max_chars.saturating_sub(keep + 1))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{left}…{right}")
+}
+
+/// Right-pad a display string to `width` Unicode scalar values.
+fn pad_display(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count >= width {
+        text.chars().take(width).collect()
+    } else {
+        format!("{text}{}", " ".repeat(width - count))
+    }
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current = word.to_string();
+            continue;
+        }
+        if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn release_label(catalog: &api::FranchiseCatalog, release: &api::ReleaseEntry) -> String {
@@ -2235,13 +3112,7 @@ fn release_list_item(
     release: &api::ReleaseEntry,
     width: usize,
 ) -> ListItem<'static> {
-    let mut lines = Vec::new();
     let unavailable = release.availability == api::ReleaseAvailability::Unavailable;
-    lines.push(Line::from(with_right_marker(
-        &release_label(catalog, release),
-        if unavailable { "×" } else { "" },
-        width,
-    )));
     let mut metadata = Vec::new();
     if let Some(year) = release.year {
         metadata.push(year.to_string());
@@ -2257,18 +3128,16 @@ fn release_list_item(
         metadata.push(format!("{} сер.", episodes));
     }
     if unavailable {
-        metadata.push("недоступно на AniHub".to_string());
+        metadata.push("⚠ недоступно".to_string());
     }
-    if !metadata.is_empty() {
-        lines.push(Line::from(Span::styled(
-            metadata.join(" · "),
-            Style::default().fg(COLOR_DIM),
-        )));
-    }
-
-    let item = ListItem::new(lines);
+    let label = label_with_metadata(&release_label(catalog, release), &metadata);
+    let item = ListItem::new(truncate_with_ellipsis(&label, width));
     if unavailable {
-        item.style(Style::default().fg(COLOR_DIM))
+        item.style(
+            Style::default()
+                .fg(COLOR_ERROR)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         item
     }
@@ -2286,18 +3155,18 @@ fn release_catalog_items(
         let is_extra = release.classification == api::ReleaseClassification::Extra;
         if previous_extra != Some(is_extra) {
             let label = if is_extra {
-                "── ДОДАТКОВО ──"
+                "ДОДАТКОВО"
             } else {
-                "── ОСНОВНА ІСТОРІЯ ──"
+                "ОСНОВНА ІСТОРІЯ"
             };
             items.push(
                 ListItem::new(Line::from(Span::styled(
-                    label,
+                    release_section_line(label, width),
                     Style::default()
                         .fg(COLOR_PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 )))
-                .style(Style::default().bg(COLOR_BG_DARK)),
+                .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
             );
             previous_extra = Some(is_extra);
         }
@@ -2308,44 +3177,22 @@ fn release_catalog_items(
     (items, release_rows)
 }
 
-fn catalog_summary(catalog: &api::FranchiseCatalog) -> Option<String> {
-    if catalog.releases.is_empty() {
-        return None;
+fn release_section_line(label: &str, width: usize) -> String {
+    let label = format!(" {label} ");
+    let label_width = label.chars().count();
+    if width <= label_width {
+        return label.chars().take(width).collect();
     }
-    let mut seasons = Vec::new();
-    let mut season_releases = 0usize;
-    let mut movies = 0usize;
-    let mut extras = 0usize;
-    for release in &catalog.releases {
-        match release.classification {
-            api::ReleaseClassification::MainlineSeason => {
-                season_releases += 1;
-                if let Some(season) = release.conceptual_season {
-                    if !seasons.contains(&season) {
-                        seasons.push(season);
-                    }
-                }
-            }
-            api::ReleaseClassification::MainlineMovie => movies += 1,
-            api::ReleaseClassification::MainlineSpecial | api::ReleaseClassification::Extra => {
-                extras += 1
-            }
-        }
-    }
-    let mut parts = Vec::new();
-    if !seasons.is_empty() {
-        parts.push(format!("{} сез.", seasons.len()));
-    }
-    if season_releases > seasons.len() {
-        parts.push(format!("{} част.", season_releases));
-    }
-    if movies > 0 {
-        parts.push(format!("{} фільм.", movies));
-    }
-    if extras > 0 {
-        parts.push(format!("{} дод.", extras));
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+
+    let fill_width = width - label_width;
+    let left_width = fill_width / 2;
+    let right_width = fill_width - left_width;
+    format!(
+        "{}{}{}",
+        "─".repeat(left_width),
+        label,
+        "─".repeat(right_width)
+    )
 }
 
 fn selected_release_for_sidebar(app: &AppState) -> Option<&api::ReleaseEntry> {
@@ -2481,40 +3328,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_summary_separates_seasons_movies_and_extras() {
-        let mut releases = vec![release(
-            "Season",
-            Some(1),
-            Some(1),
-            api::ReleaseClassification::MainlineSeason,
-        )];
-        releases.push(release(
-            "Movie",
-            None,
-            None,
-            api::ReleaseClassification::MainlineMovie,
-        ));
-        releases.push(release(
-            "OVA",
-            None,
-            None,
-            api::ReleaseClassification::Extra,
-        ));
-        let catalog = api::FranchiseCatalog {
-            anchor_anilist_id: Some(10),
-            canonical_title: "Test".to_string(),
-            canonical_poster_url: None,
-            unresolved_anilist_ids: Vec::new(),
-            releases,
-        };
-
-        assert_eq!(
-            catalog_summary(&catalog).as_deref(),
-            Some("1 сез. · 1 фільм. · 1 дод.")
-        );
-    }
-
-    #[test]
     fn release_sections_are_separate_non_release_rows() {
         let catalog = api::FranchiseCatalog {
             anchor_anilist_id: Some(10),
@@ -2542,5 +3355,43 @@ mod tests {
 
         assert_eq!(rows.len(), 5);
         assert_eq!(release_rows, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn release_section_line_centers_label_and_fills_available_width() {
+        assert_eq!(release_section_line("TEST", 12), "─── TEST ───");
+        assert_eq!(release_section_line("TEST", 13), "─── TEST ────");
+        assert_eq!(release_section_line("TEST", 4), " TES");
+    }
+
+    #[test]
+    fn compact_labels_use_brackets_and_ukrainian_season_pluralization() {
+        assert_eq!(season_count_label(1), "1 сезон");
+        assert_eq!(season_count_label(2), "2 сезони");
+        assert_eq!(season_count_label(5), "5 сезонів");
+        assert_eq!(season_count_label(12), "12 сезонів");
+        assert_eq!(
+            label_with_metadata(
+                "Клас убивць",
+                &[season_count_label(2), "22 сер.".to_string()]
+            ),
+            "Клас убивць [2 сезони · 22 сер.]"
+        );
+    }
+
+    #[test]
+    fn sidebar_polish_truncates_titles_and_limits_genres() {
+        assert_eq!(truncate_with_ellipsis("Клас убивць", 8), "Клас уб…");
+        assert_eq!(truncate_with_ellipsis("Клас", 8), "Клас");
+        assert_eq!(
+            summarized_genres(&[
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+                "E".to_string(),
+            ]),
+            "A · B · C · D · +1"
+        );
     }
 }
