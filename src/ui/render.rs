@@ -43,7 +43,7 @@ const fn palette_for(theme: ThemePreset) -> ThemePalette {
         ThemePreset::Violet => ThemePalette {
             primary: Color::Magenta,
             secondary: Color::LightMagenta,
-            highlight: Color::Blue,
+            highlight: Color::LightBlue,
             error: Color::LightRed,
             dim: Color::DarkGray,
             text: Color::White,
@@ -70,10 +70,30 @@ const fn palette_for(theme: ThemePreset) -> ThemePalette {
             on_primary: Color::Black,
             dark: Color::Black,
         },
+        ThemePreset::Sakura => ThemePalette {
+            primary: Color::LightMagenta,
+            secondary: Color::LightRed,
+            highlight: Color::Magenta,
+            error: Color::Red,
+            dim: Color::DarkGray,
+            text: Color::White,
+            on_primary: Color::Black,
+            dark: Color::Black,
+        },
+        ThemePreset::Matrix => ThemePalette {
+            primary: Color::Green,
+            secondary: Color::LightGreen,
+            highlight: Color::LightGreen,
+            error: Color::LightRed,
+            dim: Color::DarkGray,
+            text: Color::White,
+            on_primary: Color::Black,
+            dark: Color::Black,
+        },
         ThemePreset::Monochrome => ThemePalette {
             primary: Color::White,
             secondary: Color::Gray,
-            highlight: Color::LightCyan,
+            highlight: Color::White,
             error: Color::LightRed,
             dim: Color::DarkGray,
             text: Color::White,
@@ -2458,7 +2478,7 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
 fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(5)])
+        .constraints([Constraint::Length(9), Constraint::Min(5)])
         .split(area);
     let mut items = vec![ListItem::new(Line::from(vec![
         Span::styled(
@@ -2517,10 +2537,16 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
         &mut state,
     );
 
-    let preview_palette = if app.settings.ansi_themes {
-        palette_for(app.settings.theme)
+    let hovered_theme = selected_theme_preview(app.settings_selected);
+    let (preview_palette, preview_label) = if let Some(theme) = hovered_theme {
+        (palette_for(theme), format!("{} · ANSI", theme.label()))
+    } else if app.settings.ansi_themes {
+        (
+            palette_for(app.settings.theme),
+            format!("{} · ANSI", app.settings.theme.label()),
+        )
     } else {
-        ANIHUB_PALETTE
+        (ANIHUB_PALETTE, "AniHub · RGB".to_string())
     };
     let preview = vec![
         Line::from(vec![
@@ -2559,20 +2585,19 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
         Paragraph::new(preview).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    " Попередній перегляд · {} ",
-                    if app.settings.ansi_themes {
-                        format!("{} · ANSI", app.settings.theme.label())
-                    } else {
-                        "AniHub · RGB".to_string()
-                    }
-                ))
+                .title(format!(" Попередній перегляд · {preview_label} "))
                 .title_alignment(Alignment::Center)
                 .border_style(Style::default().fg(color_dim()))
                 .padding(Padding::horizontal(2)),
         ),
         chunks[1],
     );
+}
+
+fn selected_theme_preview(selected_row: usize) -> Option<ThemePreset> {
+    selected_row
+        .checked_sub(1)
+        .and_then(|index| ThemePreset::ALL.get(index).copied())
 }
 
 fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
@@ -3686,6 +3711,15 @@ mod tests {
                 assert!(!matches!(color, Color::Rgb(_, _, _)));
             }
         }
+    }
+
+    #[test]
+    fn theme_preview_follows_the_highlighted_row_before_apply() {
+        assert_eq!(selected_theme_preview(0), None);
+        assert_eq!(selected_theme_preview(1), Some(ThemePreset::Violet));
+        assert_eq!(selected_theme_preview(4), Some(ThemePreset::Sakura));
+        assert_eq!(selected_theme_preview(6), Some(ThemePreset::Monochrome));
+        assert_eq!(selected_theme_preview(7), None);
     }
 
     fn release(

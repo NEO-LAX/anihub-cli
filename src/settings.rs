@@ -35,18 +35,29 @@ pub enum ThemePreset {
     Violet,
     Ocean,
     Amber,
+    Sakura,
+    Matrix,
     Monochrome,
 }
 
 impl ThemePreset {
-    pub const ALL: [Self; 4] = [Self::Violet, Self::Ocean, Self::Amber, Self::Monochrome];
+    pub const ALL: [Self; 6] = [
+        Self::Violet,
+        Self::Ocean,
+        Self::Amber,
+        Self::Sakura,
+        Self::Matrix,
+        Self::Monochrome,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Violet => "Фіолетова",
+            Self::Violet => "Неон",
             Self::Ocean => "Океан",
             Self::Amber => "Бурштин",
-            Self::Monochrome => "Монохром",
+            Self::Sakura => "Сакура",
+            Self::Matrix => "Матриця",
+            Self::Monochrome => "Моно",
         }
     }
 }

@@ -6,7 +6,7 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 
 ## Unreleased
 
-- The original AniHub RGB theme remains the default, with an opt-in ANSI mode offering Violet, Ocean, Amber, and Monochrome palettes.
+- The original AniHub RGB theme remains the default, with an opt-in ANSI mode offering Neon, Ocean, Amber, Sakura, Matrix, and Mono palettes with live keyboard preview.
 - Optional Discord Rich Presence for mpv/Ashdi playback, including title, season, episode, dubbing studio, elapsed time, and poster artwork.
 - Persistent 150 MiB poster cache with offline fallback, automatic pruning, corruption recovery, and an explicit clear action in Settings.
 
