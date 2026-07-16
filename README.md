@@ -4,6 +4,12 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 
 ![AniHub CLI demo](assets/demo.gif)
 
+## Unreleased
+
+- Four switchable terminal-native ANSI themes: Violet, Ocean, Amber, and Monochrome.
+- Optional Discord Rich Presence for mpv/Ashdi playback, including title, season, episode, dubbing studio, elapsed time, and poster artwork.
+- Persistent 150 MiB poster cache with offline fallback, automatic pruning, corruption recovery, and an explicit clear action in Settings.
+
 ## What's new in v0.6.0
 
 - Persistent **Settings** (General / About): autoplay, resume, watched threshold slider, startup screen, library filter, posters, custom `mpv` path/args.
@@ -26,6 +32,7 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 - Filter the library by Watching, Planned, Completed, On Hold, Dropped, or the complete collection.
 - Show the active title, season, episode, dubbing studio, position, and duration while playback is running.
 - Render posters in terminals supported by `ratatui-image` and provide a Ukrainian interface.
+- Publish the current mpv/Ashdi episode to Discord Rich Presence when the user explicitly enables it.
 
 The application depends on the live AniHub/API and streaming pages. Search and stream availability can change when those services change.
 
@@ -143,13 +150,30 @@ While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and
 
 ### Settings
 
-Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` to switch General/About, `Up`/`Down` to select a row, and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
+Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). Themes use only terminal ANSI colors, so they respect the terminal palette instead of assuming true-color support. Text values for the Discord Application ID, `mpv` path, and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
+
+### Discord Rich Presence
+
+Discord integration is opt-in and only describes playback owned by AniHub CLI through mpv/Ashdi. Browser-only MoonAnime episodes are intentionally excluded because the CLI cannot reliably observe browser pause, progress, or completion.
+
+1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
+2. Copy its numeric **Application ID**. This ID is public; never paste a bot token or client secret into AniHub CLI.
+3. Open **Settings → General**, enter the Application ID, and enable **Discord Rich Presence**.
+4. Keep the Discord desktop client running with activity sharing enabled.
+
+The IPC connection runs on a background thread, reconnects when Discord starts later, and never blocks the TUI. Closing playback or AniHub CLI clears the activity. Discord web/mobile clients cannot receive local Rich Presence updates.
 
 ## Metadata cache
 
 Successful searches are stored in `metadata-cache.json` together with the AniList relationship graph used to reconstruct seasons, cours, films, and extras. Release details are cached by AniHub ID. On a repeated search the disk snapshot is rendered immediately, while AniHub/AniList are refreshed in the background. If that refresh fails, the cached result remains usable. Details are considered fresh for 24 hours; entries older than 30 days are pruned, and the cache is bounded to 64 searches and 500 detail records.
 
 The cache never contains watch history, library statuses, M3U8 URLs, MoonAnime iframe URLs, or authentication data. Deleting `metadata-cache.json` only makes the next lookup slower; `history.json` and `settings.json` remain untouched. Corrupt cache files are preserved with a `.corrupt-*` suffix and rebuilt automatically.
+
+## Poster cache
+
+Downloaded poster response bytes are stored under the `posters` directory beside `history.json`. A repeat visit decodes the local file before attempting the network, so cached metadata and artwork remain useful during a temporary outage. The cache is limited to 150 MiB and prunes the oldest files automatically. A corrupt image is deleted and fetched again without affecting history or settings.
+
+Use **Settings → About → Clear poster cache** to remove it. Clearing the poster cache never removes library progress, statuses, settings, or the metadata relationship cache.
 
 ## History and recovery
 
@@ -184,6 +208,7 @@ If no valid backup exists, keep the corrupt files for manual JSON recovery befor
 - The installer reports an unsupported platform: release installation currently supports only Linux x86_64 and macOS x86_64/arm64. Windows uses the downloadable release asset.
 - Search returns no entries: verify network access and remember that the client filters API results to entries with Ukrainian dubbing.
 - Images are missing: use a terminal with image protocol support or continue using the text interface; playback and history do not depend on poster rendering.
+- Discord status is missing: use the desktop Discord client, enable activity sharing, and verify that Settings contains a numeric Application ID. Browser/mobile Discord cannot receive local IPC updates.
 - A source page or API is unavailable: the client cannot repair upstream outages or changes to AniHub, AniList, or Ashdi.
 
 ## Build from source

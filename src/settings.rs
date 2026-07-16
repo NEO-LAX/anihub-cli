@@ -28,6 +28,29 @@ pub enum SearchMode {
     Extended,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreset {
+    #[default]
+    Violet,
+    Ocean,
+    Amber,
+    Monochrome,
+}
+
+impl ThemePreset {
+    pub const ALL: [Self; 4] = [Self::Violet, Self::Ocean, Self::Amber, Self::Monochrome];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Violet => "Фіолетова",
+            Self::Ocean => "Океан",
+            Self::Amber => "Бурштин",
+            Self::Monochrome => "Монохром",
+        }
+    }
+}
+
 impl SearchMode {
     pub const fn label(self) -> &'static str {
         match self {
@@ -119,6 +142,9 @@ pub struct Settings {
     pub start_screen: StartScreen,
     pub default_library_filter: DefaultLibraryFilter,
     pub show_posters: bool,
+    pub theme: ThemePreset,
+    pub discord_presence: bool,
+    pub discord_application_id: String,
     pub mpv_path: String,
     pub mpv_extra_args: String,
 }
@@ -134,6 +160,9 @@ impl Default for Settings {
             start_screen: StartScreen::Search,
             default_library_filter: DefaultLibraryFilter::All,
             show_posters: true,
+            theme: ThemePreset::Violet,
+            discord_presence: false,
+            discord_application_id: String::new(),
             mpv_path: "mpv".to_string(),
             mpv_extra_args: String::new(),
         }
@@ -227,6 +256,10 @@ impl SettingsStore {
     pub fn history_path(&self) -> PathBuf {
         self.data_dir.join("history.json")
     }
+
+    pub fn poster_cache_dir(&self) -> PathBuf {
+        self.data_dir.join("posters")
+    }
 }
 
 pub fn mpv_is_available(path: &str) -> bool {
@@ -293,6 +326,9 @@ mod tests {
         assert!(settings.resume_from_timestamp);
         assert_eq!(settings.watched_threshold_percent, Some(90));
         assert_eq!(settings.search_mode, SearchMode::Strict);
+        assert_eq!(settings.theme, ThemePreset::Violet);
+        assert!(!settings.discord_presence);
+        assert!(settings.discord_application_id.is_empty());
         assert_eq!(settings.mpv_path, "mpv");
     }
 
@@ -308,6 +344,20 @@ mod tests {
         value.as_object_mut().unwrap().remove("search_mode");
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert_eq!(settings.search_mode, SearchMode::Strict);
+    }
+
+    #[test]
+    fn older_settings_keep_theme_and_discord_defaults() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("theme");
+        object.remove("discord_presence");
+        object.remove("discord_application_id");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.theme, ThemePreset::Violet);
+        assert!(!settings.discord_presence);
+        assert!(settings.discord_application_id.is_empty());
     }
 
     #[test]

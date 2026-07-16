@@ -115,7 +115,7 @@ pub enum ResourceValue {
     AniHubId(Option<u32>),
     Details(AnimeDetails),
     Sources(EpisodeSourcesResponse),
-    Poster(DynamicImage),
+    Poster { image: DynamicImage, bytes: Vec<u8> },
 }
 
 #[derive(Debug, Clone)]
@@ -750,7 +750,7 @@ async fn load_once(api_client: &ApiClient, work: &Work) -> Result<ResourceValue,
         ResourceKey::Poster(url) => api_client
             .fetch_poster(url)
             .await
-            .map(ResourceValue::Poster)
+            .map(|(image, bytes)| ResourceValue::Poster { image, bytes })
             .map_err(classify_error),
     }
 }

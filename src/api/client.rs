@@ -501,7 +501,7 @@ impl ApiClient {
         Ok(media_by_id.into_values().collect())
     }
 
-    pub async fn fetch_poster(&self, url: &str) -> Result<image::DynamicImage> {
+    pub async fn fetch_poster(&self, url: &str) -> Result<(image::DynamicImage, Vec<u8>)> {
         let response = self
             .send_request(self.client.get(url), "AniHub poster request")
             .await
@@ -512,14 +512,15 @@ impl ApiClient {
             .await
             .map_err(|source| request_error("AniHub poster body", source))
             .context("Failed to read poster response")?;
-        image::load_from_memory(&bytes)
+        let image = image::load_from_memory(&bytes)
             .map_err(|source| {
                 anyhow::Error::new(ApiError::Decode {
                     operation: "AniHub poster".to_string(),
                     message: source.to_string(),
                 })
             })
-            .context("Failed to decode poster image")
+            .context("Failed to decode poster image")?;
+        Ok((image, bytes.to_vec()))
     }
 
     /// Load one AniHub release using the franchise-level season expected by

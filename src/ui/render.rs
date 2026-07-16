@@ -8,22 +8,114 @@ use ratatui::{
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 
 use crate::api;
+use crate::settings::ThemePreset;
 use crate::storage::{AnimeStatus, LibraryReleaseKind};
 use crate::ui::app::{
     AppMode, AppState, FocusPanel, LibraryFilter, PrimaryTab, SettingsChoiceKind, SettingsInput,
     SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
 };
 
-const COLOR_PRIMARY: Color = Color::Rgb(147, 51, 234);
-const COLOR_SECONDARY: Color = Color::Rgb(168, 85, 247);
-const COLOR_BG_DARK: Color = Color::Rgb(17, 24, 39);
-const COLOR_BG_TRANSPARENT: Color = Color::Reset;
-const COLOR_TEXT: Color = Color::Rgb(243, 244, 246);
-const COLOR_HIGHLIGHT: Color = Color::Rgb(59, 130, 246);
-const COLOR_ERROR: Color = Color::Rgb(239, 68, 68);
-const COLOR_DIM: Color = Color::Rgb(107, 114, 128);
+#[derive(Clone, Copy)]
+struct ThemePalette {
+    primary: Color,
+    secondary: Color,
+    highlight: Color,
+    error: Color,
+    dim: Color,
+    text: Color,
+    on_primary: Color,
+    dark: Color,
+}
+
+const fn palette_for(theme: ThemePreset) -> ThemePalette {
+    match theme {
+        ThemePreset::Violet => ThemePalette {
+            primary: Color::Magenta,
+            secondary: Color::LightMagenta,
+            highlight: Color::Blue,
+            error: Color::LightRed,
+            dim: Color::DarkGray,
+            text: Color::White,
+            on_primary: Color::White,
+            dark: Color::Black,
+        },
+        ThemePreset::Ocean => ThemePalette {
+            primary: Color::Blue,
+            secondary: Color::LightCyan,
+            highlight: Color::Cyan,
+            error: Color::LightRed,
+            dim: Color::DarkGray,
+            text: Color::White,
+            on_primary: Color::White,
+            dark: Color::Black,
+        },
+        ThemePreset::Amber => ThemePalette {
+            primary: Color::Yellow,
+            secondary: Color::LightYellow,
+            highlight: Color::Cyan,
+            error: Color::LightRed,
+            dim: Color::DarkGray,
+            text: Color::White,
+            on_primary: Color::Black,
+            dark: Color::Black,
+        },
+        ThemePreset::Monochrome => ThemePalette {
+            primary: Color::White,
+            secondary: Color::Gray,
+            highlight: Color::LightCyan,
+            error: Color::LightRed,
+            dim: Color::DarkGray,
+            text: Color::White,
+            on_primary: Color::Black,
+            dark: Color::Black,
+        },
+    }
+}
+
+thread_local! {
+    static ACTIVE_THEME: std::cell::Cell<ThemePreset> = const {
+        std::cell::Cell::new(ThemePreset::Violet)
+    };
+}
+
+fn set_active_theme(theme: ThemePreset) {
+    ACTIVE_THEME.set(theme);
+}
+
+fn active_palette() -> ThemePalette {
+    palette_for(ACTIVE_THEME.get())
+}
+
+fn color_primary() -> Color {
+    active_palette().primary
+}
+fn color_secondary() -> Color {
+    active_palette().secondary
+}
+fn color_highlight() -> Color {
+    active_palette().highlight
+}
+fn color_error() -> Color {
+    active_palette().error
+}
+fn color_dim() -> Color {
+    active_palette().dim
+}
+fn color_text() -> Color {
+    active_palette().text
+}
+fn color_on_primary() -> Color {
+    active_palette().on_primary
+}
+fn color_bg_dark() -> Color {
+    active_palette().dark
+}
+const fn color_bg_transparent() -> Color {
+    Color::Reset
+}
 
 pub fn render(f: &mut Frame, app: &mut AppState) {
+    set_active_theme(app.settings.theme);
     let size = f.area();
     // One tab row plus a compact context field. Breadcrumbs intentionally stay
     // out of the chrome: the active columns already show the same hierarchy.
@@ -42,7 +134,7 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
     // Respect the terminal's own background/opacity instead of painting an
     // opaque full-frame wash.
     f.render_widget(
-        Block::default().style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+        Block::default().style(Style::default().bg(color_bg_transparent())),
         size,
     );
 
@@ -94,25 +186,25 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
     let mut top: Vec<Span> = Vec::new();
     for (index, tab) in PrimaryTab::ALL.iter().enumerate() {
         if index > 0 {
-            top.push(Span::styled(" | ", Style::default().fg(COLOR_DIM)));
+            top.push(Span::styled(" | ", Style::default().fg(color_dim())));
         }
         let active = *tab == app.primary_tab();
         top.push(Span::styled(
             format!(" {} · {} ", index + 1, tab.label()),
             if active {
                 Style::default()
-                    .fg(COLOR_TEXT)
-                    .bg(COLOR_PRIMARY)
+                    .fg(color_on_primary())
+                    .bg(color_primary())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLOR_DIM)
+                Style::default().fg(color_dim())
             },
         ));
     }
     f.render_widget(
         Paragraph::new(Line::from(top))
             .alignment(Alignment::Center)
-            .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+            .style(Style::default().bg(color_bg_transparent())),
         rows[0],
     );
 
@@ -158,7 +250,11 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
         ),
     };
 
-    let context_border = if editing { COLOR_HIGHLIGHT } else { COLOR_DIM };
+    let context_border = if editing {
+        color_highlight()
+    } else {
+        color_dim()
+    };
 
     let context_area = rows[1];
     if context_area.height >= 3 {
@@ -171,10 +267,10 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
                         .title_alignment(Alignment::Center)
                         .border_style(Style::default().fg(context_border))
                         .padding(Padding::horizontal(1))
-                        .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+                        .style(Style::default().bg(color_bg_transparent())),
                 )
                 .alignment(alignment)
-                .style(Style::default().bg(COLOR_BG_TRANSPARENT).fg(COLOR_TEXT)),
+                .style(Style::default().bg(color_bg_transparent()).fg(color_text())),
             context_area,
         );
         if editing {
@@ -191,7 +287,7 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
         f.render_widget(
             Paragraph::new(context)
                 .alignment(Alignment::Center)
-                .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+                .style(Style::default().bg(color_bg_transparent())),
             context_area,
         );
         if editing {
@@ -215,22 +311,21 @@ fn active_search_cursor(app: &AppState) -> usize {
 }
 
 fn settings_tabs_context(app: &AppState) -> Line<'static> {
-    let tabs = [SettingsTab::General, SettingsTab::About];
     let mut spans = Vec::new();
-    for (index, tab) in tabs.into_iter().enumerate() {
+    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled("  |  ", Style::default().fg(COLOR_DIM)));
+            spans.push(Span::styled("  |  ", Style::default().fg(color_dim())));
         }
         let active = tab == app.settings_tab;
         spans.push(Span::styled(
             format!(" {} ", tab.label()),
             if active {
                 Style::default()
-                    .fg(COLOR_TEXT)
-                    .bg(COLOR_PRIMARY)
+                    .fg(color_on_primary())
+                    .bg(color_primary())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLOR_DIM)
+                Style::default().fg(color_dim())
             },
         ));
     }
@@ -250,13 +345,13 @@ fn search_header_context(app: &AppState) -> Line<'static> {
             } else {
                 "Введіть назву аніме…"
             },
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
     } else {
         Line::from(Span::styled(
             query.to_string(),
             Style::default()
-                .fg(COLOR_TEXT)
+                .fg(color_text())
                 .add_modifier(if app.mode == AppMode::SearchInput {
                     Modifier::BOLD
                 } else {
@@ -270,13 +365,13 @@ fn library_search_header_context(app: &AppState) -> Line<'static> {
     if app.library_search_query.is_empty() {
         Line::from(Span::styled(
             "введіть назву аніме у бібліотеці…",
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
     } else {
         Line::from(Span::styled(
             app.library_search_query.clone(),
             Style::default()
-                .fg(COLOR_TEXT)
+                .fg(color_text())
                 .add_modifier(if app.library_search_editing {
                     Modifier::BOLD
                 } else {
@@ -294,15 +389,15 @@ fn library_filter_context(app: &AppState) -> Line<'static> {
             let label = filter.label();
             let style = if active {
                 Style::default()
-                    .fg(COLOR_TEXT)
-                    .bg(COLOR_PRIMARY)
+                    .fg(color_on_primary())
+                    .bg(color_primary())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLOR_DIM)
+                Style::default().fg(color_dim())
             };
             [
                 Span::styled(format!("  {label}  "), style),
-                Span::styled("  ", Style::default().fg(COLOR_DIM)),
+                Span::styled("  ", Style::default().fg(color_dim())),
             ]
         })
         .collect::<Vec<_>>();
@@ -411,10 +506,10 @@ fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_PRIMARY))
+        .border_style(Style::default().fg(color_primary()))
         .title(Span::styled(
             " Інформація ",
-            Style::default().fg(COLOR_PRIMARY),
+            Style::default().fg(color_primary()),
         ))
         .title_alignment(Alignment::Center);
 
@@ -471,7 +566,7 @@ fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
 
         render_sidebar_title_area(f, app, chunks[0], display_idx);
 
-        let sep_style = Style::default().fg(COLOR_DIM);
+        let sep_style = Style::default().fg(color_dim());
         let sep_w = inner.width as usize;
         f.render_widget(
             Paragraph::new(Line::from(Span::styled("─".repeat(sep_w), sep_style))),
@@ -519,7 +614,7 @@ fn render_sidebar_title_area(
             Line::from(Span::styled(
                 truncate_with_ellipsis(&release.title, area.width as usize),
                 Style::default()
-                    .fg(COLOR_SECONDARY)
+                    .fg(color_secondary())
                     .add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Center),
@@ -529,7 +624,7 @@ fn render_sidebar_title_area(
             Line::from(Span::styled(
                 truncate_with_ellipsis(&d.title_ukrainian, area.width as usize),
                 Style::default()
-                    .fg(COLOR_SECONDARY)
+                    .fg(color_secondary())
                     .add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Center),
@@ -538,7 +633,7 @@ fn render_sidebar_title_area(
             lines.push(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(eng, area.width as usize),
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(color_dim()),
                 ))
                 .alignment(Alignment::Center),
             );
@@ -549,7 +644,7 @@ fn render_sidebar_title_area(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(&item.title_ukrainian, area.width as usize),
                     Style::default()
-                        .fg(COLOR_SECONDARY)
+                        .fg(color_secondary())
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
@@ -558,7 +653,7 @@ fn render_sidebar_title_area(
                 lines.push(
                     Line::from(Span::styled(
                         truncate_with_ellipsis(eng, area.width as usize),
-                        Style::default().fg(COLOR_DIM),
+                        Style::default().fg(color_dim()),
                     ))
                     .alignment(Alignment::Center),
                 );
@@ -579,7 +674,7 @@ fn render_sidebar_details_area(
     let mk_sep = || {
         Line::from(Span::styled(
             "─".repeat(sep_w),
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
     };
     let mut text: Vec<Line> = Vec::new();
@@ -590,7 +685,7 @@ fn render_sidebar_details_area(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(&release.title, area.width as usize),
                     Style::default()
-                        .fg(COLOR_SECONDARY)
+                        .fg(color_secondary())
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
@@ -620,7 +715,7 @@ fn render_sidebar_details_area(
                 Line::from(Span::styled(
                     "⚠ Недоступно на AniHub",
                     Style::default()
-                        .fg(COLOR_ERROR)
+                        .fg(color_error())
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
@@ -630,10 +725,10 @@ fn render_sidebar_details_area(
             if !genres.is_empty() {
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
-                    Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled("Жанри: ", Style::default().fg(color_dim())),
                     Span::styled(
                         summarized_genres(genres),
-                        Style::default().fg(COLOR_HIGHLIGHT),
+                        Style::default().fg(color_highlight()),
                     ),
                 ]));
             }
@@ -653,7 +748,7 @@ fn render_sidebar_details_area(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(&d.title_ukrainian, area.width as usize),
                     Style::default()
-                        .fg(COLOR_SECONDARY)
+                        .fg(color_secondary())
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
@@ -662,7 +757,7 @@ fn render_sidebar_details_area(
                 text.push(
                     Line::from(Span::styled(
                         truncate_with_ellipsis(eng, area.width as usize),
-                        Style::default().fg(COLOR_DIM),
+                        Style::default().fg(color_dim()),
                     ))
                     .alignment(Alignment::Center),
                 );
@@ -694,7 +789,7 @@ fn render_sidebar_details_area(
                     .collect::<Vec<_>>()
                     .join(", ");
                 text.push(Line::from(vec![
-                    Span::styled("Озвучка: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled("Озвучка: ", Style::default().fg(color_dim())),
                     Span::styled(s, Style::default().fg(Color::Green)),
                 ]));
             }
@@ -704,10 +799,10 @@ fn render_sidebar_details_area(
             if !genres.is_empty() {
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
-                    Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled("Жанри: ", Style::default().fg(color_dim())),
                     Span::styled(
                         summarized_genres(genres),
-                        Style::default().fg(COLOR_HIGHLIGHT),
+                        Style::default().fg(color_highlight()),
                     ),
                 ]));
             }
@@ -719,7 +814,7 @@ fn render_sidebar_details_area(
                     Line::from(Span::styled(
                         truncate_with_ellipsis(&item.title_ukrainian, area.width as usize),
                         Style::default()
-                            .fg(COLOR_SECONDARY)
+                            .fg(color_secondary())
                             .add_modifier(Modifier::BOLD),
                     ))
                     .alignment(Alignment::Center),
@@ -728,7 +823,7 @@ fn render_sidebar_details_area(
                     text.push(
                         Line::from(Span::styled(
                             truncate_with_ellipsis(eng, area.width as usize),
-                            Style::default().fg(COLOR_DIM),
+                            Style::default().fg(color_dim()),
                         ))
                         .alignment(Alignment::Center),
                     );
@@ -772,7 +867,7 @@ fn render_sidebar_details_area(
                             .collect::<Vec<_>>()
                             .join(", ");
                         text.push(Line::from(vec![
-                            Span::styled("Озвучка: ", Style::default().fg(COLOR_DIM)),
+                            Span::styled("Озвучка: ", Style::default().fg(color_dim())),
                             Span::styled(s, Style::default().fg(Color::Green)),
                         ]));
                     }
@@ -782,10 +877,10 @@ fn render_sidebar_details_area(
                     if !genres.is_empty() {
                         text.push(Line::from(""));
                         text.push(Line::from(vec![
-                            Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
+                            Span::styled("Жанри: ", Style::default().fg(color_dim())),
                             Span::styled(
                                 summarized_genres(genres),
-                                Style::default().fg(COLOR_HIGHLIGHT),
+                                Style::default().fg(color_highlight()),
                             ),
                         ]));
                     }
@@ -794,7 +889,7 @@ fn render_sidebar_details_area(
                 text.push(
                     Line::from(Span::styled(
                         "Завантаження деталей…",
-                        Style::default().fg(COLOR_DIM),
+                        Style::default().fg(color_dim()),
                     ))
                     .alignment(Alignment::Center),
                 );
@@ -806,7 +901,7 @@ fn render_sidebar_details_area(
                 app.activity_message
                     .as_deref()
                     .unwrap_or("Оберіть тайтл зі списку"),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(color_dim()),
             ))
             .alignment(Alignment::Center),
         );
@@ -865,8 +960,8 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
         Paragraph::new(state)
             .style(
                 Style::default()
-                    .fg(COLOR_SECONDARY)
-                    .bg(COLOR_BG_TRANSPARENT)
+                    .fg(color_secondary())
+                    .bg(color_bg_transparent())
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(Alignment::Center),
@@ -893,37 +988,41 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     " ani",
-                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     "hub",
                     Style::default()
-                        .fg(COLOR_PRIMARY)
+                        .fg(color_primary())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     "-cli",
-                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" | v{} ", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(color_dim()),
                 ),
             ]))
-            .style(Style::default().bg(COLOR_BG_TRANSPARENT))
+            .style(Style::default().bg(color_bg_transparent()))
             .alignment(Alignment::Left),
             columns[0],
         );
         // Centered framed keybinds: │ Enter Далі  ·  e Статус │
         f.render_widget(
             Paragraph::new(framed_shortcuts_line(&context_shortcuts(app)))
-                .style(Style::default().bg(COLOR_BG_TRANSPARENT))
+                .style(Style::default().bg(color_bg_transparent()))
                 .alignment(Alignment::Center),
             columns[1],
         );
         // Symmetric empty side keeps the bind strip visually centered.
         f.render_widget(
-            Paragraph::new("").style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+            Paragraph::new("").style(Style::default().bg(color_bg_transparent())),
             columns[2],
         );
     }
@@ -932,7 +1031,7 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
 /// Build `│  key Action  ·  key Action  │` with purple rails.
 fn framed_shortcuts_line(shortcuts: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
-        vec![Span::styled("│ ", Style::default().fg(COLOR_PRIMARY))];
+        vec![Span::styled("│ ", Style::default().fg(color_primary()))];
     let parts: Vec<&str> = shortcuts
         .split("  ")
         .map(str::trim)
@@ -940,7 +1039,7 @@ fn framed_shortcuts_line(shortcuts: &str) -> Line<'static> {
         .collect();
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_DIM)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(color_dim())));
         }
         // First token is the key chord, rest is the label.
         let mut tokens = part.splitn(2, ' ');
@@ -949,17 +1048,17 @@ fn framed_shortcuts_line(shortcuts: &str) -> Line<'static> {
         spans.push(Span::styled(
             key.to_string(),
             Style::default()
-                .fg(COLOR_SECONDARY)
+                .fg(color_secondary())
                 .add_modifier(Modifier::BOLD),
         ));
         if !label.is_empty() {
             spans.push(Span::styled(
                 format!(" {label}"),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(color_dim()),
             ));
         }
     }
-    spans.push(Span::styled(" │", Style::default().fg(COLOR_PRIMARY)));
+    spans.push(Span::styled(" │", Style::default().fg(color_primary())));
     Line::from(spans)
 }
 
@@ -1140,16 +1239,16 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         if items.is_empty() {
             let focused = app.focus == FocusPanel::SearchList;
             let border_style = if focused {
-                Style::default().fg(COLOR_HIGHLIGHT)
+                Style::default().fg(color_highlight())
             } else {
-                Style::default().fg(COLOR_DIM)
+                Style::default().fg(color_dim())
             };
             let title_style = if focused {
                 Style::default()
-                    .fg(COLOR_SECONDARY)
+                    .fg(color_secondary())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLOR_DIM)
+                Style::default().fg(color_dim())
             };
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -1175,7 +1274,7 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 ])
                 .split(inner);
             f.render_widget(
-                Paragraph::new(Span::styled(message, Style::default().fg(COLOR_DIM)))
+                Paragraph::new(Span::styled(message, Style::default().fg(color_dim())))
                     .alignment(Alignment::Center),
                 centered[1],
             );
@@ -1384,10 +1483,10 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
 fn render_library_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_PRIMARY))
+        .border_style(Style::default().fg(color_primary()))
         .title(Span::styled(
             " Інформація ",
-            Style::default().fg(COLOR_PRIMARY),
+            Style::default().fg(color_primary()),
         ))
         .title_alignment(Alignment::Center);
     let inner = block.inner(area);
@@ -1426,7 +1525,7 @@ fn render_library_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
 
         render_library_sidebar_title_area(f, app, chunks[0]);
 
-        let sep_style = Style::default().fg(COLOR_DIM);
+        let sep_style = Style::default().fg(color_dim());
         let sep_w = inner.width as usize;
         f.render_widget(
             Paragraph::new(Line::from(Span::styled("─".repeat(sep_w), sep_style))),
@@ -1504,9 +1603,9 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
     let library_title = format!(" {} ", app.library_filter.label());
     if app.library_items.is_empty() {
         let border_style = if app.mode == AppMode::Library {
-            Style::default().fg(COLOR_HIGHLIGHT)
+            Style::default().fg(color_highlight())
         } else {
-            Style::default().fg(COLOR_DIM)
+            Style::default().fg(color_dim())
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1530,7 +1629,7 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             ])
             .split(inner);
         f.render_widget(
-            Paragraph::new(Span::styled(message, Style::default().fg(COLOR_DIM)))
+            Paragraph::new(Span::styled(message, Style::default().fg(color_dim())))
                 .alignment(Alignment::Center),
             centered[1],
         );
@@ -1700,7 +1799,7 @@ fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) 
             Line::from(Span::styled(
                 truncate_with_ellipsis(&details.title_ukrainian, area.width as usize),
                 Style::default()
-                    .fg(COLOR_SECONDARY)
+                    .fg(color_secondary())
                     .add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Center),
@@ -1709,7 +1808,7 @@ fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) 
             lines.push(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(eng, area.width as usize),
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(color_dim()),
                 ))
                 .alignment(Alignment::Center),
             );
@@ -1719,7 +1818,7 @@ fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) 
             Line::from(Span::styled(
                 truncate_with_ellipsis(&anime.anime_title, area.width as usize),
                 Style::default()
-                    .fg(COLOR_SECONDARY)
+                    .fg(color_secondary())
                     .add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Center),
@@ -1738,7 +1837,7 @@ fn render_library_sidebar_details_area(
     let mk_sep = || {
         Line::from(Span::styled(
             "─".repeat(sep_w),
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
     };
     let mut text: Vec<Line> = Vec::new();
@@ -1749,7 +1848,7 @@ fn render_library_sidebar_details_area(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(&details.title_ukrainian, area.width as usize),
                     Style::default()
-                        .fg(COLOR_SECONDARY)
+                        .fg(color_secondary())
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
@@ -1758,7 +1857,7 @@ fn render_library_sidebar_details_area(
                 text.push(
                     Line::from(Span::styled(
                         truncate_with_ellipsis(eng, area.width as usize),
-                        Style::default().fg(COLOR_DIM),
+                        Style::default().fg(color_dim()),
                     ))
                     .alignment(Alignment::Center),
                 );
@@ -1793,7 +1892,7 @@ fn render_library_sidebar_details_area(
                     .collect::<Vec<_>>()
                     .join(", ");
                 text.push(Line::from(vec![
-                    Span::styled("Озвучка: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled("Озвучка: ", Style::default().fg(color_dim())),
                     Span::styled(s, Style::default().fg(Color::Green)),
                 ]));
             }
@@ -1803,10 +1902,10 @@ fn render_library_sidebar_details_area(
             if !genres.is_empty() {
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
-                    Span::styled("Жанри: ", Style::default().fg(COLOR_DIM)),
+                    Span::styled("Жанри: ", Style::default().fg(color_dim())),
                     Span::styled(
                         summarized_genres(genres),
-                        Style::default().fg(COLOR_HIGHLIGHT),
+                        Style::default().fg(color_highlight()),
                     ),
                 ]));
             }
@@ -1817,7 +1916,7 @@ fn render_library_sidebar_details_area(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(&anime.anime_title, area.width as usize),
                     Style::default()
-                        .fg(COLOR_SECONDARY)
+                        .fg(color_secondary())
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
@@ -1828,7 +1927,7 @@ fn render_library_sidebar_details_area(
             text.push(
                 Line::from(Span::styled(
                     "Завантаження деталей…",
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(color_dim()),
                 ))
                 .alignment(Alignment::Center),
             );
@@ -1841,7 +1940,7 @@ fn render_library_sidebar_details_area(
                 app.activity_message
                     .as_deref()
                     .unwrap_or("Оберіть тайтл зі списку"),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(color_dim()),
             ))
             .alignment(Alignment::Center),
         );
@@ -1872,7 +1971,7 @@ fn render_centered_sidebar_message(f: &mut Frame, area: Rect, message: &str) {
     f.render_widget(
         Paragraph::new(Span::styled(
             truncate_with_ellipsis(message, area.width as usize),
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
         .alignment(Alignment::Center),
         rows[1],
@@ -1936,9 +2035,9 @@ fn compact_metadata_line(
     episodes: Option<String>,
 ) -> Line<'static> {
     let mut values: Vec<(String, Style)> =
-        vec![(anime_type.to_uppercase(), Style::default().fg(COLOR_TEXT))];
+        vec![(anime_type.to_uppercase(), Style::default().fg(color_text()))];
     if let Some(year) = year {
-        values.push((year.to_string(), Style::default().fg(COLOR_TEXT)));
+        values.push((year.to_string(), Style::default().fg(color_text())));
     }
     if let Some(rating) = rating {
         values.push((
@@ -1949,13 +2048,16 @@ fn compact_metadata_line(
         ));
     }
     if let Some(episodes) = episodes {
-        values.push((format!("{episodes} сер."), Style::default().fg(COLOR_TEXT)));
+        values.push((
+            format!("{episodes} сер."),
+            Style::default().fg(color_text()),
+        ));
     }
 
     let mut spans = Vec::new();
     for (index, (value, style)) in values.into_iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(COLOR_DIM)));
+            spans.push(Span::styled(" · ", Style::default().fg(color_dim())));
         }
         spans.push(Span::styled(value, style));
     }
@@ -2024,11 +2126,11 @@ fn tracking_lines(
                     .trim_start()
                     .to_string(),
                 Style::default()
-                    .fg(COLOR_SECONDARY)
+                    .fg(color_secondary())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · ", Style::default().fg(COLOR_DIM)),
-            Span::styled(watched_label, Style::default().fg(COLOR_TEXT)),
+            Span::styled(" · ", Style::default().fg(color_dim())),
+            Span::styled(watched_label, Style::default().fg(color_text())),
         ])
         .alignment(Alignment::Center),
     ];
@@ -2041,7 +2143,7 @@ fn tracking_lines(
                     progress.episode,
                     format_timestamp(progress.timestamp)
                 ),
-                Style::default().fg(COLOR_HIGHLIGHT),
+                Style::default().fg(color_highlight()),
             ))
             .alignment(Alignment::Center),
         );
@@ -2195,16 +2297,16 @@ fn episode_progress_timestamp(
 
 fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -> List<'a> {
     let border_style = if is_focused {
-        Style::default().fg(COLOR_HIGHLIGHT)
+        Style::default().fg(color_highlight())
     } else {
-        Style::default().fg(COLOR_DIM)
+        Style::default().fg(color_dim())
     };
     let title_style = if is_focused {
         Style::default()
-            .fg(COLOR_SECONDARY)
+            .fg(color_secondary())
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_DIM)
+        Style::default().fg(color_dim())
     };
 
     List::new(items)
@@ -2217,8 +2319,8 @@ fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_PRIMARY)
-                .fg(Color::White)
+                .bg(color_primary())
+                .fg(color_on_primary())
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(">> ")
@@ -2227,6 +2329,7 @@ fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -
 fn render_settings(f: &mut Frame, app: &AppState, area: Rect) {
     match app.settings_tab {
         SettingsTab::General => render_general_settings(f, app, area),
+        SettingsTab::Themes => render_theme_settings(f, app, area),
         SettingsTab::About => render_about_settings(f, app, area),
     }
 }
@@ -2241,7 +2344,7 @@ fn settings_item(label: &str, value: &str, width: usize) -> ListItem<'static> {
 fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_HIGHLIGHT))
+        .border_style(Style::default().fg(color_highlight()))
         .title(" Основні ")
         .title_alignment(Alignment::Center)
         .padding(Padding::horizontal(2));
@@ -2286,6 +2389,26 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
             on_off(app.settings.show_posters),
             inner_width,
         ),
+        settings_item(
+            "Discord Rich Presence",
+            if app.settings.discord_presence
+                && app.settings.discord_application_id.parse::<u64>().is_err()
+            {
+                "потрібен ID"
+            } else {
+                on_off(app.settings.discord_presence)
+            },
+            inner_width,
+        ),
+        settings_item(
+            "Discord Application ID",
+            if app.settings.discord_application_id.is_empty() {
+                "—"
+            } else {
+                &app.settings.discord_application_id
+            },
+            inner_width,
+        ),
         settings_item("Шлях до mpv", &app.settings.mpv_path, inner_width),
         settings_item(
             "Додаткові аргументи mpv",
@@ -2306,23 +2429,116 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
         .highlight_symbol(">> ")
         .highlight_style(
             Style::default()
-                .bg(COLOR_PRIMARY)
-                .fg(COLOR_TEXT)
+                .bg(color_primary())
+                .fg(color_on_primary())
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, area, &mut state);
 }
 
+fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(5)])
+        .split(area);
+    let items = ThemePreset::ALL
+        .into_iter()
+        .map(|theme| {
+            let palette = palette_for(theme);
+            let active = theme == app.settings.theme;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if active { "✓ " } else { "  " },
+                    Style::default().fg(palette.highlight),
+                ),
+                Span::styled(
+                    format!("{:<14}", theme.label()),
+                    Style::default().fg(palette.text),
+                ),
+                Span::styled("■ ", Style::default().fg(palette.primary)),
+                Span::styled("■ ", Style::default().fg(palette.secondary)),
+                Span::styled("■ ", Style::default().fg(palette.highlight)),
+                Span::styled("■", Style::default().fg(palette.error)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(
+        app.settings_selected.min(items.len().saturating_sub(1)),
+    ));
+    f.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" ANSI-тема ")
+                    .title_alignment(Alignment::Center)
+                    .border_style(Style::default().fg(color_highlight()))
+                    .padding(Padding::horizontal(2)),
+            )
+            .highlight_symbol(">> ")
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+        chunks[0],
+        &mut state,
+    );
+
+    let preview = vec![
+        Line::from(vec![
+            Span::styled(
+                " 1 · Пошук ",
+                Style::default()
+                    .fg(color_on_primary())
+                    .bg(color_primary())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  |  ", Style::default().fg(color_dim())),
+            Span::styled(
+                "Сезон 2 · Серія 4",
+                Style::default()
+                    .fg(color_secondary())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(">> ", Style::default().fg(color_highlight())),
+            Span::styled(
+                "Каґуя-сама: Кохання як війна",
+                Style::default().fg(color_text()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("✓ Переглянуто", Style::default().fg(color_secondary())),
+            Span::styled("  ·  ", Style::default().fg(color_dim())),
+            Span::styled("Помилка", Style::default().fg(color_error())),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(preview).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Попередній перегляд · {} ",
+                    app.settings.theme.label()
+                ))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(color_dim()))
+                .padding(Padding::horizontal(2)),
+        ),
+        chunks[1],
+    );
+}
+
 fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(5)])
+        .constraints([Constraint::Length(7), Constraint::Min(5)])
         .split(area);
     let action_width = chunks[0].width.saturating_sub(8) as usize;
     let actions = vec![
         settings_item("Тека даних", "", action_width),
         settings_item("GitHub", "", action_width),
         settings_item("Перевірити оновлення", "", action_width),
+        settings_item("Очистити кеш постерів", "", action_width),
         settings_item("Очистити бібліотеку", "", action_width),
     ];
     let mut state = ratatui::widgets::ListState::default();
@@ -2334,14 +2550,14 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
                     .borders(Borders::ALL)
                     .title(" Дії ")
                     .title_alignment(Alignment::Center)
-                    .border_style(Style::default().fg(COLOR_HIGHLIGHT))
+                    .border_style(Style::default().fg(color_highlight()))
                     .padding(Padding::horizontal(2)),
             )
             .highlight_symbol(">> ")
             .highlight_style(
                 Style::default()
-                    .bg(COLOR_PRIMARY)
-                    .fg(COLOR_TEXT)
+                    .bg(color_primary())
+                    .fg(color_on_primary())
                     .add_modifier(Modifier::BOLD),
             ),
         chunks[0],
@@ -2350,39 +2566,63 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
 
     let diagnostics = vec![
         Line::from(vec![
-            Span::styled("Версія: ", Style::default().fg(COLOR_DIM)),
-            Span::styled(env!("CARGO_PKG_VERSION"), Style::default().fg(COLOR_TEXT)),
+            Span::styled("Версія: ", Style::default().fg(color_dim())),
+            Span::styled(env!("CARGO_PKG_VERSION"), Style::default().fg(color_text())),
         ]),
         Line::from(vec![
-            Span::styled("GitHub: ", Style::default().fg(COLOR_DIM)),
+            Span::styled("GitHub: ", Style::default().fg(color_dim())),
             Span::styled(
                 crate::settings::GITHUB_URL,
-                Style::default().fg(COLOR_HIGHLIGHT),
+                Style::default().fg(color_highlight()),
             ),
         ]),
         Line::from(vec![
-            Span::styled("History: ", Style::default().fg(COLOR_DIM)),
+            Span::styled("History: ", Style::default().fg(color_dim())),
             Span::styled(
                 app.settings_store.history_path().display().to_string(),
-                Style::default().fg(COLOR_TEXT),
+                Style::default().fg(color_text()),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Settings: ", Style::default().fg(COLOR_DIM)),
+            Span::styled("Settings: ", Style::default().fg(color_dim())),
             Span::styled(
                 app.settings_store.settings_path().display().to_string(),
-                Style::default().fg(COLOR_TEXT),
+                Style::default().fg(color_text()),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Cache: ", Style::default().fg(COLOR_DIM)),
+            Span::styled("Cache: ", Style::default().fg(color_dim())),
             Span::styled(
                 app.metadata_cache.path().display().to_string(),
-                Style::default().fg(COLOR_TEXT),
+                Style::default().fg(color_text()),
             ),
         ]),
         Line::from(vec![
-            Span::styled("mpv: ", Style::default().fg(COLOR_DIM)),
+            Span::styled("Posters: ", Style::default().fg(color_dim())),
+            Span::styled(
+                app.poster_disk_cache.path().display().to_string(),
+                Style::default().fg(color_text()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Discord: ", Style::default().fg(color_dim())),
+            Span::styled(
+                if !app.settings.discord_presence {
+                    "вимкнено"
+                } else if app.settings.discord_application_id.parse::<u64>().is_ok() {
+                    "налаштовано"
+                } else {
+                    "потрібен Application ID"
+                },
+                Style::default().fg(if app.settings.discord_presence {
+                    color_secondary()
+                } else {
+                    color_dim()
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("mpv: ", Style::default().fg(color_dim())),
             Span::styled(
                 if app.mpv_available {
                     "знайдено"
@@ -2392,11 +2632,14 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
                 Style::default().fg(if app.mpv_available {
                     Color::Green
                 } else {
-                    COLOR_ERROR
+                    color_error()
                 }),
             ),
-            Span::styled(" · image: ", Style::default().fg(COLOR_DIM)),
-            Span::styled(app.image_protocol.clone(), Style::default().fg(COLOR_TEXT)),
+            Span::styled(" · image: ", Style::default().fg(color_dim())),
+            Span::styled(
+                app.image_protocol.clone(),
+                Style::default().fg(color_text()),
+            ),
         ]),
     ];
     f.render_widget(
@@ -2406,7 +2649,7 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
                     .borders(Borders::ALL)
                     .title(" Про / шляхи ")
                     .title_alignment(Alignment::Center)
-                    .border_style(Style::default().fg(COLOR_DIM))
+                    .border_style(Style::default().fg(color_dim()))
                     .padding(Padding::horizontal(2)),
             )
             .wrap(ratatui::widgets::Wrap { trim: true }),
@@ -2444,16 +2687,16 @@ fn render_settings_choice_popup(f: &mut Frame, app: &AppState) {
     let rows = labels.len() as u16;
     let height = rows.saturating_add(5).max(8);
     let actions = [
-        ("↑/↓", "Вибір", COLOR_SECONDARY),
-        ("Enter", "OK", COLOR_HIGHLIGHT),
-        ("Esc", "", COLOR_DIM),
+        ("↑/↓", "Вибір", color_secondary()),
+        ("Enter", "OK", color_highlight()),
+        ("Esc", "", color_dim()),
     ];
     let min_width = match editor.kind {
         SettingsChoiceKind::StartScreen => 36,
         SettingsChoiceKind::LibraryFilter => 40,
     };
     let area = centered_fixed(f.area(), dialog_width_for(min_width, &actions), height);
-    let block = dialog_block(editor.kind.title(), COLOR_PRIMARY, COLOR_SECONDARY);
+    let block = dialog_block(editor.kind.title(), color_primary(), color_secondary());
     f.render_widget(Clear, area);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2481,11 +2724,11 @@ fn render_settings_choice_popup(f: &mut Frame, app: &AppState) {
             let radio = if selected { "●" } else { "○" };
             let style = if selected {
                 Style::default()
-                    .fg(COLOR_TEXT)
-                    .bg(COLOR_PRIMARY)
+                    .fg(color_on_primary())
+                    .bg(color_primary())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLOR_DIM)
+                Style::default().fg(color_dim())
             };
             Line::from(Span::styled(
                 format!(" {radio}  {} ", pad_display(label, label_w)),
@@ -2508,15 +2751,19 @@ fn render_settings_text_popup(f: &mut Frame, app: &AppState) {
         return;
     };
     let (title, hint) = match kind {
+        SettingsInput::DiscordApplicationId => (
+            " Discord Application ID ",
+            "Числовий ID застосунку з Discord Developer Portal",
+        ),
         SettingsInput::MpvPath => (" Шлях до mpv ", "Порожнє значення скинеться на «mpv»"),
         SettingsInput::MpvArgs => (" Аргументи mpv ", "Наприклад: --fs --hwdec=auto"),
     };
     let actions = [
-        ("Enter", "Зберегти", COLOR_HIGHLIGHT),
-        ("Esc", "", COLOR_DIM),
+        ("Enter", "Зберегти", color_highlight()),
+        ("Esc", "", color_dim()),
     ];
     let area = centered_fixed(f.area(), dialog_width_for(56, &actions), 10);
-    let block = dialog_block(title, COLOR_HIGHLIGHT, COLOR_SECONDARY);
+    let block = dialog_block(title, color_highlight(), color_secondary());
     f.render_widget(Clear, area);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2532,7 +2779,7 @@ fn render_settings_text_popup(f: &mut Frame, app: &AppState) {
         .split(inner);
 
     f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(COLOR_DIM)))
+        Paragraph::new(Span::styled(hint, Style::default().fg(color_dim())))
             .alignment(Alignment::Center),
         layout[0],
     );
@@ -2544,14 +2791,16 @@ fn render_settings_text_popup(f: &mut Frame, app: &AppState) {
     };
     let field = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_HIGHLIGHT))
-        .style(Style::default().bg(COLOR_BG_TRANSPARENT));
+        .border_style(Style::default().fg(color_highlight()))
+        .style(Style::default().bg(color_bg_transparent()));
     let field_inner = field.inner(layout[1]);
     f.render_widget(field, layout[1]);
     f.render_widget(
         Paragraph::new(Span::styled(
             value,
-            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color_text())
+                .add_modifier(Modifier::BOLD),
         )),
         field_inner,
     );
@@ -2569,11 +2818,11 @@ fn render_settings_text_popup(f: &mut Frame, app: &AppState) {
 
 fn render_settings_update_popup(f: &mut Frame, app: &AppState) {
     let actions_probe = [
-        ("Enter", "Відкрити реліз", COLOR_HIGHLIGHT),
-        ("Esc", "", COLOR_DIM),
+        ("Enter", "Відкрити реліз", color_highlight()),
+        ("Esc", "", color_dim()),
     ];
     let area = centered_fixed(f.area(), dialog_width_for(44, &actions_probe), 11);
-    let block = dialog_block(" Оновлення ", COLOR_PRIMARY, COLOR_SECONDARY);
+    let block = dialog_block(" Оновлення ", color_primary(), color_secondary());
     f.render_widget(Clear, area);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2591,7 +2840,7 @@ fn render_settings_update_popup(f: &mut Frame, app: &AppState) {
     f.render_widget(
         Paragraph::new(Span::styled(
             format!("Поточна версія: {}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
         .alignment(Alignment::Center),
         layout[0],
@@ -2604,41 +2853,51 @@ fn render_settings_update_popup(f: &mut Frame, app: &AppState) {
                 Line::from(Span::styled(
                     "Перевіряємо оновлення…",
                     Style::default()
-                        .fg(COLOR_SECONDARY)
+                        .fg(color_secondary())
                         .add_modifier(Modifier::BOLD),
                 )),
             ],
-            vec![("Esc", "", COLOR_DIM)],
+            vec![("Esc", "", color_dim())],
         ),
         UpdateState::Current(version) => (
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "У вас актуальна версія",
-                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     version.clone(),
-                    Style::default().fg(COLOR_SECONDARY),
+                    Style::default().fg(color_secondary()),
                 )),
             ],
-            vec![("Enter", "Ще раз", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)],
+            vec![
+                ("Enter", "Ще раз", color_highlight()),
+                ("Esc", "", color_dim()),
+            ],
         ),
         UpdateState::Available(update) => (
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "Доступна нова версія",
-                    Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     update.latest_version.clone(),
                     Style::default()
-                        .fg(COLOR_SECONDARY)
+                        .fg(color_secondary())
                         .add_modifier(Modifier::BOLD),
                 )),
             ],
-            vec![("Enter", "Реліз", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)],
+            vec![
+                ("Enter", "Реліз", color_highlight()),
+                ("Esc", "", color_dim()),
+            ],
         ),
         UpdateState::Failed(error) => (
             vec![
@@ -2646,15 +2905,18 @@ fn render_settings_update_popup(f: &mut Frame, app: &AppState) {
                 Line::from(Span::styled(
                     "Не вдалося перевірити",
                     Style::default()
-                        .fg(COLOR_ERROR)
+                        .fg(color_error())
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     truncate_middle(error, 42),
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(color_dim()),
                 )),
             ],
-            vec![("Enter", "Ще раз", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)],
+            vec![
+                ("Enter", "Ще раз", color_highlight()),
+                ("Esc", "", color_dim()),
+            ],
         ),
     };
 
@@ -2669,9 +2931,13 @@ fn render_settings_threshold_popup(f: &mut Frame, app: &AppState) {
     let Some(editor) = app.settings_threshold.as_ref() else {
         return;
     };
-    let actions = [("Enter", "OK", COLOR_HIGHLIGHT), ("Esc", "", COLOR_DIM)];
+    let actions = [("Enter", "OK", color_highlight()), ("Esc", "", color_dim())];
     let area = centered_fixed(f.area(), dialog_width_for(46, &actions), 11);
-    let block = dialog_block(" Позначати переглянутим ", COLOR_PRIMARY, COLOR_SECONDARY);
+    let block = dialog_block(
+        " Позначати переглянутим ",
+        color_primary(),
+        color_secondary(),
+    );
     f.render_widget(Clear, area);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2691,7 +2957,7 @@ fn render_settings_threshold_popup(f: &mut Frame, app: &AppState) {
     f.render_widget(
         Paragraph::new(Span::styled(
             "Поріг прогресу серії",
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
         .alignment(Alignment::Center),
         layout[0],
@@ -2707,9 +2973,9 @@ fn render_settings_threshold_popup(f: &mut Frame, app: &AppState) {
             value,
             Style::default()
                 .fg(if editor.percent.is_some() {
-                    COLOR_SECONDARY
+                    color_secondary()
                 } else {
-                    COLOR_DIM
+                    color_dim()
                 })
                 .add_modifier(Modifier::BOLD),
         ))
@@ -2724,7 +2990,7 @@ fn render_settings_threshold_popup(f: &mut Frame, app: &AppState) {
             } else {
                 "Space — увімкнути   ←/→ — виставити"
             },
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         ))
         .alignment(Alignment::Center),
         layout[3],
@@ -2740,26 +3006,28 @@ fn render_moonanime_popup(f: &mut Frame, episode_title: &str) {
     let body = vec![
         Line::from(Span::styled(
             truncate_middle(episode_title, 44),
-            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color_text())
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Епізод відкриється в браузері",
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         )),
         Line::from(Span::styled(
             "(MoonAnime embed)",
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         )),
     ];
     render_confirm_dialog(
         f,
         " MoonAnime ",
-        COLOR_HIGHLIGHT,
+        color_highlight(),
         &body,
         &[
-            ("Enter", "Відкрити", COLOR_HIGHLIGHT),
-            ("Esc", "", COLOR_DIM),
+            ("Enter", "Відкрити", color_highlight()),
+            ("Esc", "", color_dim()),
         ],
         48,
         9,
@@ -2770,24 +3038,29 @@ fn render_delete_popup(f: &mut Frame, anime_title: &str) {
     let body = vec![
         Line::from(Span::styled(
             "Видалити весь прогрес для",
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(color_dim()),
         )),
         Line::from(Span::styled(
             truncate_middle(anime_title, 42),
-            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color_text())
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Цю дію не можна скасувати.",
-            Style::default().fg(COLOR_ERROR),
+            Style::default().fg(color_error()),
         )),
     ];
     render_confirm_dialog(
         f,
         " Підтвердження ",
-        COLOR_ERROR,
+        color_error(),
         &body,
-        &[("Enter", "Видалити", COLOR_ERROR), ("Esc", "", COLOR_DIM)],
+        &[
+            ("Enter", "Видалити", color_error()),
+            ("Esc", "", color_dim()),
+        ],
         46,
         9,
     );
@@ -2797,20 +3070,25 @@ fn render_clear_library_popup(f: &mut Frame) {
     let body = vec![
         Line::from(Span::styled(
             "Очистити всю бібліотеку?",
-            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color_text())
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Статуси, переглянуті серії та таймкоди буде видалено.",
-            Style::default().fg(COLOR_ERROR),
+            Style::default().fg(color_error()),
         )),
     ];
     render_confirm_dialog(
         f,
         " Очистити бібліотеку ",
-        COLOR_ERROR,
+        color_error(),
         &body,
-        &[("Enter", "Очистити", COLOR_ERROR), ("Esc", "", COLOR_DIM)],
+        &[
+            ("Enter", "Очистити", color_error()),
+            ("Esc", "", color_dim()),
+        ],
         58,
         8,
     );
@@ -2822,16 +3100,16 @@ fn render_error_popup(f: &mut Frame, message: &str) {
     for chunk in chunks {
         body.push(Line::from(Span::styled(
             chunk,
-            Style::default().fg(COLOR_TEXT),
+            Style::default().fg(color_text()),
         )));
     }
     let height = (body.len() as u16).saturating_add(4).clamp(6, 12);
     render_confirm_dialog(
         f,
         " Помилка ",
-        COLOR_ERROR,
+        color_error(),
         &body,
-        &[("Esc", "", COLOR_DIM)],
+        &[("Esc", "", color_dim())],
         50,
         height,
     );
@@ -2842,12 +3120,12 @@ fn render_status_editor_popup(f: &mut Frame, app: &AppState) {
         return;
     };
     let actions = [
-        ("↑/↓", "Вибір", COLOR_SECONDARY),
-        ("Enter", "OK", COLOR_HIGHLIGHT),
-        ("Esc", "", COLOR_DIM),
+        ("↑/↓", "Вибір", color_secondary()),
+        ("Enter", "OK", color_highlight()),
+        ("Esc", "", color_dim()),
     ];
     let area = centered_fixed(f.area(), dialog_width_for(40, &actions), 13);
-    let block = dialog_block(" Статус аніме ", COLOR_PRIMARY, COLOR_SECONDARY);
+    let block = dialog_block(" Статус аніме ", color_primary(), color_secondary());
     f.render_widget(Clear, area);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2866,7 +3144,11 @@ fn render_status_editor_popup(f: &mut Frame, app: &AppState) {
     f.render_widget(
         Paragraph::new(truncate_middle(&editor.title, 42))
             .alignment(Alignment::Center)
-            .style(Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)),
+            .style(
+                Style::default()
+                    .fg(color_text())
+                    .add_modifier(Modifier::BOLD),
+            ),
         rows[0],
     );
     // rows[1] = breathing room under the title
@@ -2886,11 +3168,11 @@ fn render_status_editor_popup(f: &mut Frame, app: &AppState) {
             let label = pad_display(status.label(), label_w);
             let style = if selected {
                 Style::default()
-                    .fg(COLOR_TEXT)
-                    .bg(COLOR_PRIMARY)
+                    .fg(color_on_primary())
+                    .bg(color_primary())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLOR_DIM)
+                Style::default().fg(color_dim())
             };
             // Leading space + radio so the marker isn't glued to the left edge.
             Line::from(Span::styled(format!(" {radio}  {label}"), style))
@@ -2907,7 +3189,7 @@ fn render_status_editor_popup(f: &mut Frame, app: &AppState) {
 
 fn render_help_popup(f: &mut Frame) {
     let area = centered_fixed(f.area(), 68, 16);
-    let block = dialog_block(" Довідка ", COLOR_PRIMARY, COLOR_PRIMARY);
+    let block = dialog_block(" Довідка ", color_primary(), color_primary());
     f.render_widget(Clear, area);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2926,15 +3208,18 @@ fn render_help_popup(f: &mut Frame) {
         Line::from(Span::styled(
             format!(" {label} "),
             Style::default()
-                .bg(COLOR_SECONDARY)
-                .fg(COLOR_BG_DARK)
+                .bg(color_secondary())
+                .fg(color_bg_dark())
                 .add_modifier(Modifier::BOLD),
         ))
     };
     let row = |key: &'static str, desc: &'static str| {
         Line::from(vec![
-            Span::styled(format!(" {key:<10}"), Style::default().fg(COLOR_SECONDARY)),
-            Span::styled(desc, Style::default().fg(COLOR_TEXT)),
+            Span::styled(
+                format!(" {key:<10}"),
+                Style::default().fg(color_secondary()),
+            ),
+            Span::styled(desc, Style::default().fg(color_text())),
         ])
     };
 
@@ -2968,7 +3253,8 @@ fn render_help_popup(f: &mut Frame) {
     f.render_widget(Paragraph::new(left_col), columns[0]);
     f.render_widget(Paragraph::new(right_col), columns[1]);
     f.render_widget(
-        Paragraph::new(action_footer_line(&[("Esc", "", COLOR_DIM)])).alignment(Alignment::Center),
+        Paragraph::new(action_footer_line(&[("Esc", "", color_dim())]))
+            .alignment(Alignment::Center),
         body[1],
     );
 }
@@ -3018,14 +3304,14 @@ fn dialog_block(title: &str, border: Color, title_color: Color) -> Block<'_> {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         // Transparent fill so the terminal/app behind shows through (legacy look).
-        .style(Style::default().bg(COLOR_BG_TRANSPARENT))
+        .style(Style::default().bg(color_bg_transparent()))
 }
 
 fn action_footer_line(actions: &[(&str, &str, Color)]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, (key, label, color)) in actions.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(COLOR_DIM)));
+            spans.push(Span::styled(" · ", Style::default().fg(color_dim())));
         }
         spans.push(Span::styled(
             (*key).to_string(),
@@ -3034,7 +3320,7 @@ fn action_footer_line(actions: &[(&str, &str, Color)]) -> Line<'static> {
         if !label.is_empty() {
             spans.push(Span::styled(
                 format!(" {label}"),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(color_dim()),
             ));
         }
     }
@@ -3192,7 +3478,7 @@ fn release_list_item(
     if unavailable {
         item.style(
             Style::default()
-                .fg(COLOR_ERROR)
+                .fg(color_error())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
@@ -3220,10 +3506,10 @@ fn release_catalog_items(
                 ListItem::new(Line::from(Span::styled(
                     release_section_line(label, width),
                     Style::default()
-                        .fg(COLOR_PRIMARY)
+                        .fg(color_primary())
                         .add_modifier(Modifier::BOLD),
                 )))
-                .style(Style::default().bg(COLOR_BG_TRANSPARENT)),
+                .style(Style::default().bg(color_bg_transparent())),
             );
             previous_extra = Some(is_extra);
         }
@@ -3324,6 +3610,25 @@ fn count_seasons(items: &[crate::api::AnimeItem], group: &[usize]) -> (usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_theme_uses_terminal_ansi_colors_instead_of_rgb() {
+        for theme in ThemePreset::ALL {
+            let palette = palette_for(theme);
+            for color in [
+                palette.primary,
+                palette.secondary,
+                palette.highlight,
+                palette.error,
+                palette.dim,
+                palette.text,
+                palette.on_primary,
+                palette.dark,
+            ] {
+                assert!(!matches!(color, Color::Rgb(_, _, _)));
+            }
+        }
+    }
 
     fn release(
         title: &str,

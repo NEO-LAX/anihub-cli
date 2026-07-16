@@ -4,9 +4,10 @@ use crate::api::{
     ReleaseAvailability, ReleaseClassification, ReleaseEntry,
 };
 use crate::cache::MetadataCache;
+use crate::poster_cache::PosterCache;
 use crate::settings::{
-    DefaultLibraryFilter, GITHUB_URL, Settings, SettingsStore, StartScreen, UpdateCheck,
-    mpv_is_available,
+    DefaultLibraryFilter, GITHUB_URL, Settings, SettingsStore, StartScreen, ThemePreset,
+    UpdateCheck, mpv_is_available,
 };
 use crate::storage::{
     AnimeStatus, AnimeStatusUpdate, AppHistory, EpisodeWatchedUpdate, LibraryReleaseKind,
@@ -147,27 +148,35 @@ type AnimeStatusContext = (
 pub enum SettingsTab {
     #[default]
     General,
+    Themes,
     About,
 }
 
 impl SettingsTab {
+    pub const ALL: [Self; 3] = [Self::General, Self::Themes, Self::About];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "Основні",
+            Self::Themes => "Теми",
             Self::About => "Про",
         }
     }
 
-    pub const fn toggled(self) -> Self {
-        match self {
-            Self::General => Self::About,
-            Self::About => Self::General,
-        }
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[index.checked_sub(1).unwrap_or(Self::ALL.len() - 1)]
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsInput {
+    DiscordApplicationId,
     MpvPath,
     MpvArgs,
 }
@@ -242,6 +251,7 @@ pub const THRESHOLD_BAR_WIDTH: usize = 12;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
+    pub anime_id: u32,
     pub anime_title: String,
     pub season: u32,
     pub episode: u32,
@@ -414,6 +424,7 @@ pub struct AppState {
     pub image_protocol: String,
     pub update_state: UpdateState,
     pub update_check_requested: bool,
+    pub discord_config_changed: bool,
 
     pub should_quit: bool,
     pub api_client: ApiClient,
@@ -439,6 +450,7 @@ pub struct AppState {
     pub picker: Picker,
     pub current_poster: Option<StatefulProtocol>,
     pub poster_cache: moka::sync::Cache<u32, std::sync::Arc<DynamicImage>>,
+    pub poster_disk_cache: PosterCache,
     pub poster_fetch_pending: Option<u32>,
 
     // O(1) індекси для перевірки переглянутих серій під час рендеру.
@@ -457,6 +469,7 @@ impl AppState {
         let settings_store = SettingsStore::new()?;
         let settings = settings_store.load()?;
         let metadata_cache = MetadataCache::new(settings_store.data_dir())?;
+        let poster_disk_cache = PosterCache::new(settings_store.data_dir())?;
         let details_cache = moka::sync::Cache::builder().max_capacity(500).build();
         for (anime_id, details) in metadata_cache.details() {
             details_cache.insert(anime_id, details);
@@ -525,6 +538,7 @@ impl AppState {
             image_protocol: image_protocol.into(),
             update_state: UpdateState::Idle,
             update_check_requested: false,
+            discord_config_changed: false,
 
             should_quit: false,
             api_client: ApiClient::new()?,
@@ -547,6 +561,7 @@ impl AppState {
             picker,
             current_poster: None,
             poster_cache: moka::sync::Cache::builder().max_capacity(30).build(),
+            poster_disk_cache,
             poster_fetch_pending: None,
 
             watched_index,
@@ -1040,14 +1055,38 @@ impl AppState {
                 self.toggle_poster_setting();
                 self.persist_settings();
             }
-            7 => self.open_settings_text(SettingsInput::MpvPath),
-            8 => self.open_settings_text(SettingsInput::MpvArgs),
+            7 => {
+                self.settings.discord_presence = !self.settings.discord_presence;
+                self.discord_config_changed = true;
+                self.persist_settings();
+                if self.settings.discord_presence
+                    && self
+                        .settings
+                        .discord_application_id
+                        .trim()
+                        .parse::<u64>()
+                        .is_err()
+                {
+                    self.set_info_status("Вкажіть Discord Application ID нижче");
+                }
+            }
+            8 => self.open_settings_text(SettingsInput::DiscordApplicationId),
+            9 => self.open_settings_text(SettingsInput::MpvPath),
+            10 => self.open_settings_text(SettingsInput::MpvArgs),
             _ => {}
+        }
+    }
+
+    fn activate_theme_setting(&mut self) {
+        if let Some(theme) = ThemePreset::ALL.get(self.settings_selected).copied() {
+            self.settings.theme = theme;
+            self.persist_settings();
         }
     }
 
     fn open_settings_text(&mut self, kind: SettingsInput) {
         let value = match kind {
+            SettingsInput::DiscordApplicationId => self.settings.discord_application_id.clone(),
             SettingsInput::MpvPath => self.settings.mpv_path.clone(),
             SettingsInput::MpvArgs => self.settings.mpv_extra_args.clone(),
         };
@@ -1078,7 +1117,16 @@ impl AppState {
             }
             1 => self.open_url_in_browser(GITHUB_URL, "GitHub"),
             2 => self.open_update_popup(),
-            3 => self.clear_library_confirmation = true,
+            3 => match self.poster_disk_cache.clear() {
+                Ok(()) => {
+                    self.poster_cache.invalidate_all();
+                    self.set_info_status("Кеш постерів очищено");
+                }
+                Err(error) => {
+                    self.set_error_status(format!("Не вдалося очистити постери: {error}"));
+                }
+            },
+            4 => self.clear_library_confirmation = true,
             _ => {}
         }
     }
@@ -1121,6 +1169,14 @@ impl AppState {
         match key_code {
             KeyCode::Enter => {
                 match input {
+                    SettingsInput::DiscordApplicationId => {
+                        self.settings.discord_application_id = self
+                            .settings_input_value
+                            .chars()
+                            .filter(char::is_ascii_digit)
+                            .collect();
+                        self.discord_config_changed = true;
+                    }
                     SettingsInput::MpvPath => {
                         self.settings.mpv_path = self.settings_input_value.trim().to_string();
                         if self.settings.mpv_path.is_empty() {
@@ -1263,12 +1319,17 @@ impl AppState {
 
     fn handle_settings_key(&mut self, key_code: KeyCode) {
         let rows = match self.settings_tab {
-            SettingsTab::General => 9,
-            SettingsTab::About => 4,
+            SettingsTab::General => 11,
+            SettingsTab::Themes => ThemePreset::ALL.len(),
+            SettingsTab::About => 5,
         };
         match key_code {
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.settings_tab = self.settings_tab.toggled();
+            KeyCode::Tab => {
+                self.settings_tab = self.settings_tab.next();
+                self.settings_selected = 0;
+            }
+            KeyCode::BackTab => {
+                self.settings_tab = self.settings_tab.previous();
                 self.settings_selected = 0;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1279,6 +1340,7 @@ impl AppState {
             }
             KeyCode::Char(' ') | KeyCode::Enter => match self.settings_tab {
                 SettingsTab::General => self.activate_general_setting(),
+                SettingsTab::Themes => self.activate_theme_setting(),
                 SettingsTab::About => self.activate_about_setting(),
             },
             KeyCode::Char('q') => self.should_quit = true,
@@ -1289,6 +1351,10 @@ impl AppState {
 
     pub fn take_update_check_request(&mut self) -> bool {
         std::mem::take(&mut self.update_check_requested)
+    }
+
+    pub fn take_discord_config_changed(&mut self) -> bool {
+        std::mem::take(&mut self.discord_config_changed)
     }
 
     pub fn finish_update_check(&mut self, result: anyhow::Result<UpdateCheck>) {
@@ -3007,6 +3073,7 @@ impl AppState {
             target.season, target.episode
         ));
         self.now_playing = Some(NowPlaying {
+            anime_id: target.anime_id,
             anime_title: target.anime_title.clone(),
             season: target.season,
             episode: target.episode,
@@ -3821,6 +3888,14 @@ fn anime_is_fully_watched(anime: &LibraryAnimeEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_tabs_cycle_in_both_directions() {
+        assert_eq!(SettingsTab::General.next(), SettingsTab::Themes);
+        assert_eq!(SettingsTab::Themes.next(), SettingsTab::About);
+        assert_eq!(SettingsTab::About.next(), SettingsTab::General);
+        assert_eq!(SettingsTab::General.previous(), SettingsTab::About);
+    }
 
     #[test]
     fn unicode_search_cursor_maps_to_byte_boundaries() {

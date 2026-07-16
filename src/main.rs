@@ -1,12 +1,15 @@
 mod api;
 mod cache;
+mod discord;
 mod platform;
 mod playback;
 mod player;
+mod poster_cache;
 mod settings;
 mod storage;
 mod ui;
 
+use crate::discord::{DiscordPresence, PresenceActivity};
 use crate::playback::*;
 use anyhow::{Result, bail};
 use api::{
@@ -370,6 +373,10 @@ impl ResourceCoordinator {
             app.poster_fetch_pending = Some(anime_id);
             return;
         };
+        if let Ok(Some(image)) = app.poster_disk_cache.load(&url) {
+            app.install_poster(anime_id, std::sync::Arc::new(image));
+            return;
+        }
         match self
             .runtime
             .handle
@@ -534,9 +541,10 @@ impl ResourceCoordinator {
             (ResourceKey::AniHubByAniList(_), Ok(ResourceValue::AniHubId(Some(_)))) => {}
             (ResourceKey::AniHubByAniList(_), Ok(ResourceValue::AniHubId(None))) => {}
             (ResourceKey::AniHubByAniList(_), Err(_)) => {}
-            (ResourceKey::Poster(_), Ok(ResourceValue::Poster(image))) => {
+            (ResourceKey::Poster(url), Ok(ResourceValue::Poster { image, bytes })) => {
                 if let Some(anime_id) = self.poster_requests.remove(&request_id) {
                     self.posters_in_flight.remove(&anime_id);
+                    let _ = app.poster_disk_cache.store(&url, &bytes);
                     let image = std::sync::Arc::new(image);
                     app.install_poster(anime_id, image);
                 }
@@ -791,6 +799,10 @@ async fn main() -> Result<()> {
     let mut app = AppState::new(picker, image_protocol)?;
     let mut resources = ResourceCoordinator::new(app.api_client.clone());
     let mut playback = PlaybackSupervisor::new();
+    let discord_presence = DiscordPresence::new(
+        app.settings.discord_presence,
+        &app.settings.discord_application_id,
+    );
     let mut persisted_positions = HashMap::new();
     let mut update_check: Option<tokio::task::JoinHandle<Result<settings::UpdateCheck>>> = None;
 
@@ -800,6 +812,13 @@ async fn main() -> Result<()> {
         // already moved to S2/S3 but before the generation is canceled.
         resources.sync(&mut app).await;
         resources.drain(&mut app).await;
+        if app.take_discord_config_changed() {
+            discord_presence.configure(
+                app.settings.discord_presence,
+                &app.settings.discord_application_id,
+            );
+            sync_discord_presence(&app, &discord_presence);
+        }
         if app.take_update_check_request() && update_check.is_none() {
             update_check = Some(tokio::spawn(settings::check_for_update(env!(
                 "CARGO_PKG_VERSION"
@@ -825,8 +844,19 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        for event in playback.drain_events() {
+        let playback_events = playback.drain_events();
+        let mut presence_changed = false;
+        for event in playback_events {
+            presence_changed |= matches!(
+                &event,
+                PlaybackEvent::SessionStarted { .. }
+                    | PlaybackEvent::SessionStopped { .. }
+                    | PlaybackEvent::Error { .. }
+            );
             persist_playback_event(&mut app, &mut persisted_positions, event);
+        }
+        if presence_changed {
+            sync_discord_presence(&app, &discord_presence);
         }
 
         if app.play_episode {
@@ -859,14 +889,39 @@ async fn main() -> Result<()> {
     for event in playback.drain_events() {
         persist_playback_event(&mut app, &mut persisted_positions, event);
     }
+    discord_presence.clear();
     resources.shutdown().await;
     if let Some(task) = update_check {
         task.abort();
     }
+    discord_presence.shutdown();
     if let Some(error) = playback_shutdown_error {
         return Err(error);
     }
     Ok(())
+}
+
+fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
+    if !app.settings.discord_presence || app.settings.discord_application_id.parse::<u64>().is_err()
+    {
+        discord.clear();
+        return;
+    }
+    let Some(now) = &app.now_playing else {
+        discord.clear();
+        return;
+    };
+    discord.update(PresenceActivity::watching(
+        &now.anime_title,
+        now.season,
+        now.episode,
+        &now.studio_name,
+        now.position,
+        app.details_cache
+            .get(&now.anime_id)
+            .and_then(|details| details.poster_url.clone())
+            .or_else(|| app.poster_url_for_subject(now.anime_id)),
+    ));
 }
 
 fn apply_playback_settings(
@@ -930,6 +985,7 @@ fn persist_playback_event(
         PlaybackEvent::SessionStarted { session_id, target } => {
             app.clear_activity();
             app.now_playing = Some(ui::app::NowPlaying {
+                anime_id: target.anime_id,
                 anime_title: target.anime_title,
                 season: target.season,
                 episode: target.episode,
