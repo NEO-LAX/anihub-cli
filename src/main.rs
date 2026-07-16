@@ -25,10 +25,12 @@ use ratatui::backend::CrosstermBackend;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::stdout;
+use std::time::{Duration, Instant};
 use ui::{AppMode, AppState, FocusPanel};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SourceLoadScope {
+    DetailsOnly,
     Preview,
     Full,
 }
@@ -60,12 +62,13 @@ struct ResourceCoordinator {
     pending_continue: Option<PendingContinue>,
     ready_playback: Option<(PlayTarget, Vec<PlayTarget>)>,
     cached_search_used: Option<(String, bool)>,
+    poster_candidate: Option<(u32, Instant)>,
 }
 
 impl ResourceCoordinator {
-    fn new(client: api::ApiClient) -> Self {
+    fn new(client: api::ApiClient, poster_cache: poster_cache::PosterCache) -> Self {
         Self {
-            runtime: ResourceWorker::spawn(client),
+            runtime: ResourceWorker::spawn_with_poster_cache(client, poster_cache),
             generation: ViewGeneration::default(),
             context: None,
             poster_requests: HashMap::new(),
@@ -73,6 +76,7 @@ impl ResourceCoordinator {
             pending_continue: None,
             ready_playback: None,
             cached_search_used: None,
+            poster_candidate: None,
         }
     }
 
@@ -264,6 +268,7 @@ impl ResourceCoordinator {
                 source_scope,
             } => {
                 app.set_activity(match source_scope {
+                    SourceLoadScope::DetailsOnly => "Завантаження метаданих…",
                     SourceLoadScope::Preview => "Завантаження першого випуску…",
                     SourceLoadScope::Full => "Завантаження випусків…",
                 });
@@ -271,14 +276,26 @@ impl ResourceCoordinator {
                 if let Some(details) = cached_details.clone() {
                     app.current_details = Some(details);
                 }
-                if cached_details.is_none()
-                    || !app.metadata_cache.details_are_fresh(details_key.anime_id)
-                {
-                    let _ = self
+                let details_need_refresh = cached_details.is_none()
+                    || !app.metadata_cache.details_are_fresh(details_key.anime_id);
+                if details_need_refresh {
+                    let request = self
                         .runtime
                         .handle
                         .load(self.generation, ResourceKey::details(details_key.anime_id))
                         .await;
+                    if request.is_err() {
+                        app.clear_activity();
+                        app.set_error_status("Сервіс завантаження недоступний");
+                        return;
+                    }
+                }
+
+                if matches!(source_scope, SourceLoadScope::DetailsOnly) {
+                    if cached_details.is_some() {
+                        app.clear_activity();
+                    }
+                    return;
                 }
 
                 if let Some(sources) = app.sources_cache.get(&details_key) {
@@ -340,11 +357,25 @@ impl ResourceCoordinator {
     async fn schedule_poster(&mut self, app: &mut AppState) {
         if !app.settings.show_posters {
             app.poster_fetch_pending = None;
+            self.poster_candidate = None;
             return;
         }
-        let Some(anime_id) = app.poster_fetch_pending.take() else {
+        let Some(anime_id) = app.poster_fetch_pending else {
+            self.poster_candidate = None;
             return;
         };
+        const POSTER_DEBOUNCE: Duration = Duration::from_millis(120);
+        match self.poster_candidate {
+            Some((candidate, since))
+                if candidate == anime_id && since.elapsed() >= POSTER_DEBOUNCE => {}
+            Some((candidate, _)) if candidate == anime_id => return,
+            _ => {
+                self.poster_candidate = Some((anime_id, Instant::now()));
+                return;
+            }
+        }
+        app.poster_fetch_pending = None;
+        self.poster_candidate = None;
         if let Some(image) = app.poster_cache.get(&anime_id) {
             app.install_poster(anime_id, image);
             return;
@@ -373,10 +404,6 @@ impl ResourceCoordinator {
             app.poster_fetch_pending = Some(anime_id);
             return;
         };
-        if let Ok(Some(image)) = app.poster_disk_cache.load(&url) {
-            app.install_poster(anime_id, std::sync::Arc::new(image));
-            return;
-        }
         match self
             .runtime
             .handle
@@ -492,11 +519,20 @@ impl ResourceCoordinator {
                     {
                         app.poster_fetch_pending = Some(anime_id);
                     }
+                    if matches!(
+                        self.desired_context(app),
+                        Some(ResourceContext::Content {
+                            source_scope: SourceLoadScope::DetailsOnly,
+                            ..
+                        })
+                    ) {
+                        app.clear_activity();
+                    }
                 }
             }
             (ResourceKey::Details(anime_id), Err(error)) => {
+                app.clear_activity();
                 if app.details_cache.contains_key(&anime_id) {
-                    app.clear_activity();
                     app.set_info_status("Показано кешовані метадані · оновлення не вдалося");
                 } else {
                     app.set_error_status(format!("Помилка метаданих: {error}"));
@@ -541,10 +577,9 @@ impl ResourceCoordinator {
             (ResourceKey::AniHubByAniList(_), Ok(ResourceValue::AniHubId(Some(_)))) => {}
             (ResourceKey::AniHubByAniList(_), Ok(ResourceValue::AniHubId(None))) => {}
             (ResourceKey::AniHubByAniList(_), Err(_)) => {}
-            (ResourceKey::Poster(url), Ok(ResourceValue::Poster { image, bytes })) => {
+            (ResourceKey::Poster(_), Ok(ResourceValue::Poster(image))) => {
                 if let Some(anime_id) = self.poster_requests.remove(&request_id) {
                     self.posters_in_flight.remove(&anime_id);
-                    let _ = app.poster_disk_cache.store(&url, &bytes);
                     let image = std::sync::Arc::new(image);
                     app.install_poster(anime_id, image);
                 }
@@ -615,6 +650,11 @@ fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
                     .map(|season| season.season)
             })
             .unwrap_or(anime.latest_progress.season);
+        let source_scope = if app.mode == AppMode::Library {
+            SourceLoadScope::DetailsOnly
+        } else {
+            SourceLoadScope::Full
+        };
         let mut source_keys = anime
             .seasons
             .iter()
@@ -631,10 +671,11 @@ fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
         if !source_keys.contains(&details_key) {
             source_keys.push(details_key);
         }
+        let source_keys = source_keys_for_scope(source_keys, &source_scope);
         return Some(ResourceContext::Content {
             source_keys,
             details_key,
-            source_scope: SourceLoadScope::Full,
+            source_scope,
         });
     }
     if app.mode == AppMode::Normal {
@@ -703,8 +744,10 @@ fn source_keys_for_scope(
     mut source_keys: Vec<EpisodeSourcesKey>,
     scope: &SourceLoadScope,
 ) -> Vec<EpisodeSourcesKey> {
-    if matches!(scope, SourceLoadScope::Preview) {
-        source_keys.truncate(1);
+    match scope {
+        SourceLoadScope::DetailsOnly => source_keys.clear(),
+        SourceLoadScope::Preview => source_keys.truncate(1),
+        SourceLoadScope::Full => {}
     }
     source_keys
 }
@@ -797,9 +840,11 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = AppState::new(picker, image_protocol)?;
-    let mut resources = ResourceCoordinator::new(app.api_client.clone());
+    let mut resources =
+        ResourceCoordinator::new(app.api_client.clone(), app.poster_disk_cache.clone());
     let mut playback = PlaybackSupervisor::new();
     let discord_presence = DiscordPresence::new(app.settings.discord_presence);
+    sync_discord_presence(&app, &discord_presence);
     let mut persisted_positions = HashMap::new();
     let mut update_check: Option<tokio::task::JoinHandle<Result<settings::UpdateCheck>>> = None;
 
@@ -844,8 +889,6 @@ async fn main() -> Result<()> {
             presence_changed |= matches!(
                 &event,
                 PlaybackEvent::SessionStarted { .. }
-                    | PlaybackEvent::ProgressSnapshot(_)
-                    | PlaybackEvent::PauseChanged { .. }
                     | PlaybackEvent::SessionStopped { .. }
                     | PlaybackEvent::Error { .. }
             );
@@ -903,7 +946,7 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
         return;
     }
     let Some(now) = &app.now_playing else {
-        discord.clear();
+        discord.update(PresenceActivity::idle());
         return;
     };
     discord.update(PresenceActivity::watching(
@@ -911,8 +954,6 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
         now.season,
         now.episode,
         &now.studio_name,
-        now.position,
-        now.paused,
         app.details_cache
             .get(&now.anime_id)
             .and_then(|details| details.poster_url.clone())
@@ -1344,6 +1385,17 @@ mod staged_source_loading_tests {
                 &SourceLoadScope::Preview,
             ),
             vec![EpisodeSourcesKey::new(10, 1)]
+        );
+    }
+
+    #[test]
+    fn library_root_does_not_request_episode_sources() {
+        assert!(
+            source_keys_for_scope(
+                vec![EpisodeSourcesKey::new(10, 1), EpisodeSourcesKey::new(20, 2),],
+                &SourceLoadScope::DetailsOnly,
+            )
+            .is_empty()
         );
     }
 

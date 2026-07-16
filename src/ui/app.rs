@@ -623,6 +623,7 @@ impl AppState {
     /// Select the release whose metadata and poster should appear in the
     /// sidebar. This is the single state transition used by release browsing.
     pub fn select_sidebar_subject(&mut self, anime_id: Option<u32>) {
+        let subject_changed = self.sidebar_subject_id != anime_id;
         self.sidebar_subject_id = anime_id;
         self.sidebar_anime_idx =
             anime_id.and_then(|id| self.search_results.iter().position(|anime| anime.id == id));
@@ -636,13 +637,13 @@ impl AppState {
 
         match anime_id {
             Some(id) => {
-                if let Some(image) = self.poster_cache.get(&id) {
-                    self.current_poster = Some(self.picker.new_resize_protocol((*image).clone()));
-                    self.poster_fetch_pending = None;
-                } else {
-                    self.current_poster = None;
-                    self.poster_fetch_pending = Some(id);
+                if !subject_changed
+                    && (self.current_poster.is_some() || self.poster_fetch_pending == Some(id))
+                {
+                    return;
                 }
+                self.current_poster = None;
+                self.poster_fetch_pending = Some(id);
             }
             None => {
                 self.current_poster = None;

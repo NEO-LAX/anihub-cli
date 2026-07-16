@@ -7,6 +7,7 @@
 use super::client::{ApiClient, ApiError};
 use super::franchise::AniListMedia;
 use super::models::{AnimeDetails, AnimeItem, EpisodeSourcesKey, EpisodeSourcesResponse};
+use crate::poster_cache::PosterCache;
 use image::DynamicImage;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -102,7 +103,7 @@ impl ResourceKey {
     }
 
     fn uses_anihub(&self) -> bool {
-        true
+        !matches!(self, Self::Poster(_))
     }
 }
 
@@ -115,7 +116,7 @@ pub enum ResourceValue {
     AniHubId(Option<u32>),
     Details(AnimeDetails),
     Sources(EpisodeSourcesResponse),
-    Poster { image: DynamicImage, bytes: Vec<u8> },
+    Poster(DynamicImage),
 }
 
 #[derive(Debug, Clone)]
@@ -298,13 +299,29 @@ impl ResourceWorkerRuntime {
 pub struct ResourceWorker;
 
 impl ResourceWorker {
-    pub fn spawn(api_client: ApiClient) -> ResourceWorkerRuntime {
-        Self::spawn_with_config(api_client, ResourceWorkerConfig::default())
+    pub fn spawn_with_poster_cache(
+        api_client: ApiClient,
+        poster_cache: PosterCache,
+    ) -> ResourceWorkerRuntime {
+        Self::spawn_internal(
+            api_client,
+            ResourceWorkerConfig::default(),
+            Some(poster_cache),
+        )
     }
 
-    pub fn spawn_with_config(
+    #[cfg(test)]
+    fn spawn_with_config(
         api_client: ApiClient,
         config: ResourceWorkerConfig,
+    ) -> ResourceWorkerRuntime {
+        Self::spawn_internal(api_client, config, None)
+    }
+
+    fn spawn_internal(
+        api_client: ApiClient,
+        config: ResourceWorkerConfig,
+        poster_cache: Option<PosterCache>,
     ) -> ResourceWorkerRuntime {
         let command_capacity = config.command_capacity.max(1);
         let event_capacity = config.event_capacity.max(1);
@@ -314,7 +331,7 @@ impl ResourceWorker {
             command_tx,
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
-        let actor = Actor::new(api_client, command_rx, event_tx, config);
+        let actor = Actor::new(api_client, command_rx, event_tx, config, poster_cache);
         let join_handle = tokio::spawn(actor.run());
         ResourceWorkerRuntime {
             handle,
@@ -338,6 +355,7 @@ struct Waiter {
 struct InFlight {
     work: Work,
     waiters: Vec<Waiter>,
+    abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 struct CacheEntry<T> {
@@ -407,9 +425,9 @@ struct Actor {
     negative: HashMap<ResourceKey, CacheEntry<LoadError>>,
     canceled_generations: HashSet<ViewGeneration>,
     tasks: JoinSet<TaskOutcome>,
-    running_anihub: usize,
     shutting_down: bool,
     hub_limiter: Arc<HubLimiter>,
+    poster_cache: Option<PosterCache>,
 }
 
 impl Actor {
@@ -418,12 +436,14 @@ impl Actor {
         command_rx: mpsc::Receiver<ResourceCommand>,
         event_tx: mpsc::Sender<ResourceEvent>,
         config: ResourceWorkerConfig,
+        poster_cache: Option<PosterCache>,
     ) -> Self {
         Self {
             api_client,
             command_rx,
             event_tx,
             hub_limiter: Arc::new(HubLimiter::new(&config)),
+            poster_cache,
             config,
             pending: VecDeque::new(),
             in_flight: HashMap::new(),
@@ -431,7 +451,6 @@ impl Actor {
             negative: HashMap::new(),
             canceled_generations: HashSet::new(),
             tasks: JoinSet::new(),
-            running_anihub: 0,
             shutting_down: false,
         }
     }
@@ -466,7 +485,7 @@ impl Actor {
             return;
         }
 
-        while self.running_anihub < self.config.anihub_max_concurrency.max(1) {
+        while self.tasks.len() < self.config.anihub_max_concurrency.max(1) {
             let Some(key) = self.pending.pop_front() else {
                 break;
             };
@@ -479,19 +498,22 @@ impl Actor {
             }
 
             let work = in_flight.work.clone();
-            if work.key.uses_anihub() {
-                self.running_anihub += 1;
-            }
             let api_client = self.api_client.clone();
             let config = self.config.clone();
             let hub_limiter = self.hub_limiter.clone();
-            self.tasks.spawn(async move {
-                let result = load_with_retries(api_client, work.clone(), config, hub_limiter).await;
+            let poster_cache = self.poster_cache.clone();
+            let abort_handle = self.tasks.spawn(async move {
+                let result =
+                    load_with_retries(api_client, work.clone(), config, hub_limiter, poster_cache)
+                        .await;
                 TaskOutcome {
                     key: work.key,
                     result,
                 }
             });
+            if let Some(in_flight) = self.in_flight.get_mut(&key) {
+                in_flight.abort_handle = Some(abort_handle);
+            }
         }
     }
 
@@ -548,6 +570,7 @@ impl Actor {
             InFlight {
                 work,
                 waiters: vec![waiter],
+                abort_handle: None,
             },
         );
         self.pending.push_back(key);
@@ -555,10 +578,21 @@ impl Actor {
 
     fn cancel_generation(&mut self, generation: ViewGeneration) {
         self.canceled_generations.insert(generation);
-        for in_flight in self.in_flight.values_mut() {
+        let mut abandoned = Vec::new();
+        for (key, in_flight) in &mut self.in_flight {
             in_flight
                 .waiters
                 .retain(|waiter| waiter.generation != generation);
+            if in_flight.waiters.is_empty() {
+                abandoned.push(key.clone());
+            }
+        }
+        for key in abandoned {
+            if let Some(in_flight) = self.in_flight.remove(&key)
+                && let Some(abort_handle) = in_flight.abort_handle
+            {
+                abort_handle.abort();
+            }
         }
         self.pending.retain(|key| {
             self.in_flight
@@ -584,9 +618,6 @@ impl Actor {
     }
 
     async fn handle_outcome(&mut self, outcome: TaskOutcome) {
-        if outcome.key.uses_anihub() {
-            self.running_anihub = self.running_anihub.saturating_sub(1);
-        }
         let Some(in_flight) = self.in_flight.remove(&outcome.key) else {
             return;
         };
@@ -687,13 +718,14 @@ async fn load_with_retries(
     work: Work,
     config: ResourceWorkerConfig,
     hub_limiter: Arc<HubLimiter>,
+    poster_cache: Option<PosterCache>,
 ) -> Result<ResourceValue, LoadError> {
     let mut retry_number = 0usize;
     loop {
         if work.key.uses_anihub() {
             hub_limiter.acquire_start().await;
         }
-        match load_once(&api_client, &work).await {
+        match load_once(&api_client, &work, poster_cache.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) if error.is_transient() && retry_number < config.retry_limit => {
                 let exponential = config
@@ -709,7 +741,11 @@ async fn load_with_retries(
     }
 }
 
-async fn load_once(api_client: &ApiClient, work: &Work) -> Result<ResourceValue, LoadError> {
+async fn load_once(
+    api_client: &ApiClient,
+    work: &Work,
+    poster_cache: Option<PosterCache>,
+) -> Result<ResourceValue, LoadError> {
     match &work.key {
         ResourceKey::Search { query, extended } => {
             let items = api_client
@@ -747,11 +783,23 @@ async fn load_once(api_client: &ApiClient, work: &Work) -> Result<ResourceValue,
             .await
             .map(ResourceValue::Sources)
             .map_err(classify_error),
-        ResourceKey::Poster(url) => api_client
-            .fetch_poster(url)
-            .await
-            .map(|(image, bytes)| ResourceValue::Poster { image, bytes })
-            .map_err(classify_error),
+        ResourceKey::Poster(url) => {
+            if let Some(cache) = poster_cache.clone() {
+                let cache_url = url.clone();
+                if let Ok(Ok(Some(image))) =
+                    tokio::task::spawn_blocking(move || cache.load(&cache_url)).await
+                {
+                    return Ok(ResourceValue::Poster(image));
+                }
+            }
+
+            let (image, bytes) = api_client.fetch_poster(url).await.map_err(classify_error)?;
+            if let Some(cache) = poster_cache {
+                let cache_url = url.clone();
+                let _ = tokio::task::spawn_blocking(move || cache.store(&cache_url, &bytes)).await;
+            }
+            Ok(ResourceValue::Poster(image))
+        }
     }
 }
 
@@ -786,8 +834,11 @@ fn classify_error(error: anyhow::Error) -> LoadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageFormat, RgbImage};
     use serde_json::json;
+    use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout;
 
@@ -944,6 +995,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poster_worker_reuses_disk_cache_without_network() {
+        let server = TestServer::start(500, Duration::ZERO).await;
+        let api = ApiClient::with_base_urls(&server.url, &server.url).unwrap();
+        let cache_root = std::env::temp_dir().join(format!(
+            "anihub-resource-poster-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = PosterCache::new(&cache_root).unwrap();
+        let poster_url = format!("{}/poster.png", server.url);
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(RgbImage::new(2, 3))
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        cache.store(&poster_url, &encoded.into_inner()).unwrap();
+
+        let mut runtime = ResourceWorker::spawn_with_poster_cache(api, cache);
+        runtime
+            .handle
+            .load(ViewGeneration::new(1), ResourceKey::poster(&poster_url))
+            .await
+            .unwrap();
+        let event = timeout(Duration::from_secs(1), runtime.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::Completed {
+                value: ResourceValue::Poster(image),
+                ..
+            } if (image.width(), image.height()) == (2, 3)
+        ));
+        assert_eq!(server.request_count(), 0);
+
+        runtime.shutdown().await.unwrap();
+        server.stop().await;
+        std::fs::remove_dir_all(cache_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn canceled_generation_does_not_receive_stale_result() {
         let server = TestServer::start(200, Duration::from_millis(100)).await;
         let api = ApiClient::with_base_urls(&server.url, &server.url).unwrap();
@@ -961,6 +1056,57 @@ mod tests {
                 .await
                 .is_err()
         );
+        runtime.shutdown().await.unwrap();
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn canceled_running_request_releases_the_worker_slot() {
+        let server = TestServer::start(200, Duration::from_millis(200)).await;
+        let api = ApiClient::with_base_urls(&server.url, &server.url).unwrap();
+        let config = ResourceWorkerConfig {
+            anihub_max_concurrency: 1,
+            ..test_config()
+        };
+        let mut runtime = ResourceWorker::spawn_with_config(api, config);
+        let stale_generation = ViewGeneration::new(20);
+        runtime
+            .handle
+            .load(stale_generation, ResourceKey::Details(7))
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            while server.request_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        runtime
+            .handle
+            .cancel_generation(stale_generation)
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .load(ViewGeneration::new(21), ResourceKey::Details(8))
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_millis(300), runtime.events.recv())
+            .await
+            .expect("current request should not wait for the canceled request")
+            .unwrap();
+        assert!(matches!(
+            event,
+            ResourceEvent::Completed {
+                generation: ViewGeneration(21),
+                key: ResourceKey::Details(8),
+                ..
+            }
+        ));
+
         runtime.shutdown().await.unwrap();
         server.stop().await;
     }

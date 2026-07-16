@@ -12,6 +12,7 @@ const DEFAULT_MAX_BYTES: u64 = 150 * 1024 * 1024;
 ///
 /// Watch history and settings never live here, so corrupt or old entries can
 /// be removed without risking user data.
+#[derive(Clone)]
 pub struct PosterCache {
     directory: PathBuf,
     max_bytes: u64,
