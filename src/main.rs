@@ -1,4 +1,5 @@
 mod api;
+mod cache;
 mod platform;
 mod playback;
 mod player;
@@ -31,7 +32,10 @@ enum SourceLoadScope {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ResourceContext {
-    Search(String),
+    Search {
+        query: String,
+        extended: bool,
+    },
     Content {
         source_keys: Vec<EpisodeSourcesKey>,
         details_key: EpisodeSourcesKey,
@@ -52,6 +56,7 @@ struct ResourceCoordinator {
     posters_in_flight: HashSet<u32>,
     pending_continue: Option<PendingContinue>,
     ready_playback: Option<(PlayTarget, Vec<PlayTarget>)>,
+    cached_search_used: Option<(String, bool)>,
 }
 
 impl ResourceCoordinator {
@@ -64,6 +69,7 @@ impl ResourceCoordinator {
             posters_in_flight: HashSet::new(),
             pending_continue: None,
             ready_playback: None,
+            cached_search_used: None,
         }
     }
 
@@ -78,6 +84,7 @@ impl ResourceCoordinator {
             self.context = desired.clone();
             self.poster_requests.clear();
             self.posters_in_flight.clear();
+            self.cached_search_used = None;
 
             if let Some(context) = desired {
                 self.start_context(app, context).await;
@@ -230,12 +237,17 @@ impl ResourceCoordinator {
 
     async fn start_context(&mut self, app: &mut AppState, context: ResourceContext) {
         match context {
-            ResourceContext::Search(query) => {
+            ResourceContext::Search { query, extended } => {
                 app.set_activity("Пошук аніме…");
+                if let Some(cached) = app.metadata_cache.search(&query, extended) {
+                    apply_search_results(app, cached.items, cached.anilist_media, false);
+                    self.cached_search_used = Some((query.clone(), extended));
+                    app.set_activity("Показано кеш · оновлення у фоні…");
+                }
                 if self
                     .runtime
                     .handle
-                    .load(self.generation, ResourceKey::search(query))
+                    .load(self.generation, ResourceKey::search(query, extended))
                     .await
                     .is_err()
                 {
@@ -252,9 +264,13 @@ impl ResourceCoordinator {
                     SourceLoadScope::Preview => "Завантаження першого випуску…",
                     SourceLoadScope::Full => "Завантаження випусків…",
                 });
-                if let Some(details) = app.details_cache.get(&details_key.anime_id) {
+                let cached_details = app.details_cache.get(&details_key.anime_id);
+                if let Some(details) = cached_details.clone() {
                     app.current_details = Some(details);
-                } else {
+                }
+                if cached_details.is_none()
+                    || !app.metadata_cache.details_are_fresh(details_key.anime_id)
+                {
                     let _ = self
                         .runtime
                         .handle
@@ -398,18 +414,36 @@ impl ResourceCoordinator {
         }
 
         match (key, result) {
-            (ResourceKey::Search(_), Ok(ResourceValue::Search(results))) => {
+            (ResourceKey::Search { query, extended }, Ok(ResourceValue::Search(results))) => {
+                let _ = app.metadata_cache.put_search(
+                    &query,
+                    extended,
+                    results.items.clone(),
+                    results.anilist_media.clone(),
+                );
+                self.cached_search_used = None;
                 apply_search_results(
                     app,
                     api::deduplicate_anime(results.items),
                     results.anilist_media,
+                    true,
                 );
             }
-            (ResourceKey::Search(_), Err(error)) => {
-                app.clear_activity();
-                app.set_error_status(format!("Помилка пошуку: {error}"));
+            (ResourceKey::Search { query, extended }, Err(error)) => {
+                if self.cached_search_used.as_ref() == Some(&(query, extended)) {
+                    self.cached_search_used = None;
+                    app.search_query.clear();
+                    app.clear_activity();
+                    app.set_info_status(
+                        "Показано кешовані результати · мережеве оновлення не вдалося",
+                    );
+                } else {
+                    app.clear_activity();
+                    app.set_error_status(format!("Помилка пошуку: {error}"));
+                }
             }
             (ResourceKey::Details(anime_id), Ok(ResourceValue::Details(details))) => {
+                let _ = app.metadata_cache.put_details(details.clone());
                 app.details_cache.insert(anime_id, details.clone());
                 if should_add_details_to_search(
                     app.mode,
@@ -418,6 +452,14 @@ impl ResourceCoordinator {
                 ) {
                     app.search_results.push(anime_item_from_details(&details));
                     rebuild_franchise_projection(app);
+                    if !app.last_search_query.is_empty() {
+                        let _ = app.metadata_cache.put_search(
+                            &app.last_search_query,
+                            app.settings.search_mode.is_extended(),
+                            app.search_results.clone(),
+                            app.anilist_media.clone(),
+                        );
+                    }
                 }
                 for item in app
                     .library_all_items
@@ -445,8 +487,13 @@ impl ResourceCoordinator {
                     }
                 }
             }
-            (ResourceKey::Details(_), Err(error)) => {
-                app.set_error_status(format!("Помилка метаданих: {error}"));
+            (ResourceKey::Details(anime_id), Err(error)) => {
+                if app.details_cache.contains_key(&anime_id) {
+                    app.clear_activity();
+                    app.set_info_status("Показано кешовані метадані · оновлення не вдалося");
+                } else {
+                    app.set_error_status(format!("Помилка метаданих: {error}"));
+                }
             }
             (ResourceKey::Sources(source_key), Ok(ResourceValue::Sources(sources))) => {
                 let sources = cap_sources_to_available_episodes(
@@ -542,7 +589,10 @@ fn cap_sources_to_available_episodes(
 
 fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
     if app.mode == AppMode::Normal && !app.search_query.trim().is_empty() {
-        return Some(ResourceContext::Search(app.search_query.trim().to_string()));
+        return Some(ResourceContext::Search {
+            query: app.search_query.trim().to_string(),
+            extended: app.settings.search_mode.is_extended(),
+        });
     }
     if app.is_library_mode() {
         let anime = app.library_selected_anime()?;
@@ -1062,6 +1112,7 @@ fn apply_search_results(
     app: &mut AppState,
     results: Vec<api::AnimeItem>,
     anilist_media: Vec<api::AniListMedia>,
+    finish_search: bool,
 ) {
     app.search_results = results;
     app.anilist_media = anilist_media;
@@ -1070,8 +1121,10 @@ fn apply_search_results(
             .insert(item.id, anime_details_from_item(item));
     }
     rebuild_franchise_projection(app);
-    app.search_query.clear();
-    app.search_cursor = 0;
+    if finish_search {
+        app.search_query.clear();
+        app.search_cursor = 0;
+    }
 
     app.focus = FocusPanel::SearchList;
     app.current_sources = None;

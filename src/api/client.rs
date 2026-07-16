@@ -15,6 +15,8 @@ const ANILIST_GRAPHQL_URL: &str = "https://graphql.anilist.co";
 const ANILIST_BATCH_SIZE: usize = 50;
 const SEARCH_PAGE_SIZE: u32 = 20;
 const BASIC_SEARCH_RESULT_LIMIT: usize = 20;
+const EXTENDED_SEARCH_PAGE_LIMIT: u32 = 5;
+const EXTENDED_SEARCH_RESULT_LIMIT: usize = 100;
 const MAX_CONCURRENT_REQUESTS: usize = 3;
 const MAX_REQUEST_STARTS: usize = 40;
 const REQUEST_WINDOW: Duration = Duration::from_secs(60);
@@ -309,29 +311,38 @@ impl ApiClient {
     /// can exhaust the upstream request budget. Results must match the first
     /// first two words of one of the available titles.
     pub async fn search_anime(&self, query: &str) -> Result<Vec<AnimeItem>> {
+        self.search_anime_with_mode(query, false).await
+    }
+
+    pub async fn search_anime_with_mode(
+        &self,
+        query: &str,
+        extended: bool,
+    ) -> Result<Vec<AnimeItem>> {
         let normalized_query = normalize_search_text(query);
         if normalized_query.is_empty() {
             return Ok(Vec::new());
         }
 
-        let request = self
-            .authenticated(self.client.get(self.api_url("/anime/")))
-            .query(&[
-                ("search", query),
-                ("has_ukrainian_dub", "true"),
-                ("page_size", "20"),
-                ("page", "1"),
-            ]);
-        let response = self
-            .send_request(request, "AniHub search request")
-            .await
-            .context("Failed to send AniHub search request")?;
-        let response = ensure_success(response, "AniHub search")?;
-        let search_response: AnimeSearchResponse = parse_json(response, "AniHub search")
-            .await
-            .context("Failed to parse AniHub search response")?;
+        let first_page = self.search_anime_page(query, 1).await?;
+        if extended {
+            let page_limit = first_page.total_pages.min(EXTENDED_SEARCH_PAGE_LIMIT);
+            let mut items = first_page.items;
+            for page in 2..=page_limit {
+                items.extend(self.search_anime_page(query, page).await?.items);
+            }
+            return Ok(deduplicate_anime_by_id(
+                items
+                    .into_iter()
+                    .filter(|item| item.has_ukrainian_dub)
+                    .collect(),
+            )
+            .into_iter()
+            .take(EXTENDED_SEARCH_RESULT_LIMIT)
+            .collect());
+        }
 
-        let matches = search_response
+        let matches = first_page
             .items
             .into_iter()
             .filter(|item| item.has_ukrainian_dub)
@@ -341,6 +352,26 @@ impl ApiClient {
             .into_iter()
             .take(BASIC_SEARCH_RESULT_LIMIT)
             .collect())
+    }
+
+    async fn search_anime_page(&self, query: &str, page: u32) -> Result<AnimeSearchResponse> {
+        let page = page.to_string();
+        let request = self
+            .authenticated(self.client.get(self.api_url("/anime/")))
+            .query(&[
+                ("search", query),
+                ("has_ukrainian_dub", "true"),
+                ("page_size", "20"),
+                ("page", page.as_str()),
+            ]);
+        let response = self
+            .send_request(request, "AniHub search request")
+            .await
+            .context("Failed to send AniHub search request")?;
+        let response = ensure_success(response, "AniHub search")?;
+        parse_json(response, "AniHub search")
+            .await
+            .context("Failed to parse AniHub search response")
     }
 
     pub async fn get_anime_details(&self, anime_id: u32) -> Result<AnimeDetails> {
@@ -785,6 +816,33 @@ mod tests {
         let requests = server.requests().await;
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("page=1"));
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn extended_search_reads_multiple_pages_without_strict_title_filter() {
+        let server = MockServer::start(|_, path| {
+            let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+            let params = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            match params.get("page").map(String::as_str) {
+                Some("1") => (200, page(vec![item(1, "Зовсім інша назва")], 1, 3)),
+                Some("2") => (200, page(vec![item(2, "Другий результат")], 2, 3)),
+                Some("3") => (200, page(vec![item(3, "Третій результат")], 3, 3)),
+                _ => (500, "{}".to_string()),
+            }
+        })
+        .await;
+
+        let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
+        let result = client
+            .search_anime_with_mode("дівчина", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.iter().map(|anime| anime.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(server.requests().await.len(), 3);
         server.stop().await;
     }
 

@@ -20,6 +20,34 @@ pub enum StartScreen {
     Library,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    #[default]
+    Strict,
+    Extended,
+}
+
+impl SearchMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Strict => "Звичайний · 20",
+            Self::Extended => "Розширений · до 100",
+        }
+    }
+
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Strict => Self::Extended,
+            Self::Extended => Self::Strict,
+        }
+    }
+
+    pub const fn is_extended(self) -> bool {
+        matches!(self, Self::Extended)
+    }
+}
+
 impl StartScreen {
     pub const fn label(self) -> &'static str {
         match self {
@@ -87,6 +115,7 @@ pub struct Settings {
     /// Percentage at which a partial playback snapshot becomes watched.
     /// `None` means only natural EOF or an explicit Space/status action marks it.
     pub watched_threshold_percent: Option<u8>,
+    pub search_mode: SearchMode,
     pub start_screen: StartScreen,
     pub default_library_filter: DefaultLibraryFilter,
     pub show_posters: bool,
@@ -101,6 +130,7 @@ impl Default for Settings {
             autoplay_next: true,
             resume_from_timestamp: true,
             watched_threshold_percent: Some(90),
+            search_mode: SearchMode::Strict,
             start_screen: StartScreen::Search,
             default_library_filter: DefaultLibraryFilter::All,
             show_posters: true,
@@ -262,7 +292,22 @@ mod tests {
         assert!(settings.autoplay_next);
         assert!(settings.resume_from_timestamp);
         assert_eq!(settings.watched_threshold_percent, Some(90));
+        assert_eq!(settings.search_mode, SearchMode::Strict);
         assert_eq!(settings.mpv_path, "mpv");
+    }
+
+    #[test]
+    fn search_mode_toggles_between_strict_and_extended() {
+        assert_eq!(SearchMode::Strict.toggled(), SearchMode::Extended);
+        assert_eq!(SearchMode::Extended.toggled(), SearchMode::Strict);
+    }
+
+    #[test]
+    fn settings_without_search_mode_keep_strict_default() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("search_mode");
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.search_mode, SearchMode::Strict);
     }
 
     #[test]

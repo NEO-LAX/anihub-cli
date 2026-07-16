@@ -65,7 +65,10 @@ impl From<u64> for ViewGeneration {
 /// Resources supported by the worker.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResourceKey {
-    Search(String),
+    Search {
+        query: String,
+        extended: bool,
+    },
     AniHubByAniList(u32),
     Details(u32),
     /// Episode sources requested explicitly for the currently opened view.
@@ -75,8 +78,11 @@ pub enum ResourceKey {
 }
 
 impl ResourceKey {
-    pub fn search(query: impl Into<String>) -> Self {
-        Self::Search(query.into())
+    pub fn search(query: impl Into<String>, extended: bool) -> Self {
+        Self::Search {
+            query: query.into(),
+            extended,
+        }
     }
 
     pub const fn details(anime_id: u32) -> Self {
@@ -705,9 +711,9 @@ async fn load_with_retries(
 
 async fn load_once(api_client: &ApiClient, work: &Work) -> Result<ResourceValue, LoadError> {
     match &work.key {
-        ResourceKey::Search(query) => {
+        ResourceKey::Search { query, extended } => {
             let items = api_client
-                .search_anime(query)
+                .search_anime_with_mode(query, *extended)
                 .await
                 .map_err(classify_error)?;
             let anilist_ids = items
@@ -875,6 +881,14 @@ mod tests {
             completed_cache_ttl: Duration::from_secs(30),
             negative_cache_ttl: Duration::from_secs(30),
         }
+    }
+
+    #[test]
+    fn strict_and_extended_searches_do_not_share_worker_cache_keys() {
+        assert_ne!(
+            ResourceKey::search("каґуя", false),
+            ResourceKey::search("каґуя", true)
+        );
     }
 
     #[tokio::test]

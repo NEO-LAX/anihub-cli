@@ -554,6 +554,40 @@ impl StorageManager {
         self.set_episodes_watched(std::slice::from_ref(&update))
     }
 
+    /// Toggle one logical episode across all known dubbings. The selected
+    /// studio is inserted when a browser-only MoonAnime episode has no prior
+    /// local progress row.
+    pub fn set_episode_watched_across_dubbings(
+        &self,
+        anime_id: u32,
+        title: &str,
+        season: u32,
+        episode: u32,
+        studio_name: &str,
+        watched: bool,
+    ) -> Result<AppHistory> {
+        let now = Utc::now().timestamp();
+        let update = EpisodeWatchedUpdate {
+            anime_id,
+            anime_title: title.to_string(),
+            season,
+            episode,
+            studio_name: studio_name.to_string(),
+            watched,
+        };
+        self.update_history_batch(|history| {
+            for progress in history.progress.values_mut().filter(|progress| {
+                progress.anime_id == anime_id
+                    && progress.season == season
+                    && progress.episode == episode
+            }) {
+                progress.watched = watched;
+                progress.updated_at = now;
+            }
+            Self::apply_episode_watched(history, &update, now);
+        })
+    }
+
     #[allow(dead_code)]
     pub fn latest_progress(&self) -> Result<Option<WatchProgress>> {
         let history = self.load_history()?;
@@ -1550,6 +1584,41 @@ mod tests {
         assert_eq!(
             manager.load_history().expect("reload cleared history"),
             history
+        );
+    }
+
+    #[test]
+    fn manual_episode_toggle_syncs_moonanime_with_other_dubbings() {
+        let directory = TestDirectory::new();
+        let manager = directory.manager();
+        manager
+            .set_episode_watched(42, "Каґуя", 3, 4, "Ashdi", true)
+            .expect("seed Ashdi progress");
+
+        let history = manager
+            .set_episode_watched_across_dubbings(42, "Каґуя", 3, 4, "MoonAnime", false)
+            .expect("unwatch through MoonAnime");
+        let matching = history
+            .progress
+            .values()
+            .filter(|progress| {
+                progress.anime_id == 42 && progress.season == 3 && progress.episode == 4
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 2);
+        assert!(matching.iter().all(|progress| !progress.watched));
+
+        let history = manager
+            .set_episode_watched_across_dubbings(42, "Каґуя", 3, 4, "MoonAnime", true)
+            .expect("watch through MoonAnime");
+        assert!(
+            history
+                .progress
+                .values()
+                .filter(|progress| {
+                    progress.anime_id == 42 && progress.season == 3 && progress.episode == 4
+                })
+                .all(|progress| progress.watched)
         );
     }
 

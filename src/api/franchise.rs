@@ -1106,6 +1106,54 @@ mod tests {
     }
 
     #[test]
+    fn classroom_of_the_elite_keeps_three_seasons_in_story_order() {
+        let s1 = node(98659, "Classroom of the Elite", "TV", 2017);
+        let s2 = node(145545, "Classroom of the Elite Season 2", "TV", 2022);
+        let s3 = node(146066, "Classroom of the Elite Season 3", "TV", 2024);
+        let available = vec![
+            item(
+                101,
+                s1.id,
+                "Клас еліти",
+                "Classroom of the Elite",
+                "tv",
+                2017,
+            ),
+            item(
+                102,
+                s2.id,
+                "Клас еліти 2",
+                "Classroom of the Elite II",
+                "tv",
+                2022,
+            ),
+            item(
+                103,
+                s3.id,
+                "Клас еліти 3",
+                "Classroom of the Elite III",
+                "tv",
+                2024,
+            ),
+        ];
+        let graph = vec![
+            media(s1.clone(), vec![("SEQUEL", s2.clone())]),
+            media(s2, vec![("SEQUEL", s3)]),
+        ];
+
+        let catalog = &build_franchise_catalogs(&available, &graph)[0];
+        assert_eq!(release(catalog, 101).conceptual_season, Some(1));
+        assert_eq!(release(catalog, 102).conceptual_season, Some(2));
+        assert_eq!(release(catalog, 103).conceptual_season, Some(3));
+        assert!(
+            catalog
+                .releases
+                .iter()
+                .all(|release| { release.classification == ReleaseClassification::MainlineSeason })
+        );
+    }
+
+    #[test]
     fn anthology_special_does_not_merge_unrelated_franchises() {
         let assassination_s1 = node(20755, "Assassination Classroom", "TV", 2015);
         let assassination_s2 = node(21170, "Assassination Classroom 2nd Season", "TV", 2016);

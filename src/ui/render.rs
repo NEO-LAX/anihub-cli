@@ -119,7 +119,11 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
     let editing = app.mode == AppMode::SearchInput || app.library_search_editing;
     let (title, context, alignment) = match app.primary_tab() {
         PrimaryTab::Search => (
-            " Пошук · / ",
+            if app.settings.search_mode.is_extended() {
+                " Пошук · / · розширений "
+            } else {
+                " Пошук · / "
+            },
             search_header_context(app),
             // Left while typing so the cursor matches the glyph under it;
             // center when idle so the field looks framed and balanced.
@@ -1132,26 +1136,57 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             let title = label_with_metadata(name, &metadata);
             items.push(ListItem::new(truncate_with_ellipsis(&title, list_width)));
         }
+
         if items.is_empty() {
+            let focused = app.focus == FocusPanel::SearchList;
+            let border_style = if focused {
+                Style::default().fg(COLOR_HIGHLIGHT)
+            } else {
+                Style::default().fg(COLOR_DIM)
+            };
+            let title_style = if focused {
+                Style::default()
+                    .fg(COLOR_SECONDARY)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_DIM)
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" Результати пошуку ", title_style))
+                .title_alignment(Alignment::Center)
+                .border_style(border_style);
+            let inner = block.inner(list_chunks[0]);
+            f.render_widget(block, list_chunks[0]);
+
             let message = if app.activity_message.is_some() {
                 "Шукаємо…"
             } else if app.last_search_query.is_empty() {
-                "Порожньо · / — пошук · 2 — бібліотека · ? — довідка"
+                "Натисніть / щоб шукати"
             } else {
-                "Нічого не знайдено · / — інший запит"
+                "Нічого не знайдено"
             };
-            items.push(ListItem::new(Line::from(Span::styled(
-                message,
-                Style::default().fg(COLOR_DIM),
-            ))));
+            let centered = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(inner);
+            f.render_widget(
+                Paragraph::new(Span::styled(message, Style::default().fg(COLOR_DIM)))
+                    .alignment(Alignment::Center),
+                centered[1],
+            );
+        } else {
+            let list = create_list(
+                " Результати пошуку ",
+                items,
+                app.focus == FocusPanel::SearchList,
+            );
+            f.render_stateful_widget(list, list_chunks[0], &mut app.result_list_state);
         }
-
-        let list = create_list(
-            " Результати пошуку ",
-            items,
-            app.focus == FocusPanel::SearchList,
-        );
-        f.render_stateful_widget(list, list_chunks[0], &mut app.result_list_state);
     }
 
     // Визначаємо індекси чанків з урахуванням single_season
@@ -1240,6 +1275,8 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             .selected_dubbing_choice()
             .is_some_and(|choice| choice.is_moonanime())
         {
+            let episode_owner = selected_search_anime_id(app);
+            let season = app.selected_season_num();
             app.selected_episode_choices()
                 .iter()
                 .map(|episode| {
@@ -1249,11 +1286,14 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     } else {
                         format!(" · {title}")
                     };
-                    ListItem::new(format!(
-                        "Серія {}{} [браузер]",
-                        episode.episode_number(),
-                        suffix
-                    ))
+                    let label = format!("Серія {}{}", episode.episode_number(), suffix);
+                    let mut metadata = vec!["браузер".to_string()];
+                    if episode_owner.zip(season).is_some_and(|(anime_id, season)| {
+                        episode_is_watched(app, anime_id, season, episode.episode_number())
+                    }) {
+                        metadata.push("✓".to_string());
+                    }
+                    ListItem::new(label_with_metadata(&label, &metadata))
                 })
                 .collect()
         } else if let Some(studio) = app.selected_studio() {
@@ -1594,6 +1634,8 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             .selected_dubbing_choice()
             .is_some_and(|choice| choice.is_moonanime())
         {
+            let anime_id = app.library_selected_anime_id();
+            let season = app.selected_season_num();
             app.selected_episode_choices()
                 .iter()
                 .map(|episode| {
@@ -1603,11 +1645,14 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     } else {
                         format!(" · {title}")
                     };
-                    ListItem::new(format!(
-                        "Серія {}{} [браузер]",
-                        episode.episode_number(),
-                        suffix
-                    ))
+                    let label = format!("Серія {}{}", episode.episode_number(), suffix);
+                    let mut metadata = vec!["браузер".to_string()];
+                    if anime_id.zip(season).is_some_and(|(anime_id, season)| {
+                        episode_is_watched(app, anime_id, season, episode.episode_number())
+                    }) {
+                        metadata.push("✓".to_string());
+                    }
+                    ListItem::new(label_with_metadata(&label, &metadata))
                 })
                 .collect()
         } else if let Some(studio) = app.selected_studio() {
@@ -2222,6 +2267,11 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
         ),
         settings_item("Позначати переглянутим", &threshold, inner_width),
         settings_item(
+            "Режим пошуку",
+            app.settings.search_mode.label(),
+            inner_width,
+        ),
+        settings_item(
             "Стартовий екран",
             app.settings.start_screen.label(),
             inner_width,
@@ -2321,6 +2371,13 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
             Span::styled("Settings: ", Style::default().fg(COLOR_DIM)),
             Span::styled(
                 app.settings_store.settings_path().display().to_string(),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Cache: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                app.metadata_cache.path().display().to_string(),
                 Style::default().fg(COLOR_TEXT),
             ),
         ]),

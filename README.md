@@ -10,15 +10,16 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 - In-app **GitHub update check** with a confirmation popup (never installs automatically).
 - Interactive **installer menu** (Install / Update / Uninstall, optional data purge) plus `--migrate-data` validation on update.
 - Library and history use stable `history.json` with automatic import from older formats.
-- Conservative AniHub search (one page, tight title match); local library filter via `/`.
+- Strict AniHub search (20 results) plus an optional extended mode (up to 100 results).
+- Persistent stale-while-revalidate metadata cache for instant repeat searches and offline fallback.
 - Polished TUI: tabs, centered dialogs, status editor, contextual footer with `anihub-cli` branding.
 - `Esc` steps back through panels; on the search root it clears the result list to a clean home.
 
 ## Supported functionality
 
-- Search AniHub conservatively by title. The default search requests one page, keeps at most 20 Ukrainian-dubbed entries, and matches within the first two words of a Ukrainian/original/English title; broad search is intentionally reserved for a future advanced mode.
+- Search AniHub by title in strict mode (one page, at most 20 Ukrainian-dubbed entries, tight title matching) or enable extended mode in Settings (up to five pages / 100 entries).
 - Browse anime details, posters, seasons, dubbing options, and episodes.
-- Group related seasons and films deterministically and cache loaded metadata for repeated navigation.
+- Group related seasons and films deterministically and persist search graphs/details for fast repeat navigation.
 - Keep the interface responsive while search, posters, episode sources, and stream resolution run in bounded background workers.
 - Play Ashdi streams with `mpv`; browser-only MoonAnime episodes open their direct embed after confirmation.
 - Save watch progress, watched state, and explicit anime statuses in a local library, with resume support.
@@ -51,6 +52,20 @@ curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihu
 ```
 
 To install into another directory, set `ANIHUB_INSTALL_DIR` before running the script. The installer runs the downloaded, checksum-verified binary in `--migrate-data` mode before replacing the installed executable. A failed validation leaves the current executable and source data intact. User data is deleted only after selecting **Delete user data** or passing the explicit `uninstall --purge` option.
+
+### Nix
+
+With flakes enabled, run AniHub CLI directly from GitHub:
+
+```bash
+nix run github:NEO-LAX/anihub-cli
+```
+
+The flake supports x86_64/aarch64 Linux and Intel/Apple-silicon macOS. It builds the locked Rust dependencies, provides `mpv` on the application's runtime `PATH`, and configures the Nix CA certificate bundle. To install it into your Nix profile instead of running it ephemerally:
+
+```bash
+nix profile install github:NEO-LAX/anihub-cli
+```
 
 After installation, make sure the install directory is in `PATH`:
 
@@ -116,7 +131,7 @@ The footer shows shortcuts for the current screen. Press `?` or `h` outside sear
 | --- | --- |
 | `c` | Continue the latest unfinished episode |
 | `e` | Choose Not Added / Planned / Watching / Completed / On Hold / Dropped |
-| `Space` | Toggle watched state for the selected season or episode |
+| `Space` | Toggle watched state for the selected season or episode, including browser-only MoonAnime episodes |
 | `Backspace` | Clear only the selected episode's resume timestamp |
 | `o` | Open the selected anime in a browser |
 | `d` | Delete the selected library progress after confirmation |
@@ -128,7 +143,13 @@ While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and
 
 ### Settings
 
-Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` to switch General/About, `Up`/`Down` to select a row, and `Space` or `Enter` to change it. Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
+Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` to switch General/About, `Up`/`Down` to select a row, and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
+
+## Metadata cache
+
+Successful searches are stored in `metadata-cache.json` together with the AniList relationship graph used to reconstruct seasons, cours, films, and extras. Release details are cached by AniHub ID. On a repeated search the disk snapshot is rendered immediately, while AniHub/AniList are refreshed in the background. If that refresh fails, the cached result remains usable. Details are considered fresh for 24 hours; entries older than 30 days are pruned, and the cache is bounded to 64 searches and 500 detail records.
+
+The cache never contains watch history, library statuses, M3U8 URLs, MoonAnime iframe URLs, or authentication data. Deleting `metadata-cache.json` only makes the next lookup slower; `history.json` and `settings.json` remain untouched. Corrupt cache files are preserved with a `.corrupt-*` suffix and rebuilt automatically.
 
 ## History and recovery
 

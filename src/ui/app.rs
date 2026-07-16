@@ -3,6 +3,7 @@ use crate::api::{
     EpisodeSourcesResponse, FranchiseCatalog, MoonAnimeBrowserEpisode, MoonAnimeSourceMarker,
     ReleaseAvailability, ReleaseClassification, ReleaseEntry,
 };
+use crate::cache::MetadataCache;
 use crate::settings::{
     DefaultLibraryFilter, GITHUB_URL, Settings, SettingsStore, StartScreen, UpdateCheck,
     mpv_is_available,
@@ -408,6 +409,7 @@ pub struct AppState {
     /// Centered popup for the GitHub update check flow.
     pub settings_update_popup: bool,
     pub settings_store: SettingsStore,
+    pub metadata_cache: MetadataCache,
     pub mpv_available: bool,
     pub image_protocol: String,
     pub update_state: UpdateState,
@@ -454,6 +456,11 @@ impl AppState {
         let (watched_index, progress_index) = Self::build_history_indexes(&history);
         let settings_store = SettingsStore::new()?;
         let settings = settings_store.load()?;
+        let metadata_cache = MetadataCache::new(settings_store.data_dir())?;
+        let details_cache = moka::sync::Cache::builder().max_capacity(500).build();
+        for (anime_id, details) in metadata_cache.details() {
+            details_cache.insert(anime_id, details);
+        }
         let mpv_available = mpv_is_available(&settings.mpv_path);
         let default_library_filter = library_filter_from_setting(settings.default_library_filter);
         let start_in_library = settings.start_screen == StartScreen::Library;
@@ -513,6 +520,7 @@ impl AppState {
             settings_threshold: None,
             settings_update_popup: false,
             settings_store,
+            metadata_cache,
             mpv_available,
             image_protocol: image_protocol.into(),
             update_state: UpdateState::Idle,
@@ -533,7 +541,7 @@ impl AppState {
 
             now_playing: None,
 
-            details_cache: moka::sync::Cache::builder().max_capacity(100).build(),
+            details_cache,
             sources_cache: moka::sync::Cache::builder().max_capacity(100).build(),
 
             picker,
@@ -870,6 +878,11 @@ impl AppState {
         self.selected_episode_choices().len()
     }
 
+    pub fn selected_episode_choice(&self) -> Option<EpisodeChoice<'_>> {
+        let index = self.selected_episode_index?;
+        self.selected_episode_choices().get(index).copied()
+    }
+
     fn selected_dubbing_is_moonanime(&self) -> bool {
         let Some(season) = self.selected_season_num() else {
             return false;
@@ -1017,14 +1030,18 @@ impl AppState {
                 self.persist_settings();
             }
             2 => self.open_settings_threshold(),
-            3 => self.open_settings_choice(SettingsChoiceKind::StartScreen),
-            4 => self.open_settings_choice(SettingsChoiceKind::LibraryFilter),
-            5 => {
+            3 => {
+                self.settings.search_mode = self.settings.search_mode.toggled();
+                self.persist_settings();
+            }
+            4 => self.open_settings_choice(SettingsChoiceKind::StartScreen),
+            5 => self.open_settings_choice(SettingsChoiceKind::LibraryFilter),
+            6 => {
                 self.toggle_poster_setting();
                 self.persist_settings();
             }
-            6 => self.open_settings_text(SettingsInput::MpvPath),
-            7 => self.open_settings_text(SettingsInput::MpvArgs),
+            7 => self.open_settings_text(SettingsInput::MpvPath),
+            8 => self.open_settings_text(SettingsInput::MpvArgs),
             _ => {}
         }
     }
@@ -1246,7 +1263,7 @@ impl AppState {
 
     fn handle_settings_key(&mut self, key_code: KeyCode) {
         let rows = match self.settings_tab {
-            SettingsTab::General => 8,
+            SettingsTab::General => 9,
             SettingsTab::About => 4,
         };
         match key_code {
@@ -3235,6 +3252,43 @@ impl AppState {
         }
     }
 
+    fn toggle_selected_episode_watched(&mut self, anime_id: u32, anime_title: String, season: u32) {
+        let Some(studio_name) = self
+            .selected_dubbing_choice()
+            .map(|choice| choice.studio_name().to_string())
+        else {
+            return;
+        };
+        let Some(episode) = self.selected_episode_choice() else {
+            return;
+        };
+        let episode_number = episode.episode_number();
+        let mark_watched = !self
+            .watched_index
+            .contains(&(anime_id, season, episode_number));
+        match self.storage.set_episode_watched_across_dubbings(
+            anime_id,
+            &anime_title,
+            season,
+            episode_number,
+            &studio_name,
+            mark_watched,
+        ) {
+            Ok(history) => {
+                self.history = history;
+                self.rebuild_history_indexes();
+                self.set_info_status(if mark_watched {
+                    format!("Серію S{season}E{episode_number} позначено як переглянуту")
+                } else {
+                    format!("Серію S{season}E{episode_number} позначено як непереглянуту")
+                });
+            }
+            Err(error) => {
+                self.set_error_status(format!("Не вдалося оновити серію: {error}"));
+            }
+        }
+    }
+
     fn toggle_library_selection_watched(&mut self) {
         match self.mode {
             AppMode::LibrarySeason | AppMode::LibraryDubbing => {
@@ -3260,67 +3314,7 @@ impl AppState {
                 else {
                     return;
                 };
-                let Some(selected_studio) = self.selected_studio() else {
-                    return;
-                };
-                let studio_name = selected_studio.studio_name.clone();
-                let Some(episode_number) = self
-                    .selected_episode_index
-                    .and_then(|ep_idx| selected_studio.episodes.get(ep_idx))
-                    .map(|episode| episode.episode_number)
-                else {
-                    return;
-                };
-
-                let key = crate::storage::StorageManager::make_progress_key(
-                    anime_id,
-                    season_num,
-                    episode_number,
-                    &studio_name,
-                );
-                let current_progress = self.history.progress.get(&key).cloned();
-
-                let result = match current_progress.as_ref() {
-                    Some(progress) if progress.watched => self.storage.set_episode_watched(
-                        anime_id,
-                        &anime_title,
-                        season_num,
-                        episode_number,
-                        &studio_name,
-                        false,
-                    ),
-                    _ => self.storage.set_episode_watched(
-                        anime_id,
-                        &anime_title,
-                        season_num,
-                        episode_number,
-                        &studio_name,
-                        true,
-                    ),
-                };
-
-                match result {
-                    Ok(history) => {
-                        self.history = history;
-                        self.rebuild_history_indexes();
-                        let message = match current_progress.as_ref() {
-                            Some(progress) if progress.watched => {
-                                format!(
-                                    "Серію S{}E{} позначено як непереглянуту",
-                                    season_num, episode_number
-                                )
-                            }
-                            _ => {
-                                format!(
-                                    "Серію S{}E{} позначено як переглянуту",
-                                    season_num, episode_number
-                                )
-                            }
-                        };
-                        self.set_info_status(message);
-                    }
-                    Err(e) => self.set_error_status(format!("Не вдалося оновити серію: {}", e)),
-                }
+                self.toggle_selected_episode_watched(anime_id, anime_title, season_num);
             }
             _ => {}
         }
@@ -3342,10 +3336,8 @@ impl AppState {
     }
 
     fn selected_episode_number(&self) -> Option<u32> {
-        let episode_idx = self.selected_episode_index?;
-        self.selected_studio()
-            .and_then(|studio| studio.episodes.get(episode_idx))
-            .map(|episode| episode.episode_number)
+        self.selected_episode_choice()
+            .map(|episode| episode.episode_number())
     }
 
     fn toggle_search_selection_watched(&mut self) {
@@ -3391,45 +3383,7 @@ impl AppState {
                 self.toggle_release_watched(anime_id, anime_title, metadata);
             }
             FocusPanel::EpisodeList => {
-                let Some(selected_studio) = self.selected_studio() else {
-                    return;
-                };
-                let studio_name = selected_studio.studio_name.clone();
-                let Some(episode_number) = self.selected_episode_number() else {
-                    return;
-                };
-                let key = crate::storage::StorageManager::make_progress_key(
-                    anime_id,
-                    season_num,
-                    episode_number,
-                    &studio_name,
-                );
-                let current_progress = self.history.progress.get(&key).cloned();
-                let result = match current_progress.as_ref() {
-                    Some(progress) if progress.watched => self.storage.set_episode_watched(
-                        anime_id,
-                        &anime_title,
-                        season_num,
-                        episode_number,
-                        &studio_name,
-                        false,
-                    ),
-                    _ => self.storage.set_episode_watched(
-                        anime_id,
-                        &anime_title,
-                        season_num,
-                        episode_number,
-                        &studio_name,
-                        true,
-                    ),
-                };
-                match result {
-                    Ok(history) => {
-                        self.history = history;
-                        self.rebuild_history_indexes();
-                    }
-                    Err(e) => self.set_error_status(format!("Не вдалося оновити серію: {}", e)),
-                }
+                self.toggle_selected_episode_watched(anime_id, anime_title, season_num);
             }
             FocusPanel::SearchList => {}
         }
