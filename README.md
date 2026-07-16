@@ -150,18 +150,16 @@ While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and
 
 ### Settings
 
-Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). The original AniHub RGB palette is the default. The Themes tab can explicitly enable ANSI colors and choose a terminal-native palette that respects the terminal's own color configuration. Text values for the Discord Application ID, `mpv` path, and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
+Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). The original AniHub RGB palette is the default. The Themes tab can explicitly enable ANSI colors and choose a terminal-native palette that respects the terminal's own color configuration. Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
 
 ### Discord Rich Presence
 
 Discord integration is opt-in and only describes playback owned by AniHub CLI through mpv/Ashdi. Browser-only MoonAnime episodes are intentionally excluded because the CLI cannot reliably observe browser pause, progress, or completion.
 
-1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
-2. Copy its numeric **Application ID**. This ID is public; never paste a bot token or client secret into AniHub CLI.
-3. Open **Settings → General**, enter the Application ID, and enable **Discord Rich Presence**.
-4. Keep the Discord desktop client running with activity sharing enabled.
+1. Open **Settings → General** and enable **Discord Rich Presence**.
+2. Keep the Discord desktop client running with activity sharing enabled.
 
-The IPC connection runs on a background thread, reconnects when Discord starts later, and never blocks the TUI. Closing playback or AniHub CLI clears the activity. Discord web/mobile clients cannot receive local Rich Presence updates.
+AniHub CLI ships its public Discord Application ID, so users do not need to create an application or enter credentials. No bot token, client secret, or Public Key is stored. The IPC connection runs on a background thread, reconnects when Discord starts later, and never blocks the TUI. Closing playback or AniHub CLI clears the activity. Discord web/mobile clients cannot receive local Rich Presence updates.
 
 ## Metadata cache
 
@@ -208,7 +206,7 @@ If no valid backup exists, keep the corrupt files for manual JSON recovery befor
 - The installer reports an unsupported platform: release installation currently supports only Linux x86_64 and macOS x86_64/arm64. Windows uses the downloadable release asset.
 - Search returns no entries: verify network access and remember that the client filters API results to entries with Ukrainian dubbing.
 - Images are missing: use a terminal with image protocol support or continue using the text interface; playback and history do not depend on poster rendering.
-- Discord status is missing: use the desktop Discord client, enable activity sharing, and verify that Settings contains a numeric Application ID. Browser/mobile Discord cannot receive local IPC updates.
+- Discord status is missing: use the desktop Discord client, enable activity sharing, and enable Rich Presence in Settings. Browser/mobile Discord cannot receive local IPC updates.
 - A source page or API is unavailable: the client cannot repair upstream outages or changes to AniHub, AniList, or Ashdi.
 
 ## Build from source

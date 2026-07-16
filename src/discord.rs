@@ -4,6 +4,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+const APPLICATION_ID: u64 = 1_527_419_150_761_328_810;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresenceActivity {
@@ -53,21 +54,21 @@ pub struct DiscordPresence {
 }
 
 impl DiscordPresence {
-    pub fn new(enabled: bool, application_id: &str) -> Self {
+    pub fn new(enabled: bool) -> Self {
         let (commands, receiver) = mpsc::channel();
         let worker = thread::spawn(move || run_worker(receiver));
         let presence = Self {
             commands,
             worker: Some(worker),
         };
-        presence.configure(enabled, application_id);
+        presence.configure(enabled);
         presence
     }
 
-    pub fn configure(&self, enabled: bool, application_id: &str) {
+    pub fn configure(&self, enabled: bool) {
         let _ = self
             .commands
-            .send(Command::Configure(configured_id(enabled, application_id)));
+            .send(Command::Configure(enabled.then_some(APPLICATION_ID)));
     }
 
     pub fn update(&self, activity: PresenceActivity) {
@@ -92,13 +93,6 @@ impl Drop for DiscordPresence {
             let _ = self.commands.send(Command::Shutdown);
         }
     }
-}
-
-fn configured_id(enabled: bool, application_id: &str) -> Option<u64> {
-    enabled
-        .then(|| application_id.trim().parse::<u64>().ok())
-        .flatten()
-        .filter(|id| *id != 0)
 }
 
 fn run_worker(receiver: Receiver<Command>) {
@@ -244,11 +238,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discord_is_opt_in_and_requires_a_numeric_application_id() {
-        assert_eq!(configured_id(false, "123"), None);
-        assert_eq!(configured_id(true, ""), None);
-        assert_eq!(configured_id(true, "nope"), None);
-        assert_eq!(configured_id(true, " 123 "), Some(123));
+    fn discord_is_opt_in_and_uses_the_anihub_application() {
+        assert_eq!(false.then_some(APPLICATION_ID), None);
+        assert_eq!(true.then_some(APPLICATION_ID), Some(APPLICATION_ID));
     }
 
     #[test]

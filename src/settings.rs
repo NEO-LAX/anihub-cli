@@ -156,7 +156,10 @@ pub struct Settings {
     pub ansi_themes: bool,
     pub theme: ThemePreset,
     pub discord_presence: bool,
-    pub discord_application_id: String,
+    /// Read only for migrating settings written before AniHub shipped a shared
+    /// Discord application. New settings files omit this obsolete override.
+    #[serde(rename = "discord_application_id", skip_serializing)]
+    pub legacy_discord_application_id: String,
     pub mpv_path: String,
     pub mpv_extra_args: String,
 }
@@ -175,7 +178,7 @@ impl Default for Settings {
             ansi_themes: false,
             theme: ThemePreset::Violet,
             discord_presence: false,
-            discord_application_id: String::new(),
+            legacy_discord_application_id: String::new(),
             mpv_path: "mpv".to_string(),
             mpv_extra_args: String::new(),
         }
@@ -342,7 +345,7 @@ mod tests {
         assert!(!settings.ansi_themes);
         assert_eq!(settings.theme, ThemePreset::Violet);
         assert!(!settings.discord_presence);
-        assert!(settings.discord_application_id.is_empty());
+        assert!(settings.legacy_discord_application_id.is_empty());
         assert_eq!(settings.mpv_path, "mpv");
     }
 
@@ -373,7 +376,22 @@ mod tests {
         assert!(!settings.ansi_themes);
         assert_eq!(settings.theme, ThemePreset::Violet);
         assert!(!settings.discord_presence);
-        assert!(settings.discord_application_id.is_empty());
+        assert!(settings.legacy_discord_application_id.is_empty());
+    }
+
+    #[test]
+    fn obsolete_discord_application_id_is_accepted_but_not_saved_again() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "discord_application_id".to_string(),
+            serde_json::Value::String("123456".to_string()),
+        );
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.legacy_discord_application_id, "123456");
+
+        let saved = serde_json::to_value(settings).unwrap();
+        assert!(saved.get("discord_application_id").is_none());
     }
 
     #[test]

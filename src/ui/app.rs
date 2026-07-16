@@ -176,7 +176,6 @@ impl SettingsTab {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsInput {
-    DiscordApplicationId,
     MpvPath,
     MpvArgs,
 }
@@ -1059,20 +1058,9 @@ impl AppState {
                 self.settings.discord_presence = !self.settings.discord_presence;
                 self.discord_config_changed = true;
                 self.persist_settings();
-                if self.settings.discord_presence
-                    && self
-                        .settings
-                        .discord_application_id
-                        .trim()
-                        .parse::<u64>()
-                        .is_err()
-                {
-                    self.set_info_status("Вкажіть Discord Application ID нижче");
-                }
             }
-            8 => self.open_settings_text(SettingsInput::DiscordApplicationId),
-            9 => self.open_settings_text(SettingsInput::MpvPath),
-            10 => self.open_settings_text(SettingsInput::MpvArgs),
+            8 => self.open_settings_text(SettingsInput::MpvPath),
+            9 => self.open_settings_text(SettingsInput::MpvArgs),
             _ => {}
         }
     }
@@ -1095,7 +1083,6 @@ impl AppState {
 
     fn open_settings_text(&mut self, kind: SettingsInput) {
         let value = match kind {
-            SettingsInput::DiscordApplicationId => self.settings.discord_application_id.clone(),
             SettingsInput::MpvPath => self.settings.mpv_path.clone(),
             SettingsInput::MpvArgs => self.settings.mpv_extra_args.clone(),
         };
@@ -1178,14 +1165,6 @@ impl AppState {
         match key_code {
             KeyCode::Enter => {
                 match input {
-                    SettingsInput::DiscordApplicationId => {
-                        self.settings.discord_application_id = self
-                            .settings_input_value
-                            .chars()
-                            .filter(char::is_ascii_digit)
-                            .collect();
-                        self.discord_config_changed = true;
-                    }
                     SettingsInput::MpvPath => {
                         self.settings.mpv_path = self.settings_input_value.trim().to_string();
                         if self.settings.mpv_path.is_empty() {
@@ -1328,7 +1307,7 @@ impl AppState {
 
     fn handle_settings_key(&mut self, key_code: KeyCode) {
         let rows = match self.settings_tab {
-            SettingsTab::General => 11,
+            SettingsTab::General => 10,
             SettingsTab::Themes => ThemePreset::ALL.len() + 1,
             SettingsTab::About => 5,
         };

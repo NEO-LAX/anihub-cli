@@ -799,10 +799,7 @@ async fn main() -> Result<()> {
     let mut app = AppState::new(picker, image_protocol)?;
     let mut resources = ResourceCoordinator::new(app.api_client.clone());
     let mut playback = PlaybackSupervisor::new();
-    let discord_presence = DiscordPresence::new(
-        app.settings.discord_presence,
-        &app.settings.discord_application_id,
-    );
+    let discord_presence = DiscordPresence::new(app.settings.discord_presence);
     let mut persisted_positions = HashMap::new();
     let mut update_check: Option<tokio::task::JoinHandle<Result<settings::UpdateCheck>>> = None;
 
@@ -813,10 +810,7 @@ async fn main() -> Result<()> {
         resources.sync(&mut app).await;
         resources.drain(&mut app).await;
         if app.take_discord_config_changed() {
-            discord_presence.configure(
-                app.settings.discord_presence,
-                &app.settings.discord_application_id,
-            );
+            discord_presence.configure(app.settings.discord_presence);
             sync_discord_presence(&app, &discord_presence);
         }
         if app.take_update_check_request() && update_check.is_none() {
@@ -902,8 +896,7 @@ async fn main() -> Result<()> {
 }
 
 fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
-    if !app.settings.discord_presence || app.settings.discord_application_id.parse::<u64>().is_err()
-    {
+    if !app.settings.discord_presence {
         discord.clear();
         return;
     }

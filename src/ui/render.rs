@@ -2430,22 +2430,7 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
         ),
         settings_item(
             "Discord Rich Presence",
-            if app.settings.discord_presence
-                && app.settings.discord_application_id.parse::<u64>().is_err()
-            {
-                "потрібен ID"
-            } else {
-                on_off(app.settings.discord_presence)
-            },
-            inner_width,
-        ),
-        settings_item(
-            "Discord Application ID",
-            if app.settings.discord_application_id.is_empty() {
-                "—"
-            } else {
-                &app.settings.discord_application_id
-            },
+            on_off(app.settings.discord_presence),
             inner_width,
         ),
         settings_item("Шлях до mpv", &app.settings.mpv_path, inner_width),
@@ -2681,10 +2666,8 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
             Span::styled(
                 if !app.settings.discord_presence {
                     "вимкнено"
-                } else if app.settings.discord_application_id.parse::<u64>().is_ok() {
-                    "налаштовано"
                 } else {
-                    "потрібен Application ID"
+                    "увімкнено · AniHub"
                 },
                 Style::default().fg(if app.settings.discord_presence {
                     color_secondary()
@@ -2823,10 +2806,6 @@ fn render_settings_text_popup(f: &mut Frame, app: &AppState) {
         return;
     };
     let (title, hint) = match kind {
-        SettingsInput::DiscordApplicationId => (
-            " Discord Application ID ",
-            "Числовий ID застосунку з Discord Developer Portal",
-        ),
         SettingsInput::MpvPath => (" Шлях до mpv ", "Порожнє значення скинеться на «mpv»"),
         SettingsInput::MpvArgs => (" Аргументи mpv ", "Наприклад: --fs --hwdec=auto"),
     };
