@@ -159,7 +159,7 @@ Discord integration is opt-in and only describes playback owned by AniHub CLI th
 1. Open **Settings → General** and enable **Discord Rich Presence**.
 2. Keep the Discord desktop client running with activity sharing enabled.
 
-AniHub CLI ships its public Discord Application ID, so users do not need to create an application or enter credentials. No bot token, client secret, or Public Key is stored. The IPC connection runs on a background thread, reconnects when Discord starts later, and never blocks the TUI. Seeking corrects the displayed episode position after a short debounce; pausing freezes the timer and shows the current timestamp until playback resumes. Closing playback or AniHub CLI clears the activity. Discord web/mobile clients cannot receive local Rich Presence updates.
+AniHub CLI ships its public Discord Application ID, so users do not need to create an application or enter credentials. No bot token, client secret, or Public Key is stored. The IPC connection runs on a background thread, reconnects when Discord starts later, and never blocks the TUI. Seeking corrects the displayed episode position after a short debounce; pausing freezes the timer and shows the current timestamp until playback resumes. Dynamic poster art is sent through wsrv.nl as a cached 1024×1024 attention crop so Discord receives a crisp square asset instead of cropping a vertical cover blindly. Closing playback or AniHub CLI clears the activity. Discord web/mobile clients cannot receive local Rich Presence updates.
 
 ## Metadata cache
 

@@ -7,6 +7,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 const SEEK_DEBOUNCE: Duration = Duration::from_secs(2);
 const SEEK_DRIFT_SECONDS: f64 = 4.0;
 const APPLICATION_ID: u64 = 1_527_419_150_761_328_810;
+const IMAGE_PROXY: &str = "https://wsrv.nl/";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PresenceActivity {
@@ -40,7 +41,7 @@ impl PresenceActivity {
                 0.0
             },
             paused,
-            poster_url,
+            poster_url: poster_url.map(|url| square_poster_url(&url)),
         }
     }
 
@@ -327,6 +328,28 @@ fn format_position(position: f64) -> String {
     }
 }
 
+fn square_poster_url(source: &str) -> String {
+    let Ok(source_url) = reqwest::Url::parse(source) else {
+        return source.to_string();
+    };
+    if !matches!(source_url.scheme(), "http" | "https") {
+        return source.to_string();
+    }
+
+    let mut proxy = reqwest::Url::parse(IMAGE_PROXY).expect("static image proxy URL is valid");
+    proxy
+        .query_pairs_mut()
+        .append_pair("url", source_url.as_str())
+        .append_pair("w", "1024")
+        .append_pair("h", "1024")
+        .append_pair("fit", "cover")
+        .append_pair("a", "attention")
+        .append_pair("output", "jpg")
+        .append_pair("q", "85")
+        .append_pair("default", "1");
+    proxy.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +416,26 @@ mod tests {
         ));
         assert_eq!(paused.state(), "Пауза · 12:34 · Dzuski");
         assert_eq!(format_position(3723.0), "1:02:03");
+    }
+
+    #[test]
+    fn discord_posters_are_square_attention_crops_with_encoded_sources() {
+        let source = "https://s4.anilist.co/poster.jpg?large=1&lang=uk";
+        let transformed = square_poster_url(source);
+        let url = reqwest::Url::parse(&transformed).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(url.host_str(), Some("wsrv.nl"));
+        assert_eq!(query.get("url").map(|value| value.as_ref()), Some(source));
+        assert_eq!(query.get("w").map(|value| value.as_ref()), Some("1024"));
+        assert_eq!(query.get("h").map(|value| value.as_ref()), Some("1024"));
+        assert_eq!(query.get("fit").map(|value| value.as_ref()), Some("cover"));
+        assert_eq!(
+            query.get("a").map(|value| value.as_ref()),
+            Some("attention")
+        );
+        assert_eq!(square_poster_url("not a URL"), "not a URL");
     }
 }
