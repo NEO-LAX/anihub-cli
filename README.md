@@ -6,7 +6,7 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 
 ## Unreleased
 
-- Four switchable terminal-native ANSI themes: Violet, Ocean, Amber, and Monochrome.
+- The original AniHub RGB theme remains the default, with an opt-in ANSI mode offering Violet, Ocean, Amber, and Monochrome palettes.
 - Optional Discord Rich Presence for mpv/Ashdi playback, including title, season, episode, dubbing studio, elapsed time, and poster artwork.
 - Persistent 150 MiB poster cache with offline fallback, automatic pruning, corruption recovery, and an explicit clear action in Settings.
 
@@ -150,7 +150,7 @@ While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and
 
 ### Settings
 
-Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). Themes use only terminal ANSI colors, so they respect the terminal palette instead of assuming true-color support. Text values for the Discord Application ID, `mpv` path, and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
+Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). The original AniHub RGB palette is the default. The Themes tab can explicitly enable ANSI colors and choose a terminal-native palette that respects the terminal's own color configuration. Text values for the Discord Application ID, `mpv` path, and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
 
 ### Discord Rich Presence
 

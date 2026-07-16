@@ -1078,9 +1078,18 @@ impl AppState {
     }
 
     fn activate_theme_setting(&mut self) {
-        if let Some(theme) = ThemePreset::ALL.get(self.settings_selected).copied() {
+        if self.settings_selected == 0 {
+            self.settings.ansi_themes = !self.settings.ansi_themes;
+            self.persist_settings();
+        } else if let Some(theme) = ThemePreset::ALL
+            .get(self.settings_selected.saturating_sub(1))
+            .copied()
+        {
             self.settings.theme = theme;
             self.persist_settings();
+            if !self.settings.ansi_themes {
+                self.set_info_status("Увімкніть ANSI-кольори, щоб застосувати тему");
+            }
         }
     }
 
@@ -1320,7 +1329,7 @@ impl AppState {
     fn handle_settings_key(&mut self, key_code: KeyCode) {
         let rows = match self.settings_tab {
             SettingsTab::General => 11,
-            SettingsTab::Themes => ThemePreset::ALL.len(),
+            SettingsTab::Themes => ThemePreset::ALL.len() + 1,
             SettingsTab::About => 5,
         };
         match key_code {

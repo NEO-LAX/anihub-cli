@@ -142,6 +142,7 @@ pub struct Settings {
     pub start_screen: StartScreen,
     pub default_library_filter: DefaultLibraryFilter,
     pub show_posters: bool,
+    pub ansi_themes: bool,
     pub theme: ThemePreset,
     pub discord_presence: bool,
     pub discord_application_id: String,
@@ -160,6 +161,7 @@ impl Default for Settings {
             start_screen: StartScreen::Search,
             default_library_filter: DefaultLibraryFilter::All,
             show_posters: true,
+            ansi_themes: false,
             theme: ThemePreset::Violet,
             discord_presence: false,
             discord_application_id: String::new(),
@@ -326,6 +328,7 @@ mod tests {
         assert!(settings.resume_from_timestamp);
         assert_eq!(settings.watched_threshold_percent, Some(90));
         assert_eq!(settings.search_mode, SearchMode::Strict);
+        assert!(!settings.ansi_themes);
         assert_eq!(settings.theme, ThemePreset::Violet);
         assert!(!settings.discord_presence);
         assert!(settings.discord_application_id.is_empty());
@@ -351,10 +354,12 @@ mod tests {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         let object = value.as_object_mut().unwrap();
         object.remove("theme");
+        object.remove("ansi_themes");
         object.remove("discord_presence");
         object.remove("discord_application_id");
 
         let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(!settings.ansi_themes);
         assert_eq!(settings.theme, ThemePreset::Violet);
         assert!(!settings.discord_presence);
         assert!(settings.discord_application_id.is_empty());

@@ -27,6 +27,17 @@ struct ThemePalette {
     dark: Color,
 }
 
+const ANIHUB_PALETTE: ThemePalette = ThemePalette {
+    primary: Color::Rgb(147, 51, 234),
+    secondary: Color::Rgb(168, 85, 247),
+    highlight: Color::Rgb(59, 130, 246),
+    error: Color::Rgb(239, 68, 68),
+    dim: Color::Rgb(107, 114, 128),
+    text: Color::Rgb(243, 244, 246),
+    on_primary: Color::Rgb(243, 244, 246),
+    dark: Color::Rgb(17, 24, 39),
+};
+
 const fn palette_for(theme: ThemePreset) -> ThemePalette {
     match theme {
         ThemePreset::Violet => ThemePalette {
@@ -73,17 +84,25 @@ const fn palette_for(theme: ThemePreset) -> ThemePalette {
 }
 
 thread_local! {
+    static ANSI_THEMES_ENABLED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
     static ACTIVE_THEME: std::cell::Cell<ThemePreset> = const {
         std::cell::Cell::new(ThemePreset::Violet)
     };
 }
 
-fn set_active_theme(theme: ThemePreset) {
+fn set_active_theme(ansi_enabled: bool, theme: ThemePreset) {
+    ANSI_THEMES_ENABLED.set(ansi_enabled);
     ACTIVE_THEME.set(theme);
 }
 
 fn active_palette() -> ThemePalette {
-    palette_for(ACTIVE_THEME.get())
+    if ANSI_THEMES_ENABLED.get() {
+        palette_for(ACTIVE_THEME.get())
+    } else {
+        ANIHUB_PALETTE
+    }
 }
 
 fn color_primary() -> Color {
@@ -115,7 +134,7 @@ const fn color_bg_transparent() -> Color {
 }
 
 pub fn render(f: &mut Frame, app: &mut AppState) {
-    set_active_theme(app.settings.theme);
+    set_active_theme(app.settings.ansi_themes, app.settings.theme);
     let size = f.area();
     // One tab row plus a compact context field. Breadcrumbs intentionally stay
     // out of the chrome: the active columns already show the same hierarchy.
@@ -2441,27 +2460,43 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(7), Constraint::Min(5)])
         .split(area);
-    let items = ThemePreset::ALL
-        .into_iter()
-        .map(|theme| {
-            let palette = palette_for(theme);
-            let active = theme == app.settings.theme;
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    if active { "✓ " } else { "  " },
-                    Style::default().fg(palette.highlight),
-                ),
-                Span::styled(
-                    format!("{:<14}", theme.label()),
-                    Style::default().fg(palette.text),
-                ),
-                Span::styled("■ ", Style::default().fg(palette.primary)),
-                Span::styled("■ ", Style::default().fg(palette.secondary)),
-                Span::styled("■ ", Style::default().fg(palette.highlight)),
-                Span::styled("■", Style::default().fg(palette.error)),
-            ]))
-        })
-        .collect::<Vec<_>>();
+    let mut items = vec![ListItem::new(Line::from(vec![
+        Span::styled(
+            if app.settings.ansi_themes {
+                "✓ "
+            } else {
+                "  "
+            },
+            Style::default().fg(color_highlight()),
+        ),
+        Span::styled("ANSI-кольори", Style::default().fg(color_text())),
+        Span::styled(
+            if app.settings.ansi_themes {
+                "  увімкнено"
+            } else {
+                "  вимкнено · фірмова AniHub"
+            },
+            Style::default().fg(color_dim()),
+        ),
+    ]))];
+    items.extend(ThemePreset::ALL.into_iter().map(|theme| {
+        let palette = palette_for(theme);
+        let active = app.settings.ansi_themes && theme == app.settings.theme;
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if active { "✓ " } else { "  " },
+                Style::default().fg(palette.highlight),
+            ),
+            Span::styled(
+                format!("{:<14}", theme.label()),
+                Style::default().fg(palette.text),
+            ),
+            Span::styled("■ ", Style::default().fg(palette.primary)),
+            Span::styled("■ ", Style::default().fg(palette.secondary)),
+            Span::styled("■ ", Style::default().fg(palette.highlight)),
+            Span::styled("■", Style::default().fg(palette.error)),
+        ]))
+    }));
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(
         app.settings_selected.min(items.len().saturating_sub(1)),
@@ -2471,7 +2506,7 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" ANSI-тема ")
+                    .title(" Теми ")
                     .title_alignment(Alignment::Center)
                     .border_style(Style::default().fg(color_highlight()))
                     .padding(Padding::horizontal(2)),
@@ -2482,34 +2517,42 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
         &mut state,
     );
 
+    let preview_palette = if app.settings.ansi_themes {
+        palette_for(app.settings.theme)
+    } else {
+        ANIHUB_PALETTE
+    };
     let preview = vec![
         Line::from(vec![
             Span::styled(
                 " 1 · Пошук ",
                 Style::default()
-                    .fg(color_on_primary())
-                    .bg(color_primary())
+                    .fg(preview_palette.on_primary)
+                    .bg(preview_palette.primary)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  |  ", Style::default().fg(color_dim())),
+            Span::styled("  |  ", Style::default().fg(preview_palette.dim)),
             Span::styled(
                 "Сезон 2 · Серія 4",
                 Style::default()
-                    .fg(color_secondary())
+                    .fg(preview_palette.secondary)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled(">> ", Style::default().fg(color_highlight())),
+            Span::styled(">> ", Style::default().fg(preview_palette.highlight)),
             Span::styled(
                 "Каґуя-сама: Кохання як війна",
-                Style::default().fg(color_text()),
+                Style::default().fg(preview_palette.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("✓ Переглянуто", Style::default().fg(color_secondary())),
-            Span::styled("  ·  ", Style::default().fg(color_dim())),
-            Span::styled("Помилка", Style::default().fg(color_error())),
+            Span::styled(
+                "✓ Переглянуто",
+                Style::default().fg(preview_palette.secondary),
+            ),
+            Span::styled("  ·  ", Style::default().fg(preview_palette.dim)),
+            Span::styled("Помилка", Style::default().fg(preview_palette.error)),
         ]),
     ];
     f.render_widget(
@@ -2518,7 +2561,11 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .title(format!(
                     " Попередній перегляд · {} ",
-                    app.settings.theme.label()
+                    if app.settings.ansi_themes {
+                        format!("{} · ANSI", app.settings.theme.label())
+                    } else {
+                        "AniHub · RGB".to_string()
+                    }
                 ))
                 .title_alignment(Alignment::Center)
                 .border_style(Style::default().fg(color_dim()))
@@ -3610,6 +3657,17 @@ fn count_seasons(items: &[crate::api::AnimeItem], group: &[usize]) -> (usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_anihub_rgb_theme_remains_the_default_render_palette() {
+        set_active_theme(false, ThemePreset::Amber);
+        assert_eq!(color_primary(), Color::Rgb(147, 51, 234));
+        assert_eq!(color_secondary(), Color::Rgb(168, 85, 247));
+        assert_eq!(color_highlight(), Color::Rgb(59, 130, 246));
+
+        set_active_theme(true, ThemePreset::Amber);
+        assert_eq!(color_primary(), Color::Yellow);
+    }
 
     #[test]
     fn every_theme_uses_terminal_ansi_colors_instead_of_rgb() {
