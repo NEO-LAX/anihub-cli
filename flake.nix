@@ -22,7 +22,13 @@
         src = pkgs.lib.cleanSource ./.;
         cargoLock.lockFile = ./Cargo.lock;
 
-        nativeBuildInputs = [pkgs.makeWrapper];
+        nativeBuildInputs = [
+          pkgs.cacert
+          pkgs.makeWrapper
+        ];
+
+        SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
 
         postInstall = ''
           wrapProgram "$out/bin/anihub-cli" \
