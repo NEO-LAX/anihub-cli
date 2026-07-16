@@ -538,6 +538,12 @@ pub enum PlaybackEvent {
         target: PlayTarget,
     },
     ProgressSnapshot(ProgressSnapshot),
+    PauseChanged {
+        session_id: PlaybackSessionId,
+        identity: PlaybackIdentity,
+        paused: bool,
+        position: Option<f64>,
+    },
     MarkWatched(MarkWatchedEvent),
     EndFile {
         session_id: PlaybackSessionId,
@@ -651,6 +657,7 @@ struct ActivePlayback {
     queue: VecDeque<PlayTarget>,
     position: f64,
     duration: f64,
+    has_position: bool,
     entry_id: Option<i64>,
     waiting_for_next: bool,
 }
@@ -931,6 +938,7 @@ impl PlaybackActor {
             queue: queue.into_iter().collect(),
             position: 0.0,
             duration: 0.0,
+            has_position: false,
             entry_id: None,
             waiting_for_next: false,
         });
@@ -973,6 +981,7 @@ impl PlaybackActor {
         active.current = target.clone();
         active.position = 0.0;
         active.duration = 0.0;
+        active.has_position = false;
         active.entry_id = None;
         active.waiting_for_next = false;
         self.emit(PlaybackEvent::SessionStarted { session_id, target })
@@ -1014,6 +1023,7 @@ impl PlaybackActor {
                     queue: queue.into_iter().collect(),
                     position: 0.0,
                     duration: 0.0,
+                    has_position: false,
                     entry_id: None,
                     waiting_for_next: false,
                 });
@@ -1038,13 +1048,14 @@ impl PlaybackActor {
                         time_pos.filter(|value| value.is_finite() && *value >= 0.0)
                     {
                         active.position = time_pos;
+                        active.has_position = true;
                     }
                     if let Some(duration) =
                         duration.filter(|value| value.is_finite() && *value >= 0.0)
                     {
                         active.duration = duration;
                     }
-                    if active.position > 0.0 && !active.waiting_for_next {
+                    if active.has_position && !active.waiting_for_next {
                         Some(Self::progress_snapshot(active, false))
                     } else {
                         None
@@ -1054,6 +1065,28 @@ impl PlaybackActor {
                 };
                 if let Some(snapshot) = snapshot {
                     self.emit(PlaybackEvent::ProgressSnapshot(snapshot)).await;
+                }
+            }
+            MpvMonitorEvent::PauseChanged { paused, time_pos } => {
+                let event = self.active.as_mut().map(|active| {
+                    let position = if let Some(time_pos) =
+                        time_pos.filter(|value| value.is_finite() && *value >= 0.0)
+                    {
+                        active.position = time_pos;
+                        active.has_position = true;
+                        Some(time_pos)
+                    } else {
+                        active.has_position.then_some(active.position)
+                    };
+                    PlaybackEvent::PauseChanged {
+                        session_id: active.id,
+                        identity: PlaybackIdentity::from(&active.current),
+                        paused,
+                        position,
+                    }
+                });
+                if let Some(event) = event {
+                    self.emit(event).await;
                 }
             }
             MpvMonitorEvent::PlaylistPosition { position, entry_id } => {

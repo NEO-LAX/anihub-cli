@@ -324,6 +324,10 @@ pub enum MpvMonitorEvent {
         time_pos: Option<f64>,
         duration: Option<f64>,
     },
+    PauseChanged {
+        paused: bool,
+        time_pos: Option<f64>,
+    },
     PlaylistPosition {
         position: Option<usize>,
         entry_id: Option<i64>,
@@ -385,6 +389,13 @@ pub(crate) fn parse_monitor_line(
                 Some(MpvMonitorEvent::Progress {
                     time_pos: state.time(),
                     duration: state.duration(),
+                })
+            }
+            "pause" => {
+                let paused = value.get("data").and_then(Value::as_bool)?;
+                Some(MpvMonitorEvent::PauseChanged {
+                    paused,
+                    time_pos: state.time(),
                 })
             }
             "playlist-pos" => {
@@ -479,7 +490,13 @@ async fn monitor_ipc(
     if let Err(error) = ipc
         .send_observe_commands(
             &mut reader,
-            &["time-pos", "duration", "playlist-pos", "playlist-entry-id"],
+            &[
+                "time-pos",
+                "duration",
+                "pause",
+                "playlist-pos",
+                "playlist-entry-id",
+            ],
             &cancel,
         )
         .await
@@ -833,6 +850,26 @@ mod tests {
                 reason: EndFileReason::Eof,
                 playlist_entry_id: Some(17),
             }))
+        );
+    }
+
+    #[test]
+    fn monitor_reports_pause_with_the_latest_position() {
+        let mut state = MonitorState::default();
+        let _ = parse_monitor_line(
+            r#"{"event":"property-change","name":"time-pos","data":754.0}"#,
+            &mut state,
+        );
+        let event = parse_monitor_line(
+            r#"{"event":"property-change","name":"pause","data":true}"#,
+            &mut state,
+        );
+        assert_eq!(
+            event,
+            Some(MpvMonitorEvent::PauseChanged {
+                paused: true,
+                time_pos: Some(754.0),
+            })
         );
     }
 

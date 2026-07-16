@@ -844,6 +844,8 @@ async fn main() -> Result<()> {
             presence_changed |= matches!(
                 &event,
                 PlaybackEvent::SessionStarted { .. }
+                    | PlaybackEvent::ProgressSnapshot(_)
+                    | PlaybackEvent::PauseChanged { .. }
                     | PlaybackEvent::SessionStopped { .. }
                     | PlaybackEvent::Error { .. }
             );
@@ -910,6 +912,7 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
         now.episode,
         &now.studio_name,
         now.position,
+        now.paused,
         app.details_cache
             .get(&now.anime_id)
             .and_then(|details| details.poster_url.clone())
@@ -985,6 +988,7 @@ fn persist_playback_event(
                 studio_name: target.studio_name,
                 position: target.start_time.unwrap_or(0.0),
                 duration: 0.0,
+                paused: false,
             });
             persisted_positions.entry(session_id).or_insert(0.0);
         }
@@ -1022,6 +1026,24 @@ fn persist_playback_event(
                         app.set_error_status(format!("Не вдалося зберегти прогрес: {error}"));
                     }
                 }
+            }
+        }
+        PlaybackEvent::PauseChanged {
+            identity,
+            paused,
+            position,
+            ..
+        } => {
+            if let Some(now_playing) = app.now_playing.as_mut()
+                && now_playing.anime_id == identity.anime_id
+                && now_playing.season == identity.season
+                && now_playing.episode == identity.episode
+                && now_playing.studio_name == identity.studio_name
+            {
+                if let Some(position) = position {
+                    now_playing.position = position;
+                }
+                now_playing.paused = paused;
             }
         }
         PlaybackEvent::MarkWatched(mark) => {

@@ -257,6 +257,7 @@ pub struct NowPlaying {
     pub studio_name: String,
     pub position: f64,
     pub duration: f64,
+    pub paused: bool,
 }
 
 #[derive(Clone)]
@@ -3068,6 +3069,7 @@ impl AppState {
             studio_name: target.studio_name.clone(),
             position: target.start_time.unwrap_or(0.0),
             duration: 0.0,
+            paused: false,
         });
     }
 

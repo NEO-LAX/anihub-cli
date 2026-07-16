@@ -4,13 +4,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+const SEEK_DEBOUNCE: Duration = Duration::from_secs(2);
+const SEEK_DRIFT_SECONDS: f64 = 4.0;
 const APPLICATION_ID: u64 = 1_527_419_150_761_328_810;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PresenceActivity {
     title: String,
-    state: String,
-    started_at: u64,
+    season: u32,
+    episode: u32,
+    studio: String,
+    position: f64,
+    paused: bool,
     poster_url: Option<String>,
 }
 
@@ -21,19 +26,51 @@ impl PresenceActivity {
         episode: u32,
         studio: &str,
         position: f64,
+        paused: bool,
         poster_url: Option<String>,
     ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let elapsed = position.max(0.0) as u64;
         Self {
             title: truncate(title, 120),
-            state: truncate(&format!("Сезон {season} · Серія {episode} · {studio}"), 120),
-            started_at: now.saturating_sub(elapsed),
+            season,
+            episode,
+            studio: truncate(studio, 80),
+            position: if position.is_finite() {
+                position.max(0.0)
+            } else {
+                0.0
+            },
+            paused,
             poster_url,
         }
+    }
+
+    fn state(&self) -> String {
+        if self.paused {
+            truncate(
+                &format!(
+                    "Пауза · {} · {}",
+                    format_position(self.position),
+                    self.studio
+                ),
+                120,
+            )
+        } else {
+            truncate(
+                &format!(
+                    "Сезон {} · Серія {} · {}",
+                    self.season, self.episode, self.studio
+                ),
+                120,
+            )
+        }
+    }
+
+    fn same_media(&self, other: &Self) -> bool {
+        self.title == other.title
+            && self.season == other.season
+            && self.episode == other.episode
+            && self.studio == other.studio
+            && self.poster_url == other.poster_url
     }
 }
 
@@ -100,6 +137,7 @@ fn run_worker(receiver: Receiver<Command>) {
     let mut client: Option<Client> = None;
     let mut desired: Option<PresenceActivity> = None;
     let mut sent: Option<PresenceActivity> = None;
+    let mut last_sent_at: Option<Instant> = None;
     let mut was_ready = false;
     let mut next_attempt = Instant::now();
 
@@ -117,6 +155,7 @@ fn run_worker(receiver: Receiver<Command>) {
                         stop_client(&mut client);
                         configured_id = next_id;
                         sent = None;
+                        last_sent_at = None;
                         was_ready = false;
                         if let Some(id) = next_id {
                             let mut next =
@@ -143,6 +182,7 @@ fn run_worker(receiver: Receiver<Command>) {
                         stop_client(&mut client);
                         configured_id = next_id;
                         sent = None;
+                        last_sent_at = None;
                         was_ready = false;
                         if let Some(id) = next_id {
                             let mut next =
@@ -166,9 +206,14 @@ fn run_worker(receiver: Receiver<Command>) {
             // Discord may have restarted while the desired activity stayed
             // unchanged; resend it after each successful reconnect.
             sent = None;
+            last_sent_at = None;
         }
         was_ready = ready;
-        if !ready || sent == desired || Instant::now() < next_attempt {
+        let now = Instant::now();
+        if !ready
+            || now < next_attempt
+            || !presence_needs_update(sent.as_ref(), desired.as_ref(), last_sent_at, now)
+        {
             continue;
         }
 
@@ -179,6 +224,7 @@ fn run_worker(receiver: Receiver<Command>) {
         };
         if result.is_ok() {
             sent.clone_from(&desired);
+            last_sent_at = Some(now);
         } else {
             next_attempt = Instant::now() + RETRY_DELAY;
         }
@@ -191,8 +237,17 @@ fn set_activity(client: &mut Client, activity: &PresenceActivity) -> discord_pre
             let builder = builder
                 .activity_type(ActivityType::Watching)
                 .details(activity.title.clone())
-                .state(activity.state.clone())
-                .timestamps(|timestamps| timestamps.start(activity.started_at));
+                .state(activity.state());
+            let builder = if activity.paused {
+                builder
+            } else {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let started_at = now.saturating_sub(activity.position as u64);
+                builder.timestamps(|timestamps| timestamps.start(started_at))
+            };
             if let Some(poster_url) = &activity.poster_url {
                 builder.assets(|assets| {
                     assets
@@ -204,6 +259,33 @@ fn set_activity(client: &mut Client, activity: &PresenceActivity) -> discord_pre
             }
         })
         .map(|_| ())
+}
+
+fn presence_needs_update(
+    sent: Option<&PresenceActivity>,
+    desired: Option<&PresenceActivity>,
+    last_sent_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let (Some(sent), Some(desired)) = (sent, desired) else {
+        return sent.is_some() != desired.is_some();
+    };
+    if !sent.same_media(desired) || sent.paused != desired.paused {
+        return true;
+    }
+
+    let elapsed = last_sent_at
+        .map(|sent_at| now.saturating_duration_since(sent_at))
+        .unwrap_or(SEEK_DEBOUNCE);
+    if elapsed < SEEK_DEBOUNCE {
+        return false;
+    }
+    let expected_position = if sent.paused {
+        sent.position
+    } else {
+        sent.position + elapsed.as_secs_f64()
+    };
+    (desired.position - expected_position).abs() >= SEEK_DRIFT_SECONDS
 }
 
 fn stop_client(client: &mut Option<Client>) {
@@ -233,6 +315,18 @@ fn truncate(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn format_position(position: f64) -> String {
+    let seconds = position.max(0.0) as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,9 +345,53 @@ mod tests {
             4,
             &"Озвучка".repeat(40),
             12.0,
+            false,
             None,
         );
         assert!(activity.title.chars().count() <= 120);
-        assert!(activity.state.chars().count() <= 120);
+        assert!(activity.state().chars().count() <= 120);
+    }
+
+    #[test]
+    fn normal_progress_does_not_resend_but_seeks_do_after_debounce() {
+        let sent = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", 10.0, false, None);
+        let normal = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", 12.0, false, None);
+        let seek = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", 90.0, false, None);
+        let started = Instant::now();
+
+        assert!(!presence_needs_update(
+            Some(&sent),
+            Some(&normal),
+            Some(started),
+            started + Duration::from_secs(2),
+        ));
+        assert!(!presence_needs_update(
+            Some(&sent),
+            Some(&seek),
+            Some(started),
+            started + Duration::from_secs(1),
+        ));
+        assert!(presence_needs_update(
+            Some(&sent),
+            Some(&seek),
+            Some(started),
+            started + Duration::from_secs(2),
+        ));
+    }
+
+    #[test]
+    fn pause_changes_are_immediate_and_show_a_frozen_position() {
+        let playing = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", 754.0, false, None);
+        let paused = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", 754.0, true, None);
+        let now = Instant::now();
+
+        assert!(presence_needs_update(
+            Some(&playing),
+            Some(&paused),
+            Some(now),
+            now,
+        ));
+        assert_eq!(paused.state(), "Пауза · 12:34 · Dzuski");
+        assert_eq!(format_position(3723.0), "1:02:03");
     }
 }
