@@ -457,7 +457,8 @@ mod tests {
         assert_eq!(idle.state, "AniHub CLI запущено");
         assert_eq!(idle.media, None);
 
-        let watching = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, false);
+        let watching =
+            PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, false);
         assert_eq!(watching.title, "Каґуя");
         assert_eq!(watching.state, "Сезон 2 · Серія 4 · Dzuski");
         assert_eq!(
@@ -472,13 +473,18 @@ mod tests {
         let paused = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, true);
         assert_eq!(paused.state, "Сезон 2 · Серія 4 · Dzuski · Пауза");
         assert!(paused.media.as_ref().is_some_and(|media| media.paused));
-        assert_eq!(paused.media.as_ref().unwrap().timestamps_at(1_000_000), None);
+        assert_eq!(
+            paused.media.as_ref().unwrap().timestamps_at(1_000_000),
+            None
+        );
     }
 
     #[test]
     fn media_timestamps_anchor_progress_like_spotify_only_while_playing() {
         let media = PresenceMedia::from_playback(17.4, 142.2, false);
-        let (start, end) = media.timestamps_at(1_000_000).expect("playing has timestamps");
+        let (start, end) = media
+            .timestamps_at(1_000_000)
+            .expect("playing has timestamps");
         assert_eq!(start, 1_000_000 - 17);
         assert_eq!(end, Some(1_000_000 - 17 + 143));
 

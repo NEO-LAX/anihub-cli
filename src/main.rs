@@ -954,8 +954,12 @@ async fn main() -> Result<()> {
         }
         // Duration often arrives only after the first progress snapshot — push
         // immediately so Discord can switch from elapsed-only to a full bar.
-        presence_immediate |= duration_became_known(previous_now_playing.as_ref(), app.now_playing.as_ref())
-            || episode_identity_changed(previous_now_playing.as_ref(), app.now_playing.as_ref());
+        presence_immediate |=
+            duration_became_known(previous_now_playing.as_ref(), app.now_playing.as_ref())
+                || episode_identity_changed(
+                    previous_now_playing.as_ref(),
+                    app.now_playing.as_ref(),
+                );
         let presence_due = app.settings.discord_presence
             && app.now_playing.is_some()
             && last_discord_sync.elapsed() >= PRESENCE_SYNC_INTERVAL;
@@ -1030,7 +1034,10 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
     ));
 }
 
-fn duration_became_known(previous: Option<&ui::app::NowPlaying>, current: Option<&ui::app::NowPlaying>) -> bool {
+fn duration_became_known(
+    previous: Option<&ui::app::NowPlaying>,
+    current: Option<&ui::app::NowPlaying>,
+) -> bool {
     match (previous, current) {
         (Some(previous), Some(current)) => previous.duration <= 0.0 && current.duration > 0.0,
         (None, Some(current)) => current.duration > 0.0,

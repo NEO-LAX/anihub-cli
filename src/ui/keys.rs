@@ -20,10 +20,7 @@ pub fn shortcut_code(code: KeyCode) -> KeyCode {
 /// Map a character produced by common layouts to the US/QWERTY key that sits
 /// on the same physical keycap.
 pub fn shortcut_char(character: char) -> char {
-    let lower = character
-        .to_lowercase()
-        .next()
-        .unwrap_or(character);
+    let lower = character.to_lowercase().next().unwrap_or(character);
 
     match lower {
         // Ukrainian + Russian ЙЦУКЕН (same base row as QWERTY).
