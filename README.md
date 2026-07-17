@@ -1,226 +1,122 @@
 # AniHub CLI
 
-AniHub CLI is an unofficial Rust terminal client for browsing and watching anime from [AniHub](https://anihub.in.ua).
+**English** · [Українська](README.uk.md)
 
-![AniHub CLI demo](assets/demo.gif)
+Unofficial terminal client for [AniHub](https://anihub.in.ua) — search, library, and playback with Ukrainian dubs.
 
-## Unreleased
+![Demo](assets/demo.gif)
 
-- The original AniHub RGB theme remains the default, with opt-in ANSI 16 and ANSI 256 modes offering Catppuccin Mocha, Tokyo Night, Kanagawa Wave, Rosé Pine, Gruvbox Dark, Everforest Dark, and Ayu Dark palettes. Theme hover affects only the dedicated preview; Auto/Dark/Light surfaces and terminal background transparency are controlled independently.
-- Search, metadata, release, dubbing, and episode panels expose contextual loading and empty states. Transient AniHub failures use short user-facing messages and can be retried with `r` without waiting for the negative cache to expire.
-- Optional Discord Rich Presence for mpv/Ashdi playback, including title, season, episode, dubbing studio, application uptime, and poster artwork.
-- Persistent 150 MiB poster cache with offline fallback, automatic pruning, corruption recovery, and an explicit clear action in Settings.
+<p align="center">
+  <img src="assets/installer.png" alt="Installer" width="520" />
+</p>
 
-## What's new in v0.6.0
+---
 
-- Persistent **Settings** (General / About): autoplay, resume, watched threshold slider, startup screen, library filter, posters, custom `mpv` path/args.
-- In-app **GitHub update check** with a confirmation popup (never installs automatically).
-- Interactive **installer menu** (Install / Update / Uninstall, optional data purge) plus `--migrate-data` validation on update.
-- Library and history use stable `history.json` with automatic import from older formats.
-- Strict AniHub search (20 results) plus an optional extended mode (up to 100 results).
-- Persistent stale-while-revalidate metadata cache for instant repeat searches and offline fallback.
-- Polished TUI: tabs, centered dialogs, status editor, contextual footer with `anihub-cli` branding.
-- `Esc` steps back through panels; on the search root it clears the result list to a clean home.
+## Features
 
-## Supported functionality
+- Search AniHub (strict or extended) with franchise grouping for seasons and films
+- Library with statuses, filters, resume, and continue-watching
+- Ashdi playback in **mpv** (native playlist, prev/next); MoonAnime opens in the browser
+- Posters in capable terminals · themes (AniHub RGB + ANSI 16/256 palettes)
+- Optional **Discord Rich Presence** with Spotify-style episode progress
+- Offline-friendly metadata and poster caches
+- Shortcuts work on **English and Ukrainian/Russian** keyboard layouts
 
-- Search AniHub by title in strict mode (one page, at most 20 Ukrainian-dubbed entries, tight title matching) or enable extended mode in Settings (up to five pages / 100 entries).
-- Browse anime details, posters, seasons, dubbing options, and episodes.
-- Group related seasons and films deterministically and persist search graphs/details for fast repeat navigation.
-- Keep the interface responsive while search, posters, episode sources, and stream resolution run in bounded background workers.
-- Play Ashdi streams with `mpv`; browser-only MoonAnime episodes open their direct embed after confirmation.
-- Save watch progress, watched state, and explicit anime statuses in a local library, with resume support.
-- Filter the library by Watching, Planned, Completed, On Hold, Dropped, or the complete collection.
-- Show the active title, season, episode, dubbing studio, position, and duration while playback is running.
-- Render posters in terminals supported by `ratatui-image` and provide a Ukrainian interface.
-- Publish the current mpv/Ashdi episode to Discord Rich Presence when the user explicitly enables it.
+> Changelog lives in [GitHub Releases](https://github.com/NEO-LAX/anihub-cli/releases) — not here.
 
-The application depends on the live AniHub/API and streaming pages. Search and stream availability can change when those services change.
+---
 
-## Installation
+## Install
 
-The installer supports Linux x86_64 and macOS x86_64/arm64. It downloads the matching release binary, verifies it against `SHA256SUMS`, validates/migrates local data, and installs it to `~/.local/bin` by default. Run it without an action to open the arrow-key menu; it shows **Install** for a fresh setup and **Update / Uninstall** when the binary already exists.
-
-![AniHub CLI installer](assets/installer.png)
+**Linux / macOS** (interactive menu: Install · Update · Uninstall):
 
 ```bash
-curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash
+curl --fail --location --retry 3 \
+  https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash
 ```
-
-Use `↑`/`↓` (or `j`/`k`) and `Enter` in the menu. Uninstall asks whether to keep or delete local history/settings. Automation can pass `install`, `update`, or `uninstall` explicitly:
 
 ```bash
-curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- update
-
-# Remove the app but keep history and settings
-curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- uninstall
-
-# Remove the app and all AniHub CLI user data
-curl --fail --location --retry 3 https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash -s -- uninstall --purge
+# non-interactive
+bash -s -- update
+bash -s -- uninstall          # keep user data
+bash -s -- uninstall --purge  # wipe user data
 ```
 
-To install into another directory, set `ANIHUB_INSTALL_DIR` before running the script. The installer runs the downloaded, checksum-verified binary in `--migrate-data` mode before replacing the installed executable. A failed validation leaves the current executable and source data intact. User data is deleted only after selecting **Delete user data** or passing the explicit `uninstall --purge` option.
+Default install path: `~/.local/bin` (override with `ANIHUB_INSTALL_DIR`).
 
-### Nix
-
-With flakes enabled, run AniHub CLI directly from GitHub:
+**Nix:**
 
 ```bash
 nix run github:NEO-LAX/anihub-cli
+# or: nix profile install github:NEO-LAX/anihub-cli
 ```
 
-The flake supports x86_64/aarch64 Linux and Intel/Apple-silicon macOS. It builds the locked Rust dependencies, provides `mpv` on the application's runtime `PATH`, and configures the Nix CA certificate bundle. To install it into your Nix profile instead of running it ephemerally:
+**Windows:** download the asset from [Releases](https://github.com/NEO-LAX/anihub-cli/releases/latest) and put it on `PATH`.
 
-```bash
-nix profile install github:NEO-LAX/anihub-cli
-```
-
-After installation, make sure the install directory is in `PATH`:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-anihub-cli
-```
-
-To make this permanent, add the export to `~/.profile` for bash or `~/.zprofile` for zsh, then open a new shell.
-
-### Release binaries
-
-| Platform | Release asset |
+| Platform | Asset |
 | --- | --- |
 | Linux x86_64 | `anihub-cli-x86_64-unknown-linux-gnu` |
 | macOS Intel | `anihub-cli-x86_64-apple-darwin` |
 | macOS Apple silicon | `anihub-cli-aarch64-apple-darwin` |
 | Windows x86_64 | `anihub-cli-x86_64-pc-windows-msvc.exe` |
 
-Windows users can download the Windows asset from the [latest release](https://github.com/NEO-LAX/anihub-cli/releases/latest), put it in a directory on `PATH`, and launch it from Windows Terminal or another capable terminal. The installer script itself is for Linux and macOS.
+---
 
-## Runtime dependencies
+## Requirements
 
-### `mpv`
-
-`mpv` is required for episode playback. AniHub CLI starts the `mpv` executable directly, so it must be available in `PATH`.
-
-Examples:
+- **`mpv`** on `PATH` (Ashdi playback)
+- A modern terminal (image protocols optional; text UI always works)
+- Discord **desktop** client only if you enable Rich Presence
 
 ```bash
 # Debian/Ubuntu
-sudo apt update && sudo apt install mpv
+sudo apt install mpv
 
-# macOS with Homebrew
+# macOS
 brew install mpv
 ```
 
-No separate command-line stream extractor is required: Ashdi page parsing is implemented in Rust.
+---
 
-AniHub CLI resolves the complete selected Ashdi timeline before opening mpv and
-passes every direct stream as a native mpv playlist entry. Opening episode 6
-therefore starts the playlist at episode 6 while keeping episodes 1–5 and all
-later episodes available through mpv's standard previous/next controls and
-keybindings. No custom mpv bindings are installed. Manual playlist navigation
-remains available when automatic next-episode playback is disabled.
+## Controls
 
-## Basic controls
-
-The footer shows shortcuts for the current screen. Press `?` or `h` outside search input to open the complete built-in help.
-
-### Global navigation
+Footer hints follow the current screen. `?` / `h` opens full help.
 
 | Key | Action |
 | --- | --- |
-| `1` / `2` / `3` | Switch Search / Library / Settings (does not open the search editor) |
-| `Alt+1` / `Alt+2` / `Alt+3` or `Ctrl+1`… | Same tab switch while the search field is focused |
-| `/` | Search AniHub from Search, or filter only the local library from Library |
-| `?` or `h` | Open help |
-| `Up` / `Down` or `k` / `j` | Move through the active list |
-| `Page Up` / `Page Down` | Move ten entries at a time |
-| `Home` / `End` | Jump to the beginning or end of the active list |
-| `Right` or `Enter` | Open the selected level or play the selected episode |
-| `Left` or `Esc` | Return to the previous level |
-| `r` | Retry the current request when a transient network error is open |
-| `q` | Save final playback progress, stop owned processes, and quit |
-| `Ctrl+C` | Quit from any screen, including search input |
+| `1` `2` `3` | Search · Library · Settings |
+| `/` | Search AniHub, or filter the local library |
+| `↑` `↓` · `k` `j` | Move selection |
+| `Enter` · `→` | Open / play |
+| `Esc` · `←` | Back (`Esc` on search root clears results) |
+| `c` | Continue watching |
+| `e` | Library status |
+| `Space` | Toggle watched |
+| `o` | Open in browser |
+| `r` | Retry after a network error |
+| `q` | Quit |
 
-### Anime and library actions
+While typing a query, digits stay insertable; switch tabs with `Alt`/`Ctrl` + `1`–`3`.
 
-| Key | Action |
+---
+
+## Settings & data
+
+Persisted under the platform data directory (`settings.json`, `history.json`, caches):
+
+| | Path |
 | --- | --- |
-| `c` | Continue the latest unfinished episode |
-| `e` | Choose Not Added / Planned / Watching / Completed / On Hold / Dropped |
-| `Space` | Toggle watched state for the selected season or episode, including browser-only MoonAnime episodes |
-| `Backspace` | Clear only the selected episode's resume timestamp |
-| `o` | Open the selected anime in a browser |
-| `d` | Delete the selected library progress after confirmation |
-| `Tab` / `Shift+Tab` | Cycle library status filters forward or backward |
+| Linux | `~/.local/share/anihub-cli/` |
+| macOS | `~/Library/Application Support/com.shadowgarden.anihub-cli/` |
+| Windows | `%LOCALAPPDATA%\shadowgarden\anihub-cli\data\` |
 
-Library search is local and immediate: press `/` anywhere inside Library, type part of a title, and press `Enter` to keep the filter. `Esc` clears it. It never starts an AniHub network search.
+Notable options: autoplay, resume threshold, search mode, themes, mpv path/args, Discord presence, poster cache clear, update check (never auto-installs).
 
-While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and `Delete` normally. `Enter` starts the search and `Esc` cancels it. Digits stay typeable; switch tabs with `Alt+1`/`Alt+2`/`Alt+3` (or `Ctrl`) without leaving the editor first.
+---
 
-### Settings
+## Build
 
-Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). The Themes tab cycles between the original AniHub RGB palette, terminal-native ANSI 16 colors, and curated ANSI 256 colors. Auto/Dark/Light controls foreground contrast, while background transparency remains an independent toggle. ANSI palette rows are disabled in AniHub RGB mode but can still be inspected in the preview; `Space` or `Enter` applies them after ANSI mode is selected. Auto follows `COLORFGBG` when the terminal exposes it and otherwise falls back to a dark surface. Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
-
-### Discord Rich Presence
-
-Discord integration is opt-in and only describes playback owned by AniHub CLI through mpv/Ashdi. Browser-only MoonAnime episodes are intentionally excluded because the CLI cannot reliably observe browser pause, progress, or completion.
-
-1. Open **Settings → General** and enable **Discord Rich Presence**.
-2. Keep the Discord desktop client running with activity sharing enabled.
-
-AniHub CLI ships its public Discord Application ID, so users do not need to create an application or enter credentials. No bot token, client secret, or Public Key is stored. The IPC connection runs on a background thread, reconnects when Discord starts later, and never blocks the TUI. Seeking corrects the displayed episode position after a short debounce; pausing freezes the timer and shows the current timestamp until playback resumes. Dynamic poster art is sent through wsrv.nl as a cached 1024×1024 attention crop so Discord receives a crisp square asset instead of cropping a vertical cover blindly. Closing playback or AniHub CLI clears the activity. Discord web/mobile clients cannot receive local Rich Presence updates.
-
-## Metadata cache
-
-Successful searches are stored in `metadata-cache.json` together with the AniList relationship graph used to reconstruct seasons, cours, films, and extras. Release details are cached by AniHub ID. On a repeated search the disk snapshot is rendered immediately, while AniHub/AniList are refreshed in the background. If that refresh fails, the cached result remains usable. Details are considered fresh for 24 hours; entries older than 30 days are pruned, and the cache is bounded to 64 searches and 500 detail records.
-
-The cache never contains watch history, library statuses, M3U8 URLs, MoonAnime iframe URLs, or authentication data. Deleting `metadata-cache.json` only makes the next lookup slower; `history.json` and `settings.json` remain untouched. Corrupt cache files are preserved with a `.corrupt-*` suffix and rebuilt automatically.
-
-## Poster cache
-
-Downloaded poster response bytes are stored under the `posters` directory beside `history.json`. A repeat visit decodes the local file before attempting the network, so cached metadata and artwork remain useful during a temporary outage. The cache is limited to 150 MiB and prunes the oldest files automatically. A corrupt image is deleted and fetched again without affecting history or settings.
-
-Use **Settings → About → Clear poster cache** to remove it. Clearing the poster cache never removes library progress, statuses, settings, or the metadata relationship cache.
-
-## History and recovery
-
-Progress and library statuses use the v2 schema stored under the stable `history.json` filename. On update, `history-v2.json`, schema-v1 history, and the original unversioned `history.json` format are imported automatically. Legacy files are retained, and an in-place schema migration keeps the original bytes in `history.json.bak` before writing the canonical format.
-
-| Platform | History file |
-| --- | --- |
-| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/anihub-cli/history.json` |
-| macOS | `$HOME/Library/Application Support/com.shadowgarden.anihub-cli/history.json` |
-| Windows | `%LOCALAPPDATA%\\shadowgarden\\anihub-cli\\data\\history.json` |
-
-Normal uninstall leaves this data in place; the interactive purge option and `uninstall --purge` remove the complete AniHub CLI data directory. Back it up before purging or manual recovery:
-
-```bash
-cp "/path/to/history.json" "/path/to/history.json.backup"
-```
-
-Writes are atomic and the previous valid file is retained as `history.json.bak`. If the primary JSON is damaged, the application preserves it with a `.corrupt-*` suffix and restores the valid backup automatically. If both files are damaged, startup reports an error instead of silently replacing the library. For manual recovery, quit the application and restore a known-good copy:
-
-```bash
-mv "/path/to/history.json" "/path/to/history.json.corrupt"
-cp "/path/to/history.json.bak" "/path/to/history.json"
-```
-
-If no valid backup exists, keep the corrupt files for manual JSON recovery before creating a new history file.
-
-## Troubleshooting
-
-- `anihub-cli: command not found`: add `~/.local/bin` (or your `ANIHUB_INSTALL_DIR`) to `PATH`, then start a new shell.
-- Playback reports that `mpv` cannot start: install `mpv` and confirm `command -v mpv` prints its path.
-- MoonAnime episodes are browser-only; confirm the popup to open the selected direct embed.
-- The installer reports an unsupported platform: release installation currently supports only Linux x86_64 and macOS x86_64/arm64. Windows uses the downloadable release asset.
-- Search returns no entries: verify network access and remember that the client filters API results to entries with Ukrainian dubbing.
-- Images are missing: use a terminal with image protocol support or continue using the text interface; playback and history do not depend on poster rendering.
-- Discord status is missing: use the desktop Discord client, enable activity sharing, and enable Rich Presence in Settings. Browser/mobile Discord cannot receive local IPC updates.
-- A source page or API is unavailable: the client cannot repair upstream outages or changes to AniHub, AniList, or Ashdi.
-
-## Build from source
-
-Install Rust 1.85 or newer with [rustup](https://rustup.rs/), then clone and build:
+Rust **1.85+**:
 
 ```bash
 git clone https://github.com/NEO-LAX/anihub-cli.git
@@ -228,18 +124,22 @@ cd anihub-cli
 cargo build --locked --release
 ```
 
-The binary is written to `target/release/anihub-cli` (or `anihub-cli.exe` on Windows).
-
-Before submitting a change, run the same core checks as CI:
+Binary: `target/release/anihub-cli`
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
-bash -n install.sh tests/install/test_install.sh
-bash tests/install/test_install.sh
 ```
+
+---
+
+## Notes
+
+- Unofficial client; depends on live AniHub / stream sources.
+- Installer script: Linux & macOS only. Windows uses release binaries.
+- Uninstall keeps data unless you pass `--purge`.
 
 ## License
 
-AniHub CLI is released under the [MIT License](LICENSE).
+[MIT](LICENSE)
