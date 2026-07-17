@@ -31,8 +31,8 @@ pub struct PlayTarget {
 /// A complete, ordered playback timeline with one selected entry.
 ///
 /// The full timeline is logical (progress, autoplay, franchise order). Only a
-/// sliding window of streams is resolved and handed to mpv so huge seasons
-/// (200–500 episodes) do not explode argv / IPC playlist snapshots.
+/// sliding window (~50 streams: 20 behind + current + 29 ahead) is resolved and
+/// handed to mpv so huge seasons do not explode argv / IPC playlist snapshots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackTimeline {
     entries: Vec<PlayTarget>,
@@ -40,10 +40,11 @@ pub struct PlaybackTimeline {
 }
 
 /// Episodes kept behind / ahead of the current title in the native mpv playlist.
-const PLAYLIST_WINDOW_BEHIND: usize = 5;
-const PLAYLIST_WINDOW_AHEAD: usize = 5;
+/// Total window size is at most `behind + 1 + ahead` (50 with the values below).
+const PLAYLIST_WINDOW_BEHIND: usize = 20;
+const PLAYLIST_WINDOW_AHEAD: usize = 29;
 /// Re-center the window once the playhead sits this close to either edge.
-const PLAYLIST_REWINDOW_EDGE: usize = 1;
+const PLAYLIST_REWINDOW_EDGE: usize = 2;
 
 /// Inclusive-exclusive timeline range loaded into mpv around `current`.
 fn playlist_window(current: usize, len: usize) -> (usize, usize) {
@@ -1115,8 +1116,8 @@ impl PlaybackActor {
                     self.emit(PlaybackEvent::SessionStarted { session_id, target })
                         .await;
                 }
-                // After settling on a new episode near the window edge, shift
-                // the ±5 window so prev/next keep working for long seasons.
+                // After settling on a new episode near the window edge, shift the
+                // sliding window so prev/next keep working for long seasons.
                 self.rewindow_active_if_needed().await;
             }
             MpvMonitorEvent::EofReached(true) => self.natural_eof().await,
@@ -1251,7 +1252,7 @@ impl PlaybackActor {
             }
             return;
         }
-        // Next episode is outside the loaded ±5 window — rebuild around it.
+        // Next episode is outside the loaded window — rebuild around it.
         if let Some(active) = self.active.as_mut() {
             let next = active.timeline.current_index + 1;
             if active.timeline.select(next).is_some() {
@@ -1457,23 +1458,28 @@ mod supervisor_tests {
     }
 
     #[test]
-    fn playlist_window_keeps_five_behind_and_ahead() {
-        assert_eq!(playlist_window(0, 270), (0, 6));
-        assert_eq!(playlist_window(12, 270), (7, 18));
-        assert_eq!(playlist_window(231, 270), (226, 237));
-        assert_eq!(playlist_window(269, 270), (264, 270));
+    fn playlist_window_keeps_about_fifty_episodes() {
+        // 20 behind + current + 29 ahead = 50 when not clipped.
+        assert_eq!(playlist_window(0, 270), (0, 30));
+        assert_eq!(playlist_window(12, 270), (0, 42));
+        assert_eq!(playlist_window(231, 270), (211, 261));
+        assert_eq!(playlist_window(269, 270), (249, 270));
+        assert_eq!(
+            playlist_window(100, 270).1 - playlist_window(100, 270).0,
+            50
+        );
     }
 
     #[test]
     fn rewindow_triggers_near_loaded_edges_only() {
-        // Window [226, 237) while sitting on 231 — middle, no rewindow.
-        assert!(!should_rewindow(226, 11, 231, 270));
+        // Window [211, 261) while sitting on 231 — middle, no rewindow.
+        assert!(!should_rewindow(211, 50, 231, 270));
         // Near end of window with more timeline ahead.
-        assert!(should_rewindow(226, 11, 235, 270));
+        assert!(should_rewindow(211, 50, 258, 270));
         // Near start with more timeline behind.
-        assert!(should_rewindow(226, 11, 227, 270));
+        assert!(should_rewindow(211, 50, 213, 270));
         // Whole season fits — never rewindow.
-        assert!(!should_rewindow(0, 10, 5, 10));
+        assert!(!should_rewindow(0, 40, 20, 40));
     }
 
     #[test]
