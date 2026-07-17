@@ -9,7 +9,7 @@ mod settings;
 mod storage;
 mod ui;
 
-use crate::discord::{DiscordPresence, PresenceActivity};
+use crate::discord::{DiscordPresence, PRESENCE_SYNC_INTERVAL, PresenceActivity};
 use crate::playback::*;
 use anyhow::{Result, bail};
 use api::resource::LoadError;
@@ -896,6 +896,7 @@ async fn main() -> Result<()> {
     let mut playback = PlaybackSupervisor::new();
     let discord_presence = DiscordPresence::new(app.settings.discord_presence);
     sync_discord_presence(&app, &discord_presence);
+    let mut last_discord_sync = Instant::now();
     let mut persisted_positions = HashMap::new();
     let mut update_check: Option<tokio::task::JoinHandle<Result<settings::UpdateCheck>>> = None;
 
@@ -911,6 +912,7 @@ async fn main() -> Result<()> {
         if app.take_discord_config_changed() {
             discord_presence.configure(app.settings.discord_presence);
             sync_discord_presence(&app, &discord_presence);
+            last_discord_sync = Instant::now();
         }
         if app.take_update_check_request() && update_check.is_none() {
             update_check = Some(tokio::spawn(settings::check_for_update(env!(
@@ -938,18 +940,28 @@ async fn main() -> Result<()> {
             }
         }
         let playback_events = playback.drain_events();
-        let mut presence_changed = false;
+        let previous_now_playing = app.now_playing.clone();
+        let mut presence_immediate = false;
         for event in playback_events {
-            presence_changed |= matches!(
+            presence_immediate |= matches!(
                 &event,
                 PlaybackEvent::SessionStarted { .. }
                     | PlaybackEvent::SessionStopped { .. }
                     | PlaybackEvent::Error { .. }
+                    | PlaybackEvent::PauseChanged { .. }
             );
             persist_playback_event(&mut app, &mut persisted_positions, event);
         }
-        if presence_changed {
+        // Duration often arrives only after the first progress snapshot — push
+        // immediately so Discord can switch from elapsed-only to a full bar.
+        presence_immediate |= duration_became_known(previous_now_playing.as_ref(), app.now_playing.as_ref())
+            || episode_identity_changed(previous_now_playing.as_ref(), app.now_playing.as_ref());
+        let presence_due = app.settings.discord_presence
+            && app.now_playing.is_some()
+            && last_discord_sync.elapsed() >= PRESENCE_SYNC_INTERVAL;
+        if presence_immediate || presence_due {
             sync_discord_presence(&app, &discord_presence);
+            last_discord_sync = Instant::now();
         }
 
         if app.play_episode {
@@ -1012,7 +1024,34 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
             .get(&now.anime_id)
             .and_then(|details| details.poster_url.clone())
             .or_else(|| app.poster_url_for_subject(now.anime_id)),
+        now.position,
+        now.duration,
+        now.paused,
     ));
+}
+
+fn duration_became_known(previous: Option<&ui::app::NowPlaying>, current: Option<&ui::app::NowPlaying>) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => previous.duration <= 0.0 && current.duration > 0.0,
+        (None, Some(current)) => current.duration > 0.0,
+        _ => false,
+    }
+}
+
+fn episode_identity_changed(
+    previous: Option<&ui::app::NowPlaying>,
+    current: Option<&ui::app::NowPlaying>,
+) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => {
+            previous.anime_id != current.anime_id
+                || previous.season != current.season
+                || previous.episode != current.episode
+                || previous.studio_name != current.studio_name
+        }
+        (None, Some(_)) | (Some(_), None) => true,
+        (None, None) => false,
+    }
 }
 
 fn apply_playback_settings(app: &AppState, timeline: &mut PlaybackTimeline) -> Result<()> {

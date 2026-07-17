@@ -8,12 +8,61 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const APPLICATION_ID: u64 = 1_527_419_150_761_328_810;
 const IMAGE_PROXY: &str = "https://wsrv.nl/";
 const MAX_ACTIVITY_ASSET_BYTES: usize = 256;
+/// How often the TUI should re-push watching progress so Discord stays aligned
+/// after seeks/pause and duration discovery. Discord itself animates the bar
+/// between start/end timestamps without per-second updates.
+pub const PRESENCE_SYNC_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresenceMedia {
+    /// Playback cursor rounded down to whole seconds.
+    pub position_secs: u64,
+    /// Total length when known; enables the Spotify-style progress bar.
+    pub duration_secs: Option<u64>,
+    pub paused: bool,
+}
+
+impl PresenceMedia {
+    pub fn from_playback(position: f64, duration: f64, paused: bool) -> Self {
+        let position_secs = if position.is_finite() && position > 0.0 {
+            position.floor() as u64
+        } else {
+            0
+        };
+        let duration_secs = if duration.is_finite() && duration > 0.0 {
+            let duration_secs = duration.ceil() as u64;
+            Some(duration_secs.max(position_secs.saturating_add(1)))
+        } else {
+            None
+        };
+        Self {
+            position_secs,
+            duration_secs,
+            paused,
+        }
+    }
+
+    /// Discord animates between `start` and `end` wall-clock timestamps.
+    /// `start = now - position` so the bar sits at the current cursor; with an
+    /// `end` Discord draws the Spotify-like remaining-time progress bar.
+    ///
+    /// When paused we still emit both timestamps — callers re-sync every
+    /// [`PRESENCE_SYNC_INTERVAL`] so the bar does not drift while frozen.
+    pub fn timestamps_at(&self, now_unix: u64) -> (u64, Option<u64>) {
+        let start = now_unix.saturating_sub(self.position_secs);
+        let end = self
+            .duration_secs
+            .map(|duration| start.saturating_add(duration));
+        (start, end)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresenceActivity {
     title: String,
     state: String,
     poster_url: Option<String>,
+    media: Option<PresenceMedia>,
 }
 
 impl PresenceActivity {
@@ -22,6 +71,7 @@ impl PresenceActivity {
             title: "Нічого не дивиться".to_string(),
             state: "AniHub CLI запущено".to_string(),
             poster_url: None,
+            media: None,
         }
     }
 
@@ -31,11 +81,21 @@ impl PresenceActivity {
         episode: u32,
         studio: &str,
         poster_url: Option<String>,
+        position: f64,
+        duration: f64,
+        paused: bool,
     ) -> Self {
+        let media = PresenceMedia::from_playback(position, duration, paused);
+        let state = if paused {
+            format!("Сезон {season} · Серія {episode} · {studio} · Пауза")
+        } else {
+            format!("Сезон {season} · Серія {episode} · {studio}")
+        };
         Self {
             title: truncate(title, 120),
-            state: truncate(&format!("Сезон {season} · Серія {episode} · {studio}"), 120),
+            state: truncate(&state, 120),
             poster_url: poster_url.and_then(|url| square_poster_url(&url)),
+            media: Some(media),
         }
     }
 
@@ -44,6 +104,7 @@ impl PresenceActivity {
             title: self.title.clone(),
             state: self.state.clone(),
             poster_url: None,
+            media: self.media.clone(),
         }
     }
 }
@@ -113,10 +174,7 @@ fn run_worker(receiver: Receiver<Command>) {
     let mut queued_epoch = 0;
     let mut seen_rejection_epoch = 0;
     let mut fallback_without_poster = false;
-    let started_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let started_at = unix_now();
 
     loop {
         let command = match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -276,8 +334,22 @@ fn queue_activity(client: &mut Client, activity: &PresenceActivity, started_at: 
         let builder = builder
             .activity_type(ActivityType::Watching)
             .details(activity.title.clone())
-            .state(activity.state.clone())
-            .timestamps(|timestamps| timestamps.start(started_at));
+            .state(activity.state.clone());
+        let builder = match &activity.media {
+            Some(media) => {
+                let (start, end) = media.timestamps_at(unix_now());
+                builder.timestamps(|timestamps| {
+                    let timestamps = timestamps.start(start);
+                    if let Some(end) = end {
+                        timestamps.end(end)
+                    } else {
+                        timestamps
+                    }
+                })
+            }
+            // Idle (or media without a cursor) keeps a simple session timer.
+            None => builder.timestamps(|timestamps| timestamps.start(started_at)),
+        };
         if let Some(poster_url) = &activity.poster_url {
             builder.assets(|assets| {
                 assets
@@ -294,6 +366,13 @@ fn stop_client(client: &mut Option<ManagedClient>) {
     if let Some(client) = client.take() {
         let _ = client.client.shutdown();
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -353,8 +432,16 @@ mod tests {
 
     #[test]
     fn activity_strings_are_bounded_without_breaking_unicode() {
-        let activity =
-            PresenceActivity::watching(&"Каґуя".repeat(40), 2, 4, &"Озвучка".repeat(40), None);
+        let activity = PresenceActivity::watching(
+            &"Каґуя".repeat(40),
+            2,
+            4,
+            &"Озвучка".repeat(40),
+            None,
+            0.0,
+            0.0,
+            false,
+        );
         assert!(activity.title.chars().count() <= 120);
         assert!(activity.state.chars().count() <= 120);
     }
@@ -364,18 +451,48 @@ mod tests {
         let idle = PresenceActivity::idle();
         assert_eq!(idle.title, "Нічого не дивиться");
         assert_eq!(idle.state, "AniHub CLI запущено");
+        assert_eq!(idle.media, None);
 
-        let watching = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None);
+        let watching = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, false);
         assert_eq!(watching.title, "Каґуя");
         assert_eq!(watching.state, "Сезон 2 · Серія 4 · Dzuski");
+        assert_eq!(
+            watching.media,
+            Some(PresenceMedia {
+                position_secs: 17,
+                duration_secs: Some(142),
+                paused: false,
+            })
+        );
+
+        let paused = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, true);
+        assert_eq!(paused.state, "Сезон 2 · Серія 4 · Dzuski · Пауза");
+        assert!(paused.media.as_ref().is_some_and(|media| media.paused));
+    }
+
+    #[test]
+    fn media_timestamps_anchor_progress_like_spotify() {
+        let media = PresenceMedia::from_playback(17.4, 142.2, false);
+        let (start, end) = media.timestamps_at(1_000_000);
+        assert_eq!(start, 1_000_000 - 17);
+        assert_eq!(end, Some(1_000_000 - 17 + 143));
+
+        let unknown_duration = PresenceMedia::from_playback(8.0, 0.0, false);
+        let (start, end) = unknown_duration.timestamps_at(500);
+        assert_eq!(start, 492);
+        assert_eq!(end, None);
     }
 
     #[test]
     fn reconnect_requeues_the_last_activity_without_progress_churn() {
-        let activity = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None);
+        let activity = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 0.0, 0.0, false);
         assert!(should_queue(None, &activity, false, 0, 0));
         assert!(!should_queue(Some(&activity), &activity, true, 1, 1));
         assert!(should_queue(Some(&activity), &activity, true, 2, 1));
+
+        let advanced =
+            PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 30.0, 142.0, false);
+        assert!(should_queue(Some(&activity), &advanced, true, 1, 1));
     }
 
     #[test]
@@ -425,10 +542,14 @@ mod tests {
             1,
             "Amanogawa",
             Some("https://example.com/poster.jpg".to_string()),
+            12.0,
+            1400.0,
+            false,
         );
         let fallback = activity.without_poster();
         assert_eq!(fallback.title, activity.title);
         assert_eq!(fallback.state, activity.state);
+        assert_eq!(fallback.media, activity.media);
         assert_eq!(fallback.poster_url, None);
         assert!(should_queue(Some(&activity), &fallback, true, 1, 1));
     }
