@@ -88,10 +88,13 @@ const fn ansi16_palette(theme: ThemePreset) -> ThemePalette {
         dim: Color::DarkGray,
         text: Color::White,
         on_primary,
-        dark: Color::Black,
+        // Kitty makes cells matching its default background translucent. A
+        // fixed near-black 256-color surface remains opaque while accents stay
+        // strictly terminal-native ANSI 16 colors.
+        dark: Color::Indexed(234),
         light_text: Color::Black,
         light_dim: Color::DarkGray,
-        light: Color::White,
+        light: Color::Indexed(255),
     }
 }
 
@@ -3996,6 +3999,14 @@ mod tests {
         let selected = selection_style();
         assert_eq!(selected.bg, Some(Color::Blue));
         assert!(!selected.add_modifier.contains(Modifier::REVERSED));
+
+        set_active_theme(
+            ColorMode::Ansi16,
+            ThemePreset::TokyoNight,
+            SurfaceMode::Dark,
+            false,
+        );
+        assert_eq!(color_background(), Color::Indexed(234));
     }
 
     #[test]
