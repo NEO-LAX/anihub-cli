@@ -9,7 +9,7 @@ mod settings;
 mod storage;
 mod ui;
 
-use crate::discord::{DiscordPresence, PRESENCE_SYNC_INTERVAL, PresenceActivity};
+use crate::discord::{DiscordPresence, PRESENCE_SYNC_INTERVAL, PresenceActivity, WatchingPresence};
 use crate::playback::*;
 use anyhow::{Result, bail};
 use api::resource::LoadError;
@@ -1019,19 +1019,20 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
         discord.update(PresenceActivity::idle());
         return;
     };
-    discord.update(PresenceActivity::watching(
-        &now.anime_title,
-        now.season,
-        now.episode,
-        &now.studio_name,
-        app.details_cache
+    discord.update(PresenceActivity::watching(WatchingPresence {
+        title: &now.anime_title,
+        season: now.season,
+        episode: now.episode,
+        studio: &now.studio_name,
+        poster_url: app
+            .details_cache
             .get(&now.anime_id)
             .and_then(|details| details.poster_url.clone())
             .or_else(|| app.poster_url_for_subject(now.anime_id)),
-        now.position,
-        now.duration,
-        now.paused,
-    ));
+        position: now.position,
+        duration: now.duration,
+        paused: now.paused,
+    }));
 }
 
 fn duration_became_known(

@@ -60,6 +60,20 @@ impl PresenceMedia {
     }
 }
 
+/// Inputs for a watching activity — kept as one struct so the constructor
+/// stays under clippy's argument limit and call sites stay readable.
+#[derive(Clone, Debug)]
+pub struct WatchingPresence<'a> {
+    pub title: &'a str,
+    pub season: u32,
+    pub episode: u32,
+    pub studio: &'a str,
+    pub poster_url: Option<String>,
+    pub position: f64,
+    pub duration: f64,
+    pub paused: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresenceActivity {
     title: String,
@@ -78,26 +92,23 @@ impl PresenceActivity {
         }
     }
 
-    pub fn watching(
-        title: &str,
-        season: u32,
-        episode: u32,
-        studio: &str,
-        poster_url: Option<String>,
-        position: f64,
-        duration: f64,
-        paused: bool,
-    ) -> Self {
-        let media = PresenceMedia::from_playback(position, duration, paused);
-        let state = if paused {
-            format!("Сезон {season} · Серія {episode} · {studio} · Пауза")
+    pub fn watching(input: WatchingPresence<'_>) -> Self {
+        let media = PresenceMedia::from_playback(input.position, input.duration, input.paused);
+        let state = if input.paused {
+            format!(
+                "Сезон {} · Серія {} · {} · Пауза",
+                input.season, input.episode, input.studio
+            )
         } else {
-            format!("Сезон {season} · Серія {episode} · {studio}")
+            format!(
+                "Сезон {} · Серія {} · {}",
+                input.season, input.episode, input.studio
+            )
         };
         Self {
-            title: truncate(title, 120),
+            title: truncate(input.title, 120),
             state: truncate(&state, 120),
-            poster_url: poster_url.and_then(|url| square_poster_url(&url)),
+            poster_url: input.poster_url.and_then(|url| square_poster_url(&url)),
             media: Some(media),
         }
     }
@@ -428,6 +439,19 @@ fn square_poster_url(source: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn sample(position: f64, duration: f64, paused: bool) -> PresenceActivity {
+        PresenceActivity::watching(WatchingPresence {
+            title: "Каґуя",
+            season: 2,
+            episode: 4,
+            studio: "Dzuski",
+            poster_url: None,
+            position,
+            duration,
+            paused,
+        })
+    }
+
     #[test]
     fn discord_is_opt_in_and_uses_the_anihub_application() {
         assert_eq!(false.then_some(APPLICATION_ID), None);
@@ -436,16 +460,18 @@ mod tests {
 
     #[test]
     fn activity_strings_are_bounded_without_breaking_unicode() {
-        let activity = PresenceActivity::watching(
-            &"Каґуя".repeat(40),
-            2,
-            4,
-            &"Озвучка".repeat(40),
-            None,
-            0.0,
-            0.0,
-            false,
-        );
+        let title = "Каґуя".repeat(40);
+        let studio = "Озвучка".repeat(40);
+        let activity = PresenceActivity::watching(WatchingPresence {
+            title: &title,
+            season: 2,
+            episode: 4,
+            studio: &studio,
+            poster_url: None,
+            position: 0.0,
+            duration: 0.0,
+            paused: false,
+        });
         assert!(activity.title.chars().count() <= 120);
         assert!(activity.state.chars().count() <= 120);
     }
@@ -457,12 +483,11 @@ mod tests {
         assert_eq!(idle.state, "AniHub CLI запущено");
         assert_eq!(idle.media, None);
 
-        let watching =
-            PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, false);
-        assert_eq!(watching.title, "Каґуя");
-        assert_eq!(watching.state, "Сезон 2 · Серія 4 · Dzuski");
+        let playing = sample(17.4, 142.0, false);
+        assert_eq!(playing.title, "Каґуя");
+        assert_eq!(playing.state, "Сезон 2 · Серія 4 · Dzuski");
         assert_eq!(
-            watching.media,
+            playing.media,
             Some(PresenceMedia {
                 position_secs: 17,
                 duration_secs: Some(142),
@@ -470,7 +495,7 @@ mod tests {
             })
         );
 
-        let paused = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, true);
+        let paused = sample(17.4, 142.0, true);
         assert_eq!(paused.state, "Сезон 2 · Серія 4 · Dzuski · Пауза");
         assert!(paused.media.as_ref().is_some_and(|media| media.paused));
         assert_eq!(
@@ -501,13 +526,12 @@ mod tests {
 
     #[test]
     fn reconnect_requeues_the_last_activity_without_progress_churn() {
-        let activity = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 0.0, 0.0, false);
+        let activity = sample(0.0, 0.0, false);
         assert!(should_queue(None, &activity, false, 0, 0));
         assert!(!should_queue(Some(&activity), &activity, true, 1, 1));
         assert!(should_queue(Some(&activity), &activity, true, 2, 1));
 
-        let advanced =
-            PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 30.0, 142.0, false);
+        let advanced = sample(30.0, 142.0, false);
         assert!(should_queue(Some(&activity), &advanced, true, 1, 1));
     }
 
@@ -552,16 +576,16 @@ mod tests {
 
     #[test]
     fn rejected_poster_can_fall_back_without_losing_watching_state() {
-        let activity = PresenceActivity::watching(
-            "Фрірен",
-            1,
-            1,
-            "Amanogawa",
-            Some("https://example.com/poster.jpg".to_string()),
-            12.0,
-            1400.0,
-            false,
-        );
+        let activity = PresenceActivity::watching(WatchingPresence {
+            title: "Фрірен",
+            season: 1,
+            episode: 1,
+            studio: "Amanogawa",
+            poster_url: Some("https://example.com/poster.jpg".to_string()),
+            position: 12.0,
+            duration: 1400.0,
+            paused: false,
+        });
         let fallback = activity.without_poster();
         assert_eq!(fallback.title, activity.title);
         assert_eq!(fallback.state, activity.state);
