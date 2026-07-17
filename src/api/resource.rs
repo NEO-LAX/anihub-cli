@@ -145,6 +145,8 @@ pub enum LoadError {
     Decode(String),
     #[error("unsupported resource: {0}")]
     Unsupported(String),
+    #[error("no episode sources available")]
+    NoSources,
     #[error("resource worker is shutting down")]
     Shutdown,
 }
@@ -836,6 +838,9 @@ fn classify_error(error: anyhow::Error) -> LoadError {
             if api_error.is_not_found() {
                 return LoadError::NotFound;
             }
+            if api_error.is_no_sources() {
+                return LoadError::NoSources;
+            }
             if let Some(status) = api_error.status() {
                 return LoadError::Http {
                     status,
@@ -847,6 +852,7 @@ fn classify_error(error: anyhow::Error) -> LoadError {
                 ApiError::Transport { .. } => LoadError::Network(error.to_string()),
                 ApiError::Parse { .. } => LoadError::Parse(error.to_string()),
                 ApiError::Decode { .. } => LoadError::Decode(error.to_string()),
+                ApiError::NoSources { .. } => LoadError::NoSources,
                 ApiError::Http { .. } => LoadError::Http {
                     status: api_error.status().unwrap_or(0),
                     message: error.to_string(),

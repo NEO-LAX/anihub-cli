@@ -151,25 +151,42 @@ pub enum ApiError {
     Parse { operation: String, message: String },
     #[error("{operation}: response body could not be decoded: {message}")]
     Decode { operation: String, message: String },
+    /// Episode-sources returned successfully but with no playable entries.
+    #[error("{operation}: no episode sources for anime {anime_id} season {season}")]
+    NoSources {
+        operation: String,
+        anime_id: u32,
+        season: u32,
+    },
 }
 
 impl ApiError {
     pub fn status(&self) -> Option<u16> {
         match self {
             Self::Http { status, .. } => Some(*status),
-            Self::Transport { .. } | Self::Parse { .. } | Self::Decode { .. } => None,
+            Self::Transport { .. }
+            | Self::Parse { .. }
+            | Self::Decode { .. }
+            | Self::NoSources { .. } => None,
         }
     }
 
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Http { retry_after, .. } => *retry_after,
-            Self::Transport { .. } | Self::Parse { .. } | Self::Decode { .. } => None,
+            Self::Transport { .. }
+            | Self::Parse { .. }
+            | Self::Decode { .. }
+            | Self::NoSources { .. } => None,
         }
     }
 
     pub fn is_not_found(&self) -> bool {
         self.status() == Some(404)
+    }
+
+    pub fn is_no_sources(&self) -> bool {
+        matches!(self, Self::NoSources { .. })
     }
 }
 
@@ -523,17 +540,30 @@ impl ApiClient {
         Ok((image, bytes.to_vec()))
     }
 
-    /// Load one AniHub release using the franchise-level season expected by
-    /// the episode-sources endpoint. Separate AniHub ids do not make this
-    /// parameter release-local: S2 entries still require `season=2`.
+    /// Load episode sources for one AniHub release.
+    ///
+    /// Franchise UI seasons are often conceptual (S1/S2/S3 across sequels).
+    /// Some AniHub titles expose streams only under release-local `season=1`
+    /// even when the franchise label is "Сезон 2". Prefer the requested season
+    /// first (multi-season single ids still need N), then fall back to `1`.
     pub async fn get_release_sources(
         &self,
         anime_id: u32,
         season: u32,
     ) -> Result<EpisodeSourcesResponse> {
         let mut sources = self.get_episode_sources(anime_id, season).await?;
-        if sources.ashdi.is_empty() && sources.moonanime.is_empty() {
-            anyhow::bail!("No episode sources found for anime {anime_id} season {season}");
+        if episode_sources_empty(&sources) && season != 1 {
+            let fallback = self.get_episode_sources(anime_id, 1).await?;
+            if !episode_sources_empty(&fallback) {
+                sources = fallback;
+            }
+        }
+        if episode_sources_empty(&sources) {
+            return Err(anyhow::Error::new(ApiError::NoSources {
+                operation: "AniHub episode sources".to_string(),
+                anime_id,
+                season,
+            }));
         }
 
         sources.ashdi.sort_by(|left, right| {
@@ -546,6 +576,10 @@ impl ApiClient {
 
         Ok(sources)
     }
+}
+
+fn episode_sources_empty(sources: &EpisodeSourcesResponse) -> bool {
+    sources.ashdi.is_empty() && sources.moonanime.is_empty()
 }
 
 fn build_http_client() -> Result<Client> {
@@ -1034,6 +1068,83 @@ mod tests {
             sources.moonanime[0].episodes[0].iframe_url,
             "https://moonanime.art/episode/1"
         );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn release_sources_fall_back_to_local_season_one_when_conceptual_is_empty() {
+        let server = MockServer::start(|_, path| {
+            let url = reqwest::Url::parse(&format!("http://localhost{path}"))
+                .expect("mock request path must form a valid URL");
+            let params = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            let season = params.get("season").map(String::as_str).unwrap_or("");
+            match season {
+                "2" => (
+                    200,
+                    serde_json::json!({ "ashdi": [], "moonanime": [] }).to_string(),
+                ),
+                "1" => (
+                    200,
+                    serde_json::json!({
+                        "ashdi": [{
+                            "id": 9,
+                            "studio_name": "FanVoxUA",
+                            "season_number": 1,
+                            "episodes_count": 2,
+                            "episodes": [
+                                {
+                                    "episode_number": 1,
+                                    "display_episode_number": 1.0,
+                                    "title": "Ep 1",
+                                    "url": "https://ashdi.vip/vod/1",
+                                    "ashdi_episode_id": "a1"
+                                },
+                                {
+                                    "episode_number": 2,
+                                    "display_episode_number": 2.0,
+                                    "title": "Ep 2",
+                                    "url": "https://ashdi.vip/vod/2",
+                                    "ashdi_episode_id": "a2"
+                                }
+                            ]
+                        }],
+                        "moonanime": []
+                    })
+                    .to_string(),
+                ),
+                other => panic!("unexpected season query: {other}"),
+            }
+        })
+        .await;
+
+        let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
+        let sources = client.get_release_sources(77, 2).await.unwrap();
+
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("season=2"));
+        assert!(requests[1].contains("season=1"));
+        assert_eq!(sources.ashdi.len(), 1);
+        assert_eq!(sources.ashdi[0].studio_name, "FanVoxUA");
+        assert_eq!(sources.ashdi[0].episodes.len(), 2);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn release_sources_report_no_sources_when_both_seasons_are_empty() {
+        let server = MockServer::start(|_, _| {
+            (
+                200,
+                serde_json::json!({ "ashdi": [], "moonanime": [] }).to_string(),
+            )
+        })
+        .await;
+
+        let client = ApiClient::with_base_urls(&server.address, &server.address).unwrap();
+        let error = client.get_release_sources(77, 2).await.unwrap_err();
+        let api_error = error.downcast_ref::<ApiError>().expect("ApiError");
+        assert!(api_error.is_no_sources());
+        assert_eq!(server.requests().await.len(), 2);
         server.stop().await;
     }
 }

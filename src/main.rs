@@ -634,6 +634,7 @@ fn resource_error_hint(error: &LoadError) -> String {
         }
         LoadError::Http { status, .. } => format!("AniHub повернув HTTP {status}"),
         LoadError::NotFound => "Дані більше не доступні на AniHub".to_string(),
+        LoadError::NoSources => "Немає озвучок або серій для цього випуску на AniHub".to_string(),
         LoadError::Parse(_) | LoadError::Decode(_) => "AniHub повернув некоректні дані".to_string(),
         LoadError::Unsupported(_) => "Цей ресурс не підтримується".to_string(),
         LoadError::Shutdown => "Сервіс завантаження завершує роботу".to_string(),
