@@ -1171,10 +1171,6 @@ fn persist_playback_event(
             app.clear_activity();
             app.set_error_status(format!("Помилка відтворення: {message}"));
         }
-        PlaybackEvent::NavigationFailed { message, .. } => {
-            app.clear_activity();
-            app.set_error_status(format!("Не вдалося переключити серію: {message}"));
-        }
         PlaybackEvent::EndFile { .. } => {}
     }
 }

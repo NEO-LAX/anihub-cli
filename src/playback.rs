@@ -1,15 +1,15 @@
 use crate::api;
 use crate::api::EpisodeSourcesResponse;
 use crate::player::{
-    EndFileEvent, EndFileReason, MpvMonitorEvent, MpvNavigation, MpvSession, TaskCancellation,
+    EndFileReason, MpvMonitorEvent, MpvPlaylistEntry, MpvSession, TaskCancellation,
 };
 use crate::storage;
 use crate::ui::AppState;
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, sleep, timeout};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,8 +30,8 @@ pub struct PlayTarget {
 /// A complete, ordered playback timeline with one selected entry.
 ///
 /// Unlike the old forward-only queue, entries before `current_index` remain
-/// available for manual navigation from inside mpv. Stream URLs are still
-/// resolved lazily when an entry becomes current.
+/// available for manual navigation from inside mpv. Every stream is resolved
+/// before launch so mpv receives a real native playlist.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackTimeline {
     entries: Vec<PlayTarget>,
@@ -70,13 +70,8 @@ impl PlaybackTimeline {
         }
     }
 
-    fn adjacent_index(&self, navigation: MpvNavigation) -> Option<usize> {
-        match navigation {
-            MpvNavigation::Previous => self.current_index.checked_sub(1),
-            MpvNavigation::Next => {
-                (self.current_index + 1 < self.entries.len()).then_some(self.current_index + 1)
-            }
-        }
+    fn has_next(&self) -> bool {
+        self.current_index + 1 < self.entries.len()
     }
 
     fn select(&mut self, index: usize) -> Option<PlayTarget> {
@@ -194,7 +189,7 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
 }
 
 /// Build a deterministic timeline around the selected target. The supervisor
-/// resolves each Ashdi stream only when it becomes current.
+/// resolves the complete timeline before launching mpv.
 pub fn build_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
     let Some(sources) = app.current_sources.as_ref() else {
         return PlaybackTimeline::single(target.clone());
@@ -485,10 +480,6 @@ pub enum PlaybackEvent {
         session_id: Option<PlaybackSessionId>,
         message: String,
     },
-    NavigationFailed {
-        session_id: PlaybackSessionId,
-        message: String,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -582,8 +573,8 @@ impl Drop for PlaybackSupervisor {
     }
 }
 
-struct ResolvedStream {
-    url: String,
+struct ResolvedPlaylist {
+    entries: Vec<MpvPlaylistEntry>,
 }
 
 struct ActivePlayback {
@@ -592,36 +583,18 @@ struct ActivePlayback {
     current: PlayTarget,
     timeline: PlaybackTimeline,
     autoplay_next: bool,
-    resolved_streams: HashMap<PlaybackIdentity, String>,
     position: f64,
     duration: f64,
     has_position: bool,
     entry_id: Option<i64>,
-    transitioning: bool,
+    pending_index: Option<usize>,
     at_eof: bool,
-    pending_navigation: Option<PendingNavigation>,
-    stale_entry_id: Option<i64>,
-}
-
-struct PendingNavigation {
-    target: PlayTarget,
-    target_index: usize,
-    resolved_url: String,
-    old_entry_id: Option<i64>,
-    new_entry_id: Option<i64>,
-    replacing_active_file: bool,
-    old_end_seen: bool,
 }
 
 enum ResolutionPurpose {
     Start {
         timeline: PlaybackTimeline,
         autoplay_next: bool,
-        session_id: PlaybackSessionId,
-    },
-    Navigate {
-        target: PlayTarget,
-        target_index: usize,
         session_id: PlaybackSessionId,
     },
     Replace {
@@ -634,7 +607,7 @@ enum ResolutionPurpose {
 struct PendingResolution {
     cancellation: TaskCancellation,
     purpose: Option<ResolutionPurpose>,
-    task: Option<JoinHandle<std::result::Result<ResolvedStream, String>>>,
+    task: Option<JoinHandle<std::result::Result<ResolvedPlaylist, String>>>,
 }
 
 impl Drop for PendingResolution {
@@ -651,35 +624,6 @@ struct PlaybackActor {
     events: mpsc::Sender<PlaybackEvent>,
     active: Option<ActivePlayback>,
     pending: Option<PendingResolution>,
-}
-
-fn end_file_belongs_to_replaced_entry(
-    pending: &PendingNavigation,
-    end_file: &EndFileEvent,
-) -> bool {
-    if !pending.replacing_active_file {
-        return false;
-    }
-    if let (Some(event_entry_id), Some(new_entry_id)) =
-        (end_file.playlist_entry_id, pending.new_entry_id)
-    {
-        // Once mpv announces the new entry, every other concrete id belongs
-        // to the entry being replaced even if its id was not observed earlier.
-        return event_entry_id != new_entry_id;
-    }
-    if let (Some(event_entry_id), Some(old_entry_id)) =
-        (end_file.playlist_entry_id, pending.old_entry_id)
-    {
-        return event_entry_id == old_entry_id;
-    }
-    if pending.new_entry_id.is_none() {
-        // Before `start-file`, an uncorrelated synthetic stop (or a genuine
-        // last-frame EOF race) belongs to the entry being replaced. Never
-        // suppress an error/abort from an entry whose id we failed to observe.
-        return matches!(end_file.reason, EndFileReason::Stop | EndFileReason::Eof);
-    }
-    // Some mpv builds omit the old playlist entry id for the synthetic stop.
-    matches!(end_file.reason, EndFileReason::Stop)
 }
 
 impl PlaybackActor {
@@ -755,15 +699,14 @@ impl PlaybackActor {
     }
 
     async fn begin_resolution(&mut self, purpose: ResolutionPurpose) {
-        let target = match &purpose {
+        let timeline = match &purpose {
             ResolutionPurpose::Start { timeline, .. }
-            | ResolutionPurpose::Replace { timeline, .. } => timeline.current().clone(),
-            ResolutionPurpose::Navigate { target, .. } => target.clone(),
+            | ResolutionPurpose::Replace { timeline, .. } => timeline.clone(),
         };
         let cancellation = TaskCancellation::new();
         let task_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
-            resolve_stream(&target, &task_cancellation)
+            resolve_playlist(&timeline, &task_cancellation)
                 .await
                 .map_err(|error| error.to_string())
         });
@@ -822,60 +765,33 @@ impl PlaybackActor {
             .and_then(|active| active.mpv.child_exited().ok().flatten())
             .is_some();
         if exited {
-            let transitioning = self
-                .active
-                .as_ref()
-                .map(|active| active.transitioning)
-                .unwrap_or(false);
             let id = self.active.as_ref().map(|active| active.id);
             self.emit(PlaybackEvent::Error {
                 session_id: id,
                 message: "mpv exited before playback completed".to_string(),
             })
             .await;
-            self.stop_active(!transitioning).await;
+            self.stop_active(true).await;
         }
     }
 
     async fn handle_resolution(
         &mut self,
         purpose: ResolutionPurpose,
-        result: std::result::Result<ResolvedStream, String>,
+        result: std::result::Result<ResolvedPlaylist, String>,
     ) {
         let resolved = match result {
             Ok(resolved) => resolved,
             Err(message) => {
-                let is_navigation = matches!(&purpose, ResolutionPurpose::Navigate { .. });
                 let session_id = match purpose {
                     ResolutionPurpose::Start { session_id, .. }
-                    | ResolutionPurpose::Navigate { session_id, .. }
                     | ResolutionPurpose::Replace { session_id, .. } => Some(session_id),
                 };
-                if is_navigation {
-                    let stopped_at_eof = self.active.as_ref().is_some_and(|active| active.at_eof);
-                    if stopped_at_eof {
-                        self.emit(PlaybackEvent::Error {
-                            session_id,
-                            message,
-                        })
-                        .await;
-                        self.stop_active(false).await;
-                    } else if let Some(active) = self.active.as_mut() {
-                        let session_id = active.id;
-                        active.transitioning = false;
-                        self.emit(PlaybackEvent::NavigationFailed {
-                            session_id,
-                            message,
-                        })
-                        .await;
-                    }
-                } else {
-                    self.emit(PlaybackEvent::Error {
-                        session_id,
-                        message,
-                    })
-                    .await;
-                }
+                self.emit(PlaybackEvent::Error {
+                    session_id,
+                    message,
+                })
+                .await;
                 return;
             }
         };
@@ -890,14 +806,6 @@ impl PlaybackActor {
                     self.launch_active(session_id, timeline, autoplay_next, resolved)
                         .await;
                 }
-            }
-            ResolutionPurpose::Navigate {
-                target,
-                target_index,
-                session_id,
-            } => {
-                self.commit_navigation(session_id, target_index, target, resolved)
-                    .await;
             }
             ResolutionPurpose::Replace {
                 timeline,
@@ -915,108 +823,38 @@ impl PlaybackActor {
         session_id: PlaybackSessionId,
         timeline: PlaybackTimeline,
         autoplay_next: bool,
-        resolved: ResolvedStream,
+        resolved: ResolvedPlaylist,
     ) {
         let target = timeline.current().clone();
-        let mpv = match MpvSession::spawn(
-            session_id.raw(),
-            &resolved.url,
-            target.start_time,
-            &target.player_title,
-            &target.episode_title,
-            &target.referrer,
-        )
-        .await
-        {
-            Ok(mpv) => mpv,
-            Err(error) => {
-                self.emit(PlaybackEvent::Error {
-                    session_id: Some(session_id),
-                    message: error.to_string(),
-                })
-                .await;
-                return;
-            }
-        };
-        let mut resolved_streams = HashMap::new();
-        resolved_streams.insert(PlaybackIdentity::from(&target), resolved.url);
+        let mpv =
+            match MpvSession::spawn(session_id.raw(), &resolved.entries, timeline.current_index)
+                .await
+            {
+                Ok(mpv) => mpv,
+                Err(error) => {
+                    self.emit(PlaybackEvent::Error {
+                        session_id: Some(session_id),
+                        message: error.to_string(),
+                    })
+                    .await;
+                    return;
+                }
+            };
         self.active = Some(ActivePlayback {
             id: session_id,
             mpv,
             current: target.clone(),
             timeline,
             autoplay_next,
-            resolved_streams,
             position: 0.0,
             duration: 0.0,
             has_position: false,
             entry_id: None,
-            transitioning: false,
+            pending_index: None,
             at_eof: false,
-            pending_navigation: None,
-            stale_entry_id: None,
         });
         self.emit(PlaybackEvent::SessionStarted { session_id, target })
             .await;
-    }
-
-    async fn commit_navigation(
-        &mut self,
-        session_id: PlaybackSessionId,
-        target_index: usize,
-        target: PlayTarget,
-        resolved: ResolvedStream,
-    ) {
-        let Some(active) = self.active.as_mut() else {
-            return;
-        };
-        if active.id != session_id || !active.transitioning {
-            return;
-        }
-        let replacing_active_file = !active.at_eof;
-        let old_entry_id = active.entry_id;
-        let load_result = active
-            .mpv
-            .load_media(
-                &resolved.url,
-                target.start_time,
-                &target.player_title,
-                &target.episode_title,
-            )
-            .await;
-        if let Err(error) = load_result {
-            let id = active.id;
-            active.transitioning = false;
-            if replacing_active_file {
-                self.emit(PlaybackEvent::NavigationFailed {
-                    session_id: id,
-                    message: error.to_string(),
-                })
-                .await;
-            } else {
-                self.emit(PlaybackEvent::Error {
-                    session_id: Some(id),
-                    message: error.to_string(),
-                })
-                .await;
-                self.stop_active(false).await;
-            }
-            return;
-        }
-
-        // `loadfile` only acknowledges that the command was queued. Keep the
-        // old logical episode selected until mpv confirms the new entry with
-        // `file-loaded`, otherwise queued old-file events could be persisted
-        // against the new episode.
-        active.pending_navigation = Some(PendingNavigation {
-            target,
-            target_index,
-            resolved_url: resolved.url,
-            old_entry_id,
-            new_entry_id: None,
-            replacing_active_file,
-            old_end_seen: false,
-        });
     }
 
     async fn replace_active(
@@ -1024,7 +862,7 @@ impl PlaybackActor {
         session_id: PlaybackSessionId,
         timeline: PlaybackTimeline,
         autoplay_next: bool,
-        resolved: ResolvedStream,
+        resolved: ResolvedPlaylist,
     ) {
         let target = timeline.current().clone();
         let Some(mut old) = self.active.take() else {
@@ -1033,38 +871,24 @@ impl PlaybackActor {
             return;
         };
         let old_snapshot = old.mpv.shutdown().await;
-        if !old.transitioning {
-            self.emit_partial(&old, old_snapshot.time_pos, old_snapshot.duration)
-                .await;
-        }
-        let launch_result = MpvSession::spawn(
-            session_id.raw(),
-            &resolved.url,
-            target.start_time,
-            &target.player_title,
-            &target.episode_title,
-            &target.referrer,
-        )
-        .await;
+        self.emit_partial(&old, old_snapshot.time_pos, old_snapshot.duration)
+            .await;
+        let launch_result =
+            MpvSession::spawn(session_id.raw(), &resolved.entries, timeline.current_index).await;
         match launch_result {
             Ok(mpv) => {
-                let mut resolved_streams = HashMap::new();
-                resolved_streams.insert(PlaybackIdentity::from(&target), resolved.url);
                 self.active = Some(ActivePlayback {
                     id: session_id,
                     mpv,
                     current: target.clone(),
                     timeline,
                     autoplay_next,
-                    resolved_streams,
                     position: 0.0,
                     duration: 0.0,
                     has_position: false,
                     entry_id: None,
-                    transitioning: false,
+                    pending_index: None,
                     at_eof: false,
-                    pending_navigation: None,
-                    stale_entry_id: None,
                 });
                 self.emit(PlaybackEvent::SessionStarted { session_id, target })
                     .await;
@@ -1083,7 +907,7 @@ impl PlaybackActor {
         match event {
             MpvMonitorEvent::Progress { time_pos, duration } => {
                 let snapshot = if let Some(active) = self.active.as_mut() {
-                    if active.pending_navigation.is_some() {
+                    if active.pending_index.is_some() {
                         return;
                     }
                     if let Some(time_pos) =
@@ -1097,7 +921,7 @@ impl PlaybackActor {
                     {
                         active.duration = duration;
                     }
-                    if active.has_position && !active.transitioning {
+                    if active.has_position && !active.at_eof {
                         Some(Self::progress_snapshot(active, false))
                     } else {
                         None
@@ -1111,7 +935,7 @@ impl PlaybackActor {
             }
             MpvMonitorEvent::PauseChanged { paused, time_pos } => {
                 let event = self.active.as_mut().and_then(|active| {
-                    if active.pending_navigation.is_some() {
+                    if active.pending_index.is_some() {
                         return None;
                     }
                     let position = if let Some(time_pos) =
@@ -1136,106 +960,88 @@ impl PlaybackActor {
             }
             MpvMonitorEvent::PlaylistPosition { position, entry_id } => {
                 if let Some(active) = self.active.as_mut() {
-                    if active.pending_navigation.is_none() {
-                        active.entry_id = entry_id.or(active.entry_id);
+                    active.entry_id = entry_id.or(active.entry_id);
+                    if let Some(position) =
+                        position.filter(|index| *index < active.timeline.entries.len())
+                        && position != active.timeline.current_index
+                    {
+                        active.pending_index = Some(position);
                     }
-                    // Position zero is mpv initialization. It is deliberately
-                    // not a queue transition and never emits a reset.
-                    let _initial_position = position == Some(0);
                 }
             }
             MpvMonitorEvent::FileStarted { playlist_entry_id } => {
                 if let Some(active) = self.active.as_mut() {
-                    if let Some(pending) = active.pending_navigation.as_mut() {
-                        if playlist_entry_id.is_some() && playlist_entry_id != pending.old_entry_id
-                        {
-                            pending.new_entry_id = playlist_entry_id;
-                        }
-                    } else {
-                        active.entry_id = playlist_entry_id.or(active.entry_id);
+                    let index =
+                        playlist_entry_id.and_then(|entry_id| active.mpv.playlist_index(entry_id));
+                    if let Some(index) =
+                        index.filter(|index| *index != active.timeline.current_index)
+                    {
+                        active.pending_index = Some(index);
                     }
+                    active.entry_id = playlist_entry_id.or(active.entry_id);
                 }
             }
             MpvMonitorEvent::FileLoaded { playlist_entry_id } => {
-                let started = if let Some(active) = self.active.as_mut() {
-                    let stale_old_load =
-                        active.pending_navigation.as_ref().is_some_and(|pending| {
-                            pending.replacing_active_file
-                                && playlist_entry_id.is_some()
-                                && playlist_entry_id == pending.old_entry_id
-                        });
-                    if stale_old_load {
-                        active.entry_id = playlist_entry_id.or(active.entry_id);
-                        None
-                    } else if let Some(pending) = active.pending_navigation.take() {
-                        let new_entry_id = playlist_entry_id.or(pending.new_entry_id);
-                        active.stale_entry_id = (!pending.old_end_seen
-                            && pending.replacing_active_file)
-                            .then_some(pending.old_entry_id)
-                            .flatten();
-                        let identity = PlaybackIdentity::from(&pending.target);
-                        active
-                            .resolved_streams
-                            .insert(identity, pending.resolved_url);
+                let (started, resume_from_eof) = if let Some(active) = self.active.as_mut() {
+                    let index = playlist_entry_id
+                        .and_then(|entry_id| active.mpv.playlist_index(entry_id))
+                        .or(active.pending_index)
+                        .unwrap_or(active.timeline.current_index);
+                    active.pending_index = None;
+                    active.entry_id = playlist_entry_id.or(active.entry_id);
+                    let resume_from_eof = active.at_eof;
+                    if index != active.timeline.current_index {
                         let selected = active
                             .timeline
-                            .select(pending.target_index)
-                            .unwrap_or(pending.target);
+                            .select(index)
+                            .unwrap_or_else(|| active.current.clone());
                         active.current = selected.clone();
                         active.position = 0.0;
                         active.duration = 0.0;
                         active.has_position = false;
-                        active.entry_id = new_entry_id;
-                        active.transitioning = false;
                         active.at_eof = false;
-                        Some((active.id, selected))
+                        (Some((active.id, selected)), resume_from_eof)
                     } else {
-                        active.entry_id = playlist_entry_id.or(active.entry_id);
-                        None
+                        active.at_eof = false;
+                        (None, resume_from_eof)
                     }
                 } else {
-                    None
+                    (None, false)
                 };
+                if resume_from_eof && let Some(active) = self.active.as_ref() {
+                    let _ = active.mpv.set_paused(false).await;
+                }
                 if let Some((session_id, target)) = started {
                     self.emit(PlaybackEvent::SessionStarted { session_id, target })
                         .await;
                 }
             }
-            MpvMonitorEvent::Navigate(navigation) => {
-                self.navigate(navigation).await;
-            }
+            MpvMonitorEvent::EofReached(true) => self.natural_eof().await,
+            MpvMonitorEvent::EofReached(false) => {}
             MpvMonitorEvent::EndFile(end_file) => {
-                let (id, entry_id, ignore_replaced, pending_failed) = {
+                let (id, entry_id, partial) = {
                     let Some(active) = self.active.as_mut() else {
                         return;
                     };
-                    let mut ignore_replaced = false;
-                    let mut pending_failed = None;
-                    if let Some(pending) = active.pending_navigation.as_mut() {
-                        if end_file_belongs_to_replaced_entry(pending, &end_file) {
-                            pending.old_end_seen = true;
-                            ignore_replaced = true;
-                        } else {
-                            pending_failed = Some(format!(
-                                "mpv не зміг завантажити серію {}",
-                                pending.target.episode
-                            ));
-                        }
-                    } else if active.stale_entry_id.is_some()
-                        && end_file.playlist_entry_id == active.stale_entry_id
+                    let partial = if matches!(end_file.reason, EndFileReason::Stop)
+                        && active.has_position
+                        && !active.at_eof
                     {
-                        active.stale_entry_id = None;
-                        ignore_replaced = true;
-                    }
+                        let resume = (active.position > 0.0).then_some(active.position);
+                        active.timeline.entries[active.timeline.current_index].start_time = resume;
+                        active.current.start_time = resume;
+                        Some(Self::progress_snapshot(active, false))
+                    } else {
+                        None
+                    };
                     (
                         active.id,
                         end_file.playlist_entry_id.or(active.entry_id),
-                        ignore_replaced,
-                        pending_failed,
+                        partial,
                     )
                 };
-                if ignore_replaced {
-                    return;
+                if let Some(partial) = partial {
+                    self.emit(PlaybackEvent::ProgressSnapshot(partial)).await;
                 }
                 self.emit(PlaybackEvent::EndFile {
                     session_id: id,
@@ -1243,17 +1049,18 @@ impl PlaybackActor {
                     playlist_entry_id: entry_id,
                 })
                 .await;
-                if let Some(message) = pending_failed {
-                    self.emit(PlaybackEvent::Error {
-                        session_id: Some(id),
-                        message,
-                    })
-                    .await;
-                    self.stop_active(false).await;
-                } else if end_file.reason.is_natural_eof() {
-                    self.natural_eof().await;
-                } else {
-                    self.stop_active(true).await;
+                match end_file.reason {
+                    EndFileReason::Stop => {
+                        // Native playlist-prev/next unloads the old entry with
+                        // reason=stop. The following start/file-loaded events
+                        // commit the new logical episode.
+                    }
+                    EndFileReason::Eof => self.natural_eof().await,
+                    EndFileReason::Quit => self.stop_active(false).await,
+                    EndFileReason::Error
+                    | EndFileReason::Abort
+                    | EndFileReason::Redirect
+                    | EndFileReason::Unknown(_) => self.stop_active(true).await,
                 }
             }
             MpvMonitorEvent::MonitorFailed(message) => {
@@ -1277,70 +1084,14 @@ impl PlaybackActor {
         }
     }
 
-    async fn navigate(&mut self, navigation: MpvNavigation) {
-        let (session_id, target_index, target, cached, snapshot) = {
-            let Some(active) = self.active.as_mut() else {
-                return;
-            };
-            if active.transitioning {
-                return;
-            }
-            let Some(target_index) = active.timeline.adjacent_index(navigation) else {
-                let message = match navigation {
-                    MpvNavigation::Previous => "Це перша доступна серія",
-                    MpvNavigation::Next => "Це остання доступна серія",
-                };
-                let _ = active.mpv.show_text(message, 1500).await;
-                return;
-            };
-            let target = active.timeline.entries[target_index].clone();
-            let cached = active
-                .resolved_streams
-                .get(&PlaybackIdentity::from(&target))
-                .cloned();
-            let snapshot = (active.has_position && !active.at_eof)
-                .then(|| Self::progress_snapshot(active, false));
-            if active.has_position && !active.at_eof {
-                let resume = (active.position > 0.0).then_some(active.position);
-                active.timeline.entries[active.timeline.current_index].start_time = resume;
-                active.current.start_time = resume;
-            }
-            active.transitioning = true;
-            (active.id, target_index, target, cached, snapshot)
-        };
-        if let Some(snapshot) = snapshot {
-            self.emit(PlaybackEvent::ProgressSnapshot(snapshot)).await;
-        }
-
-        if let Some(url) = cached {
-            self.commit_navigation(session_id, target_index, target, ResolvedStream { url })
-                .await;
-        } else {
-            if let Some(active) = self.active.as_ref() {
-                let _ = active
-                    .mpv
-                    .show_text(&format!("Завантаження серії {}…", target.episode), 2000)
-                    .await;
-            }
-            self.begin_resolution(ResolutionPurpose::Navigate {
-                target,
-                target_index,
-                session_id,
-            })
-            .await;
-        }
-    }
-
     async fn natural_eof(&mut self) {
-        let (id, snapshot, mark, next_index, navigation_already_in_progress) = {
+        let (snapshot, mark, should_advance) = {
             let Some(active) = self.active.as_mut() else {
                 return;
             };
             if active.at_eof {
                 return;
             }
-            let navigation_already_in_progress = active.transitioning;
-            active.transitioning = true;
             active.at_eof = true;
             // Going back to a fully completed episode should replay it from
             // the beginning, not from the timestamp used to enter this
@@ -1361,55 +1112,30 @@ impl PlaybackActor {
                 position,
                 duration,
             };
-            let next_index = if navigation_already_in_progress {
-                None
-            } else {
-                active
-                    .autoplay_next
-                    .then(|| active.timeline.adjacent_index(MpvNavigation::Next))
-                    .flatten()
-            };
-            (
-                id,
-                snapshot,
-                mark,
-                next_index,
-                navigation_already_in_progress,
-            )
+            let should_advance = active.autoplay_next && active.timeline.has_next();
+            (snapshot, mark, should_advance)
         };
         if let Some(snapshot) = snapshot {
             self.emit(PlaybackEvent::ProgressSnapshot(snapshot)).await;
         }
         self.emit(PlaybackEvent::MarkWatched(mark)).await;
-        if navigation_already_in_progress {
-            // A manually selected neighbour is still resolving. Its result
-            // will either load from idle or close this completed session on
-            // failure; do not start a second autoplay resolution.
-            return;
-        }
-        if let Some(target_index) = next_index {
-            let (target, cached) = {
-                let active = self.active.as_ref().expect("active playback at EOF");
-                let target = active.timeline.entries[target_index].clone();
-                let cached = active
-                    .resolved_streams
-                    .get(&PlaybackIdentity::from(&target))
-                    .cloned();
-                (target, cached)
-            };
-            if let Some(url) = cached {
-                self.commit_navigation(id, target_index, target, ResolvedStream { url })
-                    .await;
+        if should_advance {
+            let result = if let Some(active) = self.active.as_ref() {
+                match active.mpv.playlist_next().await {
+                    Ok(()) => active.mpv.set_paused(false).await,
+                    Err(error) => Err(error),
+                }
             } else {
-                self.begin_resolution(ResolutionPurpose::Navigate {
-                    target,
-                    target_index,
+                Ok(())
+            };
+            if let Err(error) = result {
+                let id = self.active.as_ref().map(|active| active.id);
+                self.emit(PlaybackEvent::Error {
                     session_id: id,
+                    message: error.to_string(),
                 })
                 .await;
             }
-        } else {
-            self.stop_active(false).await;
         }
     }
 
@@ -1451,7 +1177,7 @@ impl PlaybackActor {
             return;
         };
         let snapshot = active.mpv.shutdown().await;
-        if emit_partial && !active.transitioning {
+        if emit_partial {
             self.emit_partial(&active, snapshot.time_pos, snapshot.duration)
                 .await;
         }
@@ -1462,19 +1188,72 @@ impl PlaybackActor {
     }
 }
 
-async fn resolve_stream(
-    target: &PlayTarget,
+const PLAYLIST_RESOLUTION_CONCURRENCY: usize = 4;
+
+async fn resolve_playlist(
+    timeline: &PlaybackTimeline,
     cancellation: &TaskCancellation,
-) -> Result<ResolvedStream> {
+) -> Result<ResolvedPlaylist> {
     if cancellation.is_cancelled() {
-        return Err(anyhow!("stream resolution cancelled"));
+        return Err(anyhow!("playlist resolution cancelled"));
     }
-    let parser = api::AshdiParser::new()?;
-    let url = tokio::select! {
-        _ = cancellation.cancelled() => return Err(anyhow!("stream resolution cancelled")),
-        result = parser.extract_m3u8(&target.stream_page_url) => result?,
-    };
-    Ok(ResolvedStream { url })
+    let parser = Arc::new(api::AshdiParser::new()?);
+    let concurrency = Arc::new(Semaphore::new(PLAYLIST_RESOLUTION_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+    for (index, target) in timeline.entries.iter().cloned().enumerate() {
+        let parser = parser.clone();
+        let concurrency = concurrency.clone();
+        let cancellation = cancellation.clone();
+        tasks.spawn(async move {
+            let permit = tokio::select! {
+                _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
+                permit = concurrency.acquire_owned() => permit
+                    .map_err(|_| anyhow!("playlist resolver was closed"))?,
+            };
+            let url = tokio::select! {
+                _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
+                result = parser.extract_m3u8(&target.stream_page_url) => result
+                    .map_err(|error| anyhow!(
+                        "не вдалося отримати S{}E{}: {error}",
+                        target.season,
+                        target.episode
+                    ))?,
+            };
+            drop(permit);
+            Ok((
+                index,
+                MpvPlaylistEntry {
+                    media_url: url,
+                    title: format!("{} - {}", target.player_title, target.episode_title),
+                    start_time: target.start_time,
+                    referrer: target.referrer,
+                },
+            ))
+        });
+    }
+
+    let mut entries = vec![None; timeline.entries.len()];
+    while !tasks.is_empty() {
+        let outcome = tokio::select! {
+            _ = cancellation.cancelled() => {
+                tasks.abort_all();
+                return Err(anyhow!("playlist resolution cancelled"));
+            }
+            outcome = tasks.join_next() => outcome,
+        };
+        let Some(outcome) = outcome else {
+            break;
+        };
+        let (index, entry) =
+            outcome.map_err(|error| anyhow!("playlist resolver task failed: {error}"))??;
+        entries[index] = Some(entry);
+    }
+
+    let entries = entries
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow!("playlist resolution finished without every episode"))?;
+    Ok(ResolvedPlaylist { entries })
 }
 
 #[cfg(test)]
@@ -1530,72 +1309,6 @@ mod supervisor_tests {
         let identity = PlaybackIdentity::from(&target(4, Some(123.0)));
         assert_eq!(identity.episode, 4);
         assert_eq!(identity.studio_name, "dub");
-    }
-
-    #[test]
-    fn pending_load_correlates_old_and_new_end_file_events() {
-        let pending = PendingNavigation {
-            target: target(2, None),
-            target_index: 1,
-            resolved_url: "https://media.test/2.m3u8".to_string(),
-            old_entry_id: Some(10),
-            new_entry_id: Some(11),
-            replacing_active_file: true,
-            old_end_seen: false,
-        };
-        assert!(end_file_belongs_to_replaced_entry(
-            &pending,
-            &EndFileEvent {
-                reason: EndFileReason::Eof,
-                playlist_entry_id: Some(10),
-            }
-        ));
-        assert!(end_file_belongs_to_replaced_entry(
-            &pending,
-            &EndFileEvent {
-                reason: EndFileReason::Stop,
-                playlist_entry_id: None,
-            }
-        ));
-        assert!(!end_file_belongs_to_replaced_entry(
-            &pending,
-            &EndFileEvent {
-                reason: EndFileReason::Error,
-                playlist_entry_id: Some(11),
-            }
-        ));
-
-        let old_id_was_not_observed = PendingNavigation {
-            old_entry_id: None,
-            ..PendingNavigation {
-                target: target(2, None),
-                target_index: 1,
-                resolved_url: "https://media.test/2.m3u8".to_string(),
-                old_entry_id: Some(10),
-                new_entry_id: Some(11),
-                replacing_active_file: true,
-                old_end_seen: false,
-            }
-        };
-        assert!(end_file_belongs_to_replaced_entry(
-            &old_id_was_not_observed,
-            &EndFileEvent {
-                reason: EndFileReason::Eof,
-                playlist_entry_id: Some(10),
-            }
-        ));
-
-        let from_idle = PendingNavigation {
-            replacing_active_file: false,
-            ..pending
-        };
-        assert!(!end_file_belongs_to_replaced_entry(
-            &from_idle,
-            &EndFileEvent {
-                reason: EndFileReason::Stop,
-                playlist_entry_id: Some(10),
-            }
-        ));
     }
 
     #[test]
@@ -1693,15 +1406,15 @@ mod supervisor_tests {
         assert_eq!(timeline.current_index, 5);
         assert_eq!(timeline.current().episode, 6);
         assert_eq!(timeline.current().start_time, Some(123.0));
-        assert_eq!(timeline.adjacent_index(MpvNavigation::Previous), Some(4));
-        assert_eq!(timeline.adjacent_index(MpvNavigation::Next), Some(6));
+        assert!(timeline.current_index > 0);
+        assert!(timeline.has_next());
 
         timeline.select(0).unwrap();
         assert_eq!(timeline.current().episode, 1);
-        assert_eq!(timeline.adjacent_index(MpvNavigation::Previous), None);
+        assert_eq!(timeline.current_index, 0);
         timeline.select(11).unwrap();
         assert_eq!(timeline.current().episode, 12);
-        assert_eq!(timeline.adjacent_index(MpvNavigation::Next), None);
+        assert!(!timeline.has_next());
     }
 
     #[test]
