@@ -32,12 +32,19 @@ pub enum SearchMode {
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreset {
     #[default]
-    Violet,
-    Ocean,
-    Amber,
-    Sakura,
-    Matrix,
-    Monochrome,
+    #[serde(alias = "violet")]
+    CatppuccinMocha,
+    #[serde(alias = "ocean")]
+    TokyoNight,
+    #[serde(alias = "amber")]
+    KanagawaWave,
+    #[serde(alias = "sakura")]
+    RosePine,
+    #[serde(alias = "monochrome")]
+    GruvboxDark,
+    #[serde(alias = "matrix")]
+    EverforestDark,
+    AyuDark,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -58,24 +65,53 @@ impl ColorMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceMode {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl SurfaceMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Авто",
+            Self::Dark => "Темна",
+            Self::Light => "Світла",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::Auto,
+        }
+    }
+}
+
 impl ThemePreset {
-    pub const ALL: [Self; 6] = [
-        Self::Violet,
-        Self::Ocean,
-        Self::Amber,
-        Self::Sakura,
-        Self::Matrix,
-        Self::Monochrome,
+    pub const ALL: [Self; 7] = [
+        Self::CatppuccinMocha,
+        Self::TokyoNight,
+        Self::KanagawaWave,
+        Self::RosePine,
+        Self::GruvboxDark,
+        Self::EverforestDark,
+        Self::AyuDark,
     ];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Violet => "Неон",
-            Self::Ocean => "Океан",
-            Self::Amber => "Бурштин",
-            Self::Sakura => "Сакура",
-            Self::Matrix => "Матриця",
-            Self::Monochrome => "Моно",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
+            Self::TokyoNight => "Tokyo Night",
+            Self::KanagawaWave => "Kanagawa Wave",
+            Self::RosePine => "Rosé Pine",
+            Self::GruvboxDark => "Gruvbox Dark",
+            Self::EverforestDark => "Everforest Dark",
+            Self::AyuDark => "Ayu Dark",
         }
     }
 }
@@ -174,6 +210,7 @@ pub struct Settings {
     pub ansi_themes: bool,
     pub ansi_256_colors: bool,
     pub theme: ThemePreset,
+    pub surface_mode: SurfaceMode,
     pub transparent_background: bool,
     pub discord_presence: bool,
     /// Read only for migrating settings written before AniHub shipped a shared
@@ -197,7 +234,8 @@ impl Default for Settings {
             show_posters: true,
             ansi_themes: false,
             ansi_256_colors: false,
-            theme: ThemePreset::Violet,
+            theme: ThemePreset::CatppuccinMocha,
+            surface_mode: SurfaceMode::Auto,
             transparent_background: true,
             discord_presence: false,
             legacy_discord_application_id: String::new(),
@@ -393,7 +431,8 @@ mod tests {
         assert!(!settings.ansi_themes);
         assert!(!settings.ansi_256_colors);
         assert_eq!(settings.color_mode(), ColorMode::AniHubRgb);
-        assert_eq!(settings.theme, ThemePreset::Violet);
+        assert_eq!(settings.theme, ThemePreset::CatppuccinMocha);
+        assert_eq!(settings.surface_mode, SurfaceMode::Auto);
         assert!(settings.transparent_background);
         assert!(!settings.discord_presence);
         assert!(settings.legacy_discord_application_id.is_empty());
@@ -418,6 +457,13 @@ mod tests {
     }
 
     #[test]
+    fn surface_mode_cycles_auto_dark_and_light() {
+        assert_eq!(SurfaceMode::Auto.next(), SurfaceMode::Dark);
+        assert_eq!(SurfaceMode::Dark.next(), SurfaceMode::Light);
+        assert_eq!(SurfaceMode::Light.next(), SurfaceMode::Auto);
+    }
+
+    #[test]
     fn settings_without_search_mode_keep_strict_default() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         value.as_object_mut().unwrap().remove("search_mode");
@@ -432,6 +478,7 @@ mod tests {
         object.remove("theme");
         object.remove("ansi_themes");
         object.remove("ansi_256_colors");
+        object.remove("surface_mode");
         object.remove("transparent_background");
         object.remove("discord_presence");
         object.remove("discord_application_id");
@@ -439,10 +486,27 @@ mod tests {
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert!(!settings.ansi_themes);
         assert!(!settings.ansi_256_colors);
-        assert_eq!(settings.theme, ThemePreset::Violet);
+        assert_eq!(settings.theme, ThemePreset::CatppuccinMocha);
+        assert_eq!(settings.surface_mode, SurfaceMode::Auto);
         assert!(settings.transparent_background);
         assert!(!settings.discord_presence);
         assert!(settings.legacy_discord_application_id.is_empty());
+    }
+
+    #[test]
+    fn old_theme_names_map_to_the_replacement_palettes() {
+        let cases = [
+            ("violet", ThemePreset::CatppuccinMocha),
+            ("ocean", ThemePreset::TokyoNight),
+            ("amber", ThemePreset::KanagawaWave),
+            ("sakura", ThemePreset::RosePine),
+            ("monochrome", ThemePreset::GruvboxDark),
+            ("matrix", ThemePreset::EverforestDark),
+        ];
+        for (stored, expected) in cases {
+            let parsed: ThemePreset = serde_json::from_str(&format!("\"{stored}\"")).unwrap();
+            assert_eq!(parsed, expected);
+        }
     }
 
     #[test]
