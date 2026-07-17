@@ -6,9 +6,10 @@ use crate::player::{
 use crate::storage;
 use crate::ui::AppState;
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, sleep, timeout};
 
@@ -29,13 +30,57 @@ pub struct PlayTarget {
 
 /// A complete, ordered playback timeline with one selected entry.
 ///
-/// Unlike the old forward-only queue, entries before `current_index` remain
-/// available for manual navigation from inside mpv. Every stream is resolved
-/// before launch so mpv receives a real native playlist.
+/// The full timeline is logical (progress, autoplay, franchise order). Only a
+/// sliding window of streams is resolved and handed to mpv so huge seasons
+/// (200–500 episodes) do not explode argv / IPC playlist snapshots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackTimeline {
     entries: Vec<PlayTarget>,
     current_index: usize,
+}
+
+/// Episodes kept behind / ahead of the current title in the native mpv playlist.
+const PLAYLIST_WINDOW_BEHIND: usize = 5;
+const PLAYLIST_WINDOW_AHEAD: usize = 5;
+/// Re-center the window once the playhead sits this close to either edge.
+const PLAYLIST_REWINDOW_EDGE: usize = 1;
+
+/// Inclusive-exclusive timeline range loaded into mpv around `current`.
+fn playlist_window(current: usize, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let current = current.min(len - 1);
+    let start = current.saturating_sub(PLAYLIST_WINDOW_BEHIND);
+    let end = (current + PLAYLIST_WINDOW_AHEAD + 1).min(len);
+    (start, end)
+}
+
+fn should_rewindow(
+    window_start: usize,
+    window_len: usize,
+    current: usize,
+    timeline_len: usize,
+) -> bool {
+    if window_len == 0 || timeline_len <= window_len {
+        return false;
+    }
+    let local = current.saturating_sub(window_start);
+    let near_start = local <= PLAYLIST_REWINDOW_EDGE && window_start > 0;
+    let near_end = local + 1 + PLAYLIST_REWINDOW_EDGE >= window_len
+        && window_start + window_len < timeline_len;
+    near_start || near_end
+}
+
+fn timeline_in_window(window_start: usize, window_len: usize, timeline_index: usize) -> bool {
+    timeline_index >= window_start && timeline_index < window_start + window_len
+}
+
+fn play_target_cache_key(target: &PlayTarget) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        target.anime_id, target.season, target.episode, target.studio_name
+    )
 }
 
 impl PlaybackTimeline {
@@ -574,7 +619,9 @@ impl Drop for PlaybackSupervisor {
 }
 
 struct ResolvedPlaylist {
+    /// Streams for `timeline[window_start..window_start + entries.len()]`.
     entries: Vec<MpvPlaylistEntry>,
+    window_start: usize,
 }
 
 struct ActivePlayback {
@@ -582,11 +629,16 @@ struct ActivePlayback {
     mpv: MpvSession,
     current: PlayTarget,
     timeline: PlaybackTimeline,
+    /// First timeline index currently loaded into the native mpv playlist.
+    window_start: usize,
+    /// Number of entries currently in the mpv playlist window.
+    window_len: usize,
     autoplay_next: bool,
     position: f64,
     duration: f64,
     has_position: bool,
     entry_id: Option<i64>,
+    /// Pending **timeline** index after native playlist navigation.
     pending_index: Option<usize>,
     at_eof: bool,
 }
@@ -624,6 +676,8 @@ struct PlaybackActor {
     events: mpsc::Sender<PlaybackEvent>,
     active: Option<ActivePlayback>,
     pending: Option<PendingResolution>,
+    /// Cached Ashdi m3u8 URLs so window shifts do not re-scrape every page.
+    url_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl PlaybackActor {
@@ -633,6 +687,7 @@ impl PlaybackActor {
             events,
             active: None,
             pending: None,
+            url_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -705,8 +760,9 @@ impl PlaybackActor {
         };
         let cancellation = TaskCancellation::new();
         let task_cancellation = cancellation.clone();
+        let url_cache = self.url_cache.clone();
         let task = tokio::spawn(async move {
-            resolve_playlist(&timeline, &task_cancellation)
+            resolve_playlist(&timeline, &task_cancellation, url_cache)
                 .await
                 .map_err(|error| error.to_string())
         });
@@ -715,6 +771,33 @@ impl PlaybackActor {
             purpose: Some(purpose),
             task: Some(task),
         });
+    }
+
+    /// Rebuild the native mpv window around the current timeline index.
+    async fn rewindow_active_if_needed(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if !should_rewindow(
+            active.window_start,
+            active.window_len,
+            active.timeline.current_index,
+            active.timeline.entries.len(),
+        ) {
+            return;
+        }
+        let timeline = active.timeline.clone();
+        let autoplay_next = active.autoplay_next;
+        let session_id = active.id;
+        self.begin_resolution(ResolutionPurpose::Replace {
+            timeline,
+            autoplay_next,
+            session_id,
+        })
+        .await;
     }
 
     async fn cancel_pending(&mut self) {
@@ -826,25 +909,31 @@ impl PlaybackActor {
         resolved: ResolvedPlaylist,
     ) {
         let target = timeline.current().clone();
-        let mpv =
-            match MpvSession::spawn(session_id.raw(), &resolved.entries, timeline.current_index)
-                .await
-            {
-                Ok(mpv) => mpv,
-                Err(error) => {
-                    self.emit(PlaybackEvent::Error {
-                        session_id: Some(session_id),
-                        message: error.to_string(),
-                    })
-                    .await;
-                    return;
-                }
-            };
+        let playlist_start = timeline
+            .current_index
+            .saturating_sub(resolved.window_start)
+            .min(resolved.entries.len().saturating_sub(1));
+        let window_len = resolved.entries.len();
+        let window_start = resolved.window_start;
+        let mpv = match MpvSession::spawn(session_id.raw(), &resolved.entries, playlist_start).await
+        {
+            Ok(mpv) => mpv,
+            Err(error) => {
+                self.emit(PlaybackEvent::Error {
+                    session_id: Some(session_id),
+                    message: error.to_string(),
+                })
+                .await;
+                return;
+            }
+        };
         self.active = Some(ActivePlayback {
             id: session_id,
             mpv,
             current: target.clone(),
             timeline,
+            window_start,
+            window_len,
             autoplay_next,
             position: 0.0,
             duration: 0.0,
@@ -873,8 +962,14 @@ impl PlaybackActor {
         let old_snapshot = old.mpv.shutdown().await;
         self.emit_partial(&old, old_snapshot.time_pos, old_snapshot.duration)
             .await;
+        let playlist_start = timeline
+            .current_index
+            .saturating_sub(resolved.window_start)
+            .min(resolved.entries.len().saturating_sub(1));
+        let window_len = resolved.entries.len();
+        let window_start = resolved.window_start;
         let launch_result =
-            MpvSession::spawn(session_id.raw(), &resolved.entries, timeline.current_index).await;
+            MpvSession::spawn(session_id.raw(), &resolved.entries, playlist_start).await;
         match launch_result {
             Ok(mpv) => {
                 self.active = Some(ActivePlayback {
@@ -882,6 +977,8 @@ impl PlaybackActor {
                     mpv,
                     current: target.clone(),
                     timeline,
+                    window_start,
+                    window_len,
                     autoplay_next,
                     position: 0.0,
                     duration: 0.0,
@@ -961,39 +1058,42 @@ impl PlaybackActor {
             MpvMonitorEvent::PlaylistPosition { position, entry_id } => {
                 if let Some(active) = self.active.as_mut() {
                     active.entry_id = entry_id.or(active.entry_id);
-                    if let Some(position) =
-                        position.filter(|index| *index < active.timeline.entries.len())
-                        && position != active.timeline.current_index
-                    {
-                        active.pending_index = Some(position);
+                    if let Some(local) = position.filter(|index| *index < active.window_len) {
+                        let timeline_index = active.window_start + local;
+                        if timeline_index != active.timeline.current_index {
+                            active.pending_index = Some(timeline_index);
+                        }
                     }
                 }
             }
             MpvMonitorEvent::FileStarted { playlist_entry_id } => {
                 if let Some(active) = self.active.as_mut() {
-                    let index =
+                    let local =
                         playlist_entry_id.and_then(|entry_id| active.mpv.playlist_index(entry_id));
-                    if let Some(index) =
-                        index.filter(|index| *index != active.timeline.current_index)
-                    {
-                        active.pending_index = Some(index);
+                    if let Some(local) = local {
+                        let timeline_index = active.window_start + local;
+                        if timeline_index != active.timeline.current_index {
+                            active.pending_index = Some(timeline_index);
+                        }
                     }
                     active.entry_id = playlist_entry_id.or(active.entry_id);
                 }
             }
             MpvMonitorEvent::FileLoaded { playlist_entry_id } => {
                 let (started, resume_from_eof) = if let Some(active) = self.active.as_mut() {
-                    let index = playlist_entry_id
-                        .and_then(|entry_id| active.mpv.playlist_index(entry_id))
+                    let local =
+                        playlist_entry_id.and_then(|entry_id| active.mpv.playlist_index(entry_id));
+                    let timeline_index = local
+                        .map(|index| active.window_start + index)
                         .or(active.pending_index)
                         .unwrap_or(active.timeline.current_index);
                     active.pending_index = None;
                     active.entry_id = playlist_entry_id.or(active.entry_id);
                     let resume_from_eof = active.at_eof;
-                    if index != active.timeline.current_index {
+                    if timeline_index != active.timeline.current_index {
                         let selected = active
                             .timeline
-                            .select(index)
+                            .select(timeline_index)
                             .unwrap_or_else(|| active.current.clone());
                         active.current = selected.clone();
                         active.position = 0.0;
@@ -1015,6 +1115,9 @@ impl PlaybackActor {
                     self.emit(PlaybackEvent::SessionStarted { session_id, target })
                         .await;
                 }
+                // After settling on a new episode near the window edge, shift
+                // the ±5 window so prev/next keep working for long seasons.
+                self.rewindow_active_if_needed().await;
             }
             MpvMonitorEvent::EofReached(true) => self.natural_eof().await,
             MpvMonitorEvent::EofReached(false) => {}
@@ -1085,7 +1188,7 @@ impl PlaybackActor {
     }
 
     async fn natural_eof(&mut self) {
-        let (snapshot, mark, should_advance) = {
+        let (snapshot, mark, should_advance, next_in_window) = {
             let Some(active) = self.active.as_mut() else {
                 return;
             };
@@ -1112,14 +1215,24 @@ impl PlaybackActor {
                 position,
                 duration,
             };
-            let should_advance = active.autoplay_next && active.timeline.has_next();
-            (snapshot, mark, should_advance)
+            let next_index = active
+                .timeline
+                .has_next()
+                .then_some(active.timeline.current_index + 1);
+            let next_in_window = next_index.is_some_and(|index| {
+                timeline_in_window(active.window_start, active.window_len, index)
+            });
+            let should_advance = active.autoplay_next && next_index.is_some();
+            (snapshot, mark, should_advance, next_in_window)
         };
         if let Some(snapshot) = snapshot {
             self.emit(PlaybackEvent::ProgressSnapshot(snapshot)).await;
         }
         self.emit(PlaybackEvent::MarkWatched(mark)).await;
-        if should_advance {
+        if !should_advance {
+            return;
+        }
+        if next_in_window {
             let result = if let Some(active) = self.active.as_ref() {
                 match active.mpv.playlist_next().await {
                     Ok(()) => active.mpv.set_paused(false).await,
@@ -1133,6 +1246,22 @@ impl PlaybackActor {
                 self.emit(PlaybackEvent::Error {
                     session_id: id,
                     message: error.to_string(),
+                })
+                .await;
+            }
+            return;
+        }
+        // Next episode is outside the loaded ±5 window — rebuild around it.
+        if let Some(active) = self.active.as_mut() {
+            let next = active.timeline.current_index + 1;
+            if active.timeline.select(next).is_some() {
+                let timeline = active.timeline.clone();
+                let autoplay_next = active.autoplay_next;
+                let session_id = active.id;
+                self.begin_resolution(ResolutionPurpose::Replace {
+                    timeline,
+                    autoplay_next,
+                    session_id,
                 })
                 .await;
             }
@@ -1193,18 +1322,44 @@ const PLAYLIST_RESOLUTION_CONCURRENCY: usize = 4;
 async fn resolve_playlist(
     timeline: &PlaybackTimeline,
     cancellation: &TaskCancellation,
+    url_cache: Arc<Mutex<HashMap<String, String>>>,
 ) -> Result<ResolvedPlaylist> {
     if cancellation.is_cancelled() {
         return Err(anyhow!("playlist resolution cancelled"));
     }
+    if timeline.entries.is_empty() {
+        return Err(anyhow!("playback timeline is empty"));
+    }
+
+    let (window_start, window_end) =
+        playlist_window(timeline.current_index, timeline.entries.len());
+    let window_targets = timeline.entries[window_start..window_end].to_vec();
+    if window_targets.is_empty() {
+        return Err(anyhow!("playback window is empty"));
+    }
+
     let parser = Arc::new(api::AshdiParser::new()?);
     let concurrency = Arc::new(Semaphore::new(PLAYLIST_RESOLUTION_CONCURRENCY));
     let mut tasks = JoinSet::new();
-    for (index, target) in timeline.entries.iter().cloned().enumerate() {
+    for (offset, target) in window_targets.into_iter().enumerate() {
         let parser = parser.clone();
         let concurrency = concurrency.clone();
         let cancellation = cancellation.clone();
+        let url_cache = url_cache.clone();
         tasks.spawn(async move {
+            let cache_key = play_target_cache_key(&target);
+            if let Some(url) = url_cache.lock().await.get(&cache_key).cloned() {
+                return Ok((
+                    offset,
+                    MpvPlaylistEntry {
+                        media_url: url,
+                        title: format!("{} - {}", target.player_title, target.episode_title),
+                        start_time: target.start_time,
+                        referrer: target.referrer,
+                    },
+                ));
+            }
+
             let permit = tokio::select! {
                 _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
                 permit = concurrency.acquire_owned() => permit
@@ -1220,8 +1375,9 @@ async fn resolve_playlist(
                     ))?,
             };
             drop(permit);
+            url_cache.lock().await.insert(cache_key, url.clone());
             Ok((
-                index,
+                offset,
                 MpvPlaylistEntry {
                     media_url: url,
                     title: format!("{} - {}", target.player_title, target.episode_title),
@@ -1232,7 +1388,7 @@ async fn resolve_playlist(
         });
     }
 
-    let mut entries = vec![None; timeline.entries.len()];
+    let mut entries = vec![None; window_end - window_start];
     while !tasks.is_empty() {
         let outcome = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -1244,16 +1400,19 @@ async fn resolve_playlist(
         let Some(outcome) = outcome else {
             break;
         };
-        let (index, entry) =
+        let (offset, entry) =
             outcome.map_err(|error| anyhow!("playlist resolver task failed: {error}"))??;
-        entries[index] = Some(entry);
+        entries[offset] = Some(entry);
     }
 
     let entries = entries
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| anyhow!("playlist resolution finished without every episode"))?;
-    Ok(ResolvedPlaylist { entries })
+    Ok(ResolvedPlaylist {
+        entries,
+        window_start,
+    })
 }
 
 #[cfg(test)]
@@ -1295,6 +1454,26 @@ mod supervisor_tests {
             studio_name: "dub".to_string(),
             referrer: "https://ashdi.vip/".to_string(),
         }
+    }
+
+    #[test]
+    fn playlist_window_keeps_five_behind_and_ahead() {
+        assert_eq!(playlist_window(0, 270), (0, 6));
+        assert_eq!(playlist_window(12, 270), (7, 18));
+        assert_eq!(playlist_window(231, 270), (226, 237));
+        assert_eq!(playlist_window(269, 270), (264, 270));
+    }
+
+    #[test]
+    fn rewindow_triggers_near_loaded_edges_only() {
+        // Window [226, 237) while sitting on 231 — middle, no rewindow.
+        assert!(!should_rewindow(226, 11, 231, 270));
+        // Near end of window with more timeline ahead.
+        assert!(should_rewindow(226, 11, 235, 270));
+        // Near start with more timeline behind.
+        assert!(should_rewindow(226, 11, 227, 270));
+        // Whole season fits — never rewindow.
+        assert!(!should_rewindow(0, 10, 5, 10));
     }
 
     #[test]

@@ -20,7 +20,9 @@ use tokio::time::{sleep, timeout};
 const IPC_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_IPC_LINE_BYTES: usize = 64 * 1024;
+// Playlist inspect JSON for a ±5 window stays well under this; the old 64 KiB
+// cap broke multi-hundred episode seasons when the full list was loaded.
+const MAX_IPC_LINE_BYTES: usize = 256 * 1024;
 static NEXT_ENDPOINT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Cancellation shared by every task owned by a playback session.
