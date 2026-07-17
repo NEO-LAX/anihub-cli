@@ -1,45 +1,130 @@
+<div align="center">
+
 # AniHub CLI
 
-**English** · [Українська](README.uk.md)
+[![English](https://img.shields.io/badge/🇬🇧_English-0d1117?style=for-the-badge&labelColor=238636)](README.md)
+[![Українська](https://img.shields.io/badge/🇺🇦_Українська-161b22?style=for-the-badge&labelColor=30363d)](README.uk.md)
 
-Unofficial terminal client for [AniHub](https://anihub.in.ua) — search, library, and playback with Ukrainian dubs.
+<br/>
+
+**Unofficial terminal client** written in **Rust** 🦀  
+for browsing and watching anime from [**AniHub**](https://anihub.in.ua)
+
+Ukrainian dubs · local library · mpv playback · Discord presence
+
+<br/>
+
+[![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/Linux%20%7C%20macOS%20%7C%20Windows-111827?style=flat-square)](https://github.com/NEO-LAX/anihub-cli/releases/latest)
+[![Release](https://img.shields.io/github/v/release/NEO-LAX/anihub-cli?style=flat-square&color=a855f7)](https://github.com/NEO-LAX/anihub-cli/releases)
+
+</div>
+
+---
+
+<div align="center">
+
+### 🎬 From search to playback
+
+Search AniHub, pick a season and dub, hit play — streams open in **mpv** with a native playlist.
 
 ![Demo](assets/demo.gif)
 
-<p align="center">
-  <img src="assets/library.jpg" alt="Library" width="48%" />
-  <img src="assets/themes.jpg" alt="Themes" width="48%" />
-</p>
-<p align="center">
-  <img src="assets/mpv-terminal.jpg" alt="mpv + terminal" width="48%" />
-  <img src="assets/discord.jpg" alt="Discord Rich Presence" width="48%" />
-</p>
-<p align="center">
-  <img src="assets/continue.gif" alt="Continue watching" width="72%" />
-</p>
-<p align="center">
-  <img src="assets/installer.png" alt="Installer" width="420" />
-</p>
+</div>
 
 ---
 
-## Features
+<div align="center">
 
-- Search AniHub (strict or extended) with franchise grouping for seasons and films
-- Library with statuses, filters, resume, and continue-watching
-- Ashdi playback in **mpv** (native playlist, prev/next); MoonAnime opens in the browser
-- Posters in capable terminals · themes (AniHub RGB + ANSI 16/256 palettes)
-- Optional **Discord Rich Presence** with Spotify-style episode progress
-- Offline-friendly metadata and poster caches
-- Shortcuts work on **English and Ukrainian/Russian** keyboard layouts
+### 📚 Library
 
-> Changelog lives in [GitHub Releases](https://github.com/NEO-LAX/anihub-cli/releases) — not here.
+Statuses (Watching, Planned, Completed…), filters, resume, and continue-watching — all offline-friendly.
+
+<img src="assets/library.jpg" alt="Library" width="900" />
+
+</div>
 
 ---
 
-## Install
+<div align="center">
 
-**Linux / macOS** (interactive menu: Install · Update · Uninstall):
+### 🎨 Themes
+
+Original AniHub RGB palette by default. Optional ANSI 16 / ANSI 256 modes with curated palettes  
+(Catppuccin, Tokyo Night, Kanagawa, Rosé Pine, Gruvbox, Everforest, Ayu…).
+
+<img src="assets/themes.jpg" alt="Themes" width="900" />
+
+</div>
+
+---
+
+<div align="center">
+
+### 📺 Terminal + mpv
+
+Ashdi episodes run in **mpv** (prev / next via the native playlist).  
+Browser-only MoonAnime titles open in your browser after confirmation.
+
+<img src="assets/mpv-terminal.jpg" alt="mpv and terminal" width="900" />
+
+</div>
+
+---
+
+<div align="center">
+
+### ▶️ Continue watching
+
+One key (`c`) jumps back to your latest unfinished episode.
+
+![Continue](assets/continue.gif)
+
+</div>
+
+---
+
+<div align="center">
+
+### 💬 Discord Rich Presence
+
+Opt-in. Shows title, season, episode, studio, poster, and a Spotify-style progress bar while playing.  
+On pause the bar hides and the status shows **Пауза**. Desktop Discord only.
+
+<img src="assets/discord.jpg" alt="Discord Rich Presence" width="480" />
+
+</div>
+
+---
+
+## ✨ Features
+
+| | |
+| :--- | :--- |
+| 🔍 **Search** | Strict (≤20) or extended (≤100) · franchise grouping for seasons & films |
+| 📖 **Library** | Statuses, filters, resume timestamps, watched toggle |
+| ▶️ **Playback** | Ashdi → mpv · MoonAnime → browser · autoplay next |
+| 🖼 **Posters** | Kitty / iTerm2 / Sixel / halfblocks when the terminal supports it |
+| 🎨 **Themes** | AniHub RGB + ANSI 16/256 palettes · surface & transparency controls |
+| 💬 **Discord** | Rich Presence with progress bar (opt-in) |
+| 💾 **Caches** | Metadata SWR cache · ~150 MiB poster cache with prune |
+| ⌨️ **Keys** | Shortcuts work on **EN** and **UA/RU (ЙЦУКЕН)** layouts |
+
+> Full changelog → [GitHub Releases](https://github.com/NEO-LAX/anihub-cli/releases)
+
+---
+
+## 📦 Install
+
+### Interactive installer (Linux / macOS)
+
+Arrow-key menu: **Install · Update · Uninstall** (optional data purge).  
+Downloads a checksum-verified release binary and migrates local data safely.
+
+<div align="center">
+  <img src="assets/installer.png" alt="Interactive installer" width="480" />
+</div>
 
 ```bash
 curl --fail --location --retry 3 \
@@ -49,20 +134,20 @@ curl --fail --location --retry 3 \
 ```bash
 # non-interactive
 bash -s -- update
-bash -s -- uninstall          # keep user data
-bash -s -- uninstall --purge  # wipe user data
+bash -s -- uninstall          # keep history & settings
+bash -s -- uninstall --purge  # wipe all user data
 ```
 
-Default install path: `~/.local/bin` (override with `ANIHUB_INSTALL_DIR`).
+Default path: `~/.local/bin` · override with `ANIHUB_INSTALL_DIR`.
 
-**Nix:**
+### Nix
 
 ```bash
 nix run github:NEO-LAX/anihub-cli
-# or: nix profile install github:NEO-LAX/anihub-cli
+# nix profile install github:NEO-LAX/anihub-cli
 ```
 
-**Windows:** download the asset from [Releases](https://github.com/NEO-LAX/anihub-cli/releases/latest) and put it on `PATH`.
+### Release binaries
 
 | Platform | Asset |
 | --- | --- |
@@ -71,16 +156,18 @@ nix run github:NEO-LAX/anihub-cli
 | macOS Apple silicon | `anihub-cli-aarch64-apple-darwin` |
 | Windows x86_64 | `anihub-cli-x86_64-pc-windows-msvc.exe` |
 
+Windows: grab the asset from [Releases](https://github.com/NEO-LAX/anihub-cli/releases/latest) and put it on `PATH`.
+
 ---
 
-## Requirements
+## 🔧 Requirements
 
 - **`mpv`** on `PATH` (Ashdi playback)
-- A modern terminal (image protocols optional; text UI always works)
-- Discord **desktop** client only if you enable Rich Presence
+- A modern terminal (image protocols optional)
+- Discord **desktop** app if you enable Rich Presence
 
 ```bash
-# Debian/Ubuntu
+# Debian / Ubuntu
 sudo apt install mpv
 
 # macOS
@@ -89,43 +176,44 @@ brew install mpv
 
 ---
 
-## Controls
+## ⌨️ Controls
 
-Footer hints follow the current screen. `?` / `h` opens full help.
+Footer shows context-aware hints. Press `?` or `h` for full help.
 
 | Key | Action |
 | --- | --- |
 | `1` `2` `3` | Search · Library · Settings |
-| `/` | Search AniHub, or filter the local library |
+| `/` | Search AniHub / filter local library |
 | `↑` `↓` · `k` `j` | Move selection |
 | `Enter` · `→` | Open / play |
 | `Esc` · `←` | Back (`Esc` on search root clears results) |
 | `c` | Continue watching |
-| `e` | Library status |
+| `e` | Set library status |
 | `Space` | Toggle watched |
 | `o` | Open in browser |
 | `r` | Retry after a network error |
 | `q` | Quit |
 
-While typing a query, digits stay insertable; switch tabs with `Alt`/`Ctrl` + `1`–`3`.
+While typing a query, digits stay insertable — switch tabs with `Alt`/`Ctrl` + `1`–`3`.
 
 ---
 
-## Settings & data
+## 🗂 Settings & data
 
-Persisted under the platform data directory (`settings.json`, `history.json`, caches):
+Stored in the platform data directory:
 
-| | Path |
+| OS | Path |
 | --- | --- |
 | Linux | `~/.local/share/anihub-cli/` |
 | macOS | `~/Library/Application Support/com.shadowgarden.anihub-cli/` |
 | Windows | `%LOCALAPPDATA%\shadowgarden\anihub-cli\data\` |
 
-Notable options: autoplay, resume threshold, search mode, themes, mpv path/args, Discord presence, poster cache clear, update check (never auto-installs).
+Files: `settings.json`, `history.json`, metadata & poster caches.  
+Options include autoplay, resume threshold, search mode, themes, mpv path/args, Discord, poster cache clear, and in-app update check (never auto-installs).
 
 ---
 
-## Build
+## 🛠 Build from source
 
 Rust **1.85+**:
 
@@ -135,8 +223,6 @@ cd anihub-cli
 cargo build --locked --release
 ```
 
-Binary: `target/release/anihub-cli`
-
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -145,12 +231,11 @@ cargo test --locked --all-targets --all-features
 
 ---
 
-## Notes
+<div align="center">
 
-- Unofficial client; depends on live AniHub / stream sources.
-- Installer script: Linux & macOS only. Windows uses release binaries.
-- Uninstall keeps data unless you pass `--purge`.
+**Unofficial** · depends on live AniHub / stream sources  
+Uninstall keeps your data unless you pass `--purge`
 
-## License
+[MIT License](LICENSE) · [Releases](https://github.com/NEO-LAX/anihub-cli/releases) · [Issues](https://github.com/NEO-LAX/anihub-cli/issues)
 
-[MIT](LICENSE)
+</div>
