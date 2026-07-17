@@ -45,7 +45,7 @@ case "${1:-}" in
         fi
         ;;
     --version)
-        printf 'anihub-cli 0.7.1\n'
+        printf 'anihub-cli 0.7.2\n'
         ;;
 esac
 EOF
