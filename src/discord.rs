@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const APPLICATION_ID: u64 = 1_527_419_150_761_328_810;
 const IMAGE_PROXY: &str = "https://wsrv.nl/";
+const MAX_ACTIVITY_ASSET_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresenceActivity {
@@ -34,7 +35,15 @@ impl PresenceActivity {
         Self {
             title: truncate(title, 120),
             state: truncate(&format!("Сезон {season} · Серія {episode} · {studio}"), 120),
-            poster_url: poster_url.map(|url| square_poster_url(&url)),
+            poster_url: poster_url.and_then(|url| square_poster_url(&url)),
+        }
+    }
+
+    fn without_poster(&self) -> Self {
+        Self {
+            title: self.title.clone(),
+            state: self.state.clone(),
+            poster_url: None,
         }
     }
 }
@@ -102,6 +111,8 @@ fn run_worker(receiver: Receiver<Command>) {
     let mut desired: Option<PresenceActivity> = None;
     let mut queued: Option<PresenceActivity> = None;
     let mut queued_epoch = 0;
+    let mut seen_rejection_epoch = 0;
+    let mut fallback_without_poster = false;
     let started_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -125,12 +136,19 @@ fn run_worker(receiver: Receiver<Command>) {
                         configured_id = next_id;
                         queued = None;
                         queued_epoch = 0;
+                        seen_rejection_epoch = 0;
+                        fallback_without_poster = false;
                         if let Some(id) = next_id {
                             client = Some(start_client(id));
                         }
                     }
                 }
-                Command::Update(activity) => desired = Some(activity),
+                Command::Update(activity) => {
+                    if desired.as_ref() != Some(&activity) {
+                        fallback_without_poster = false;
+                    }
+                    desired = Some(activity);
+                }
                 Command::Shutdown => {
                     stop_client(&mut client);
                     break;
@@ -150,12 +168,19 @@ fn run_worker(receiver: Receiver<Command>) {
                         configured_id = next_id;
                         queued = None;
                         queued_epoch = 0;
+                        seen_rejection_epoch = 0;
+                        fallback_without_poster = false;
                         if let Some(id) = next_id {
                             client = Some(start_client(id));
                         }
                     }
                 }
-                Command::Update(activity) => desired = Some(activity),
+                Command::Update(activity) => {
+                    if desired.as_ref() != Some(&activity) {
+                        fallback_without_poster = false;
+                    }
+                    desired = Some(activity);
+                }
                 Command::Shutdown => {
                     stop_client(&mut client);
                     return;
@@ -163,17 +188,32 @@ fn run_worker(receiver: Receiver<Command>) {
             }
         }
 
-        if let (Some(client), Some(activity)) = (&mut client, &desired) {
+        if let Some(client) = &mut client {
+            let rejection_epoch = client.rejection_epoch.load(Ordering::Relaxed);
+            if rejection_epoch != seen_rejection_epoch {
+                seen_rejection_epoch = rejection_epoch;
+                queued = None;
+                fallback_without_poster = true;
+            }
+
+            let Some(activity) = &desired else {
+                continue;
+            };
+            let effective_activity = if fallback_without_poster {
+                activity.without_poster()
+            } else {
+                activity.clone()
+            };
             let connection_epoch = client.connection_epoch.load(Ordering::Relaxed);
             if should_queue(
                 queued.as_ref(),
-                activity,
+                &effective_activity,
                 client.connected.load(Ordering::Relaxed),
                 connection_epoch,
                 queued_epoch,
             ) {
-                queue_activity(&mut client.client, activity, started_at);
-                queued = Some(activity.clone());
+                queue_activity(&mut client.client, &effective_activity, started_at);
+                queued = Some(effective_activity);
                 queued_epoch = connection_epoch;
             }
         }
@@ -194,11 +234,13 @@ struct ManagedClient {
     client: Client,
     connected: Arc<AtomicBool>,
     connection_epoch: Arc<AtomicU64>,
+    rejection_epoch: Arc<AtomicU64>,
 }
 
 fn start_client(application_id: u64) -> ManagedClient {
     let connected = Arc::new(AtomicBool::new(false));
     let connection_epoch = Arc::new(AtomicU64::new(0));
+    let rejection_epoch = Arc::new(AtomicU64::new(0));
     let mut client = Client::with_error_config(application_id, Duration::from_secs(1), None);
 
     let connected_on_open = connected.clone();
@@ -213,12 +255,19 @@ fn start_client(application_id: u64) -> ManagedClient {
     client
         .on_disconnected(move |_| connected_on_close.store(false, Ordering::Relaxed))
         .persist();
+    let rejection_on_error = rejection_epoch.clone();
+    client
+        .on_error(move |_| {
+            rejection_on_error.fetch_add(1, Ordering::Relaxed);
+        })
+        .persist();
     client.start();
 
     ManagedClient {
         client,
         connected,
         connection_epoch,
+        rejection_epoch,
     }
 }
 
@@ -263,12 +312,12 @@ fn truncate(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn square_poster_url(source: &str) -> String {
+fn square_poster_url(source: &str) -> Option<String> {
     let Ok(source_url) = reqwest::Url::parse(source) else {
-        return source.to_string();
+        return None;
     };
     if !matches!(source_url.scheme(), "http" | "https") {
-        return source.to_string();
+        return None;
     }
 
     let mut proxy = reqwest::Url::parse(IMAGE_PROXY).expect("static image proxy URL is valid");
@@ -278,11 +327,18 @@ fn square_poster_url(source: &str) -> String {
         .append_pair("w", "1024")
         .append_pair("h", "1024")
         .append_pair("fit", "cover")
-        .append_pair("a", "attention")
-        .append_pair("output", "jpg")
-        .append_pair("q", "85")
-        .append_pair("default", "1");
-    proxy.into()
+        .append_pair("a", "attention");
+    let proxy = String::from(proxy);
+    if proxy.len() <= MAX_ACTIVITY_ASSET_BYTES {
+        Some(proxy)
+    } else if source.len() <= MAX_ACTIVITY_ASSET_BYTES {
+        // Preserve the activity even when a very long proxy URL would make
+        // Discord reject the complete payload. The uncropped source is still
+        // preferable to losing the watching status altogether.
+        Some(source.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -325,7 +381,7 @@ mod tests {
     #[test]
     fn discord_posters_are_square_attention_crops_with_encoded_sources() {
         let source = "https://s4.anilist.co/poster.jpg?large=1&lang=uk";
-        let transformed = square_poster_url(source);
+        let transformed = square_poster_url(source).unwrap();
         let url = reqwest::Url::parse(&transformed).unwrap();
         let query = url
             .query_pairs()
@@ -340,6 +396,40 @@ mod tests {
             query.get("a").map(|value| value.as_ref()),
             Some("attention")
         );
-        assert_eq!(square_poster_url("not a URL"), "not a URL");
+        assert!(transformed.len() <= MAX_ACTIVITY_ASSET_BYTES);
+        assert_eq!(square_poster_url("not a URL"), None);
+    }
+
+    #[test]
+    fn long_anihub_poster_keeps_the_rpc_asset_within_the_safe_limit() {
+        let source = "https://cdn.anihub.in.ua/file/media-bucket-anihub/media/anime/posters/4802/friren-shcho-provodzhaye-v-ostanniu-put-medium_640-cc07f01b539252830d588ee3f394200f.webp";
+        let transformed = square_poster_url(source).unwrap();
+        assert!(transformed.len() <= MAX_ACTIVITY_ASSET_BYTES);
+        assert!(transformed.contains("fit=cover"));
+
+        let proxy_too_long = format!("https://example.com/{}.jpg", "a".repeat(220));
+        assert_eq!(
+            square_poster_url(&proxy_too_long).as_deref(),
+            Some(proxy_too_long.as_str())
+        );
+
+        let source_too_long = format!("https://example.com/{}.jpg", "a".repeat(300));
+        assert_eq!(square_poster_url(&source_too_long), None);
+    }
+
+    #[test]
+    fn rejected_poster_can_fall_back_without_losing_watching_state() {
+        let activity = PresenceActivity::watching(
+            "Фрірен",
+            1,
+            1,
+            "Amanogawa",
+            Some("https://example.com/poster.jpg".to_string()),
+        );
+        let fallback = activity.without_poster();
+        assert_eq!(fallback.title, activity.title);
+        assert_eq!(fallback.state, activity.state);
+        assert_eq!(fallback.poster_url, None);
+        assert!(should_queue(Some(&activity), &fallback, true, 1, 1));
     }
 }
