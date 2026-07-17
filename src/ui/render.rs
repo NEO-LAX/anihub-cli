@@ -392,7 +392,7 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
     render_status_bar(f, app, main_chunks[2]);
 
     if let Some((message, StatusKind::Error)) = app.status_message.clone() {
-        render_error_popup(f, &message);
+        render_error_popup(f, &message, app.status_retry_available);
     } else if let Some((title, _)) = app.moonanime_browser_prompt.clone() {
         render_moonanime_popup(f, &title);
     } else if app.status_editor.is_some() {
@@ -1465,46 +1465,20 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         }
 
         if items.is_empty() {
-            let focused = app.focus == FocusPanel::SearchList;
-            let border_style = if focused {
-                Style::default().fg(color_highlight())
-            } else {
-                Style::default().fg(color_dim())
-            };
-            let title_style = if focused {
-                Style::default()
-                    .fg(color_secondary())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color_dim())
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" Результати пошуку ", title_style))
-                .title_alignment(Alignment::Center)
-                .border_style(border_style);
-            let inner = block.inner(list_chunks[0]);
-            f.render_widget(block, list_chunks[0]);
-
-            let message = if app.activity_message.is_some() {
-                "Шукаємо…"
+            let (message, loading) = if let Some(activity) = &app.activity_message {
+                (activity.as_str(), true)
             } else if app.last_search_query.is_empty() {
-                "Натисніть / щоб шукати"
+                ("Натисніть / щоб шукати", false)
             } else {
-                "Нічого не знайдено"
+                ("Нічого не знайдено", false)
             };
-            let centered = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Fill(1),
-                    Constraint::Length(1),
-                    Constraint::Fill(1),
-                ])
-                .split(inner);
-            f.render_widget(
-                Paragraph::new(Span::styled(message, Style::default().fg(color_dim())))
-                    .alignment(Alignment::Center),
-                centered[1],
+            render_list_message(
+                f,
+                list_chunks[0],
+                " Результати пошуку ",
+                app.focus == FocusPanel::SearchList,
+                message,
+                loading,
             );
         } else {
             let list = create_list(
@@ -1545,16 +1519,31 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         if let Some(catalog) = app.selected_franchise_catalog() {
             let (items, release_rows) =
                 release_catalog_items(catalog, list_chunks[idx].width.saturating_sub(6) as usize);
-            let mut visual_state = ratatui::widgets::ListState::default();
-            visual_state.select(
-                app.season_list_state
-                    .selected()
-                    .and_then(|release_index| release_rows.get(release_index).copied()),
-            );
-            let list = create_list(" Випуски ", items, app.focus == FocusPanel::ReleaseList);
-            f.render_stateful_widget(list, list_chunks[idx], &mut visual_state);
+            if items.is_empty() {
+                render_list_message(
+                    f,
+                    list_chunks[idx],
+                    " Випуски ",
+                    app.focus == FocusPanel::ReleaseList,
+                    if app.loading {
+                        "Завантаження випусків…"
+                    } else {
+                        "Випусків не знайдено"
+                    },
+                    app.loading,
+                );
+            } else {
+                let mut visual_state = ratatui::widgets::ListState::default();
+                visual_state.select(
+                    app.season_list_state
+                        .selected()
+                        .and_then(|release_index| release_rows.get(release_index).copied()),
+                );
+                let list = create_list(" Випуски ", items, app.focus == FocusPanel::ReleaseList);
+                f.render_stateful_widget(list, list_chunks[idx], &mut visual_state);
+            }
         } else {
-            let items = app
+            let items: Vec<ListItem> = app
                 .unique_seasons()
                 .iter()
                 .map(|&sn| {
@@ -1573,8 +1562,23 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     ))
                 })
                 .collect();
-            let list = create_list(" Випуски ", items, app.focus == FocusPanel::ReleaseList);
-            f.render_stateful_widget(list, list_chunks[idx], &mut app.season_list_state);
+            if items.is_empty() {
+                render_list_message(
+                    f,
+                    list_chunks[idx],
+                    " Випуски ",
+                    app.focus == FocusPanel::ReleaseList,
+                    if app.loading {
+                        "Завантаження випусків…"
+                    } else {
+                        "Випусків не знайдено"
+                    },
+                    app.loading,
+                );
+            } else {
+                let list = create_list(" Випуски ", items, app.focus == FocusPanel::ReleaseList);
+                f.render_stateful_widget(list, list_chunks[idx], &mut app.season_list_state);
+            }
         }
     }
 
@@ -1593,8 +1597,26 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         } else {
             vec![]
         };
-        let list = create_list(" Озвучки ", items, app.focus == FocusPanel::DubbingList);
-        f.render_stateful_widget(list, list_chunks[idx], &mut app.dubbing_list_state);
+        if items.is_empty() {
+            let (message, loading) = if app.loading {
+                ("Завантаження озвучок…", true)
+            } else if app.selected_season_num().is_none() {
+                ("Оберіть випуск", false)
+            } else {
+                ("Озвучок не знайдено", false)
+            };
+            render_list_message(
+                f,
+                list_chunks[idx],
+                " Озвучки ",
+                app.focus == FocusPanel::DubbingList,
+                message,
+                loading,
+            );
+        } else {
+            let list = create_list(" Озвучки ", items, app.focus == FocusPanel::DubbingList);
+            f.render_stateful_widget(list, list_chunks[idx], &mut app.dubbing_list_state);
+        }
     }
 
     if let Some(idx) = episode_chunk_idx {
@@ -1703,8 +1725,26 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         } else {
             vec![]
         };
-        let list = create_list(" Серії ", items, app.focus == FocusPanel::EpisodeList);
-        f.render_stateful_widget(list, list_chunks[idx], &mut app.episode_list_state);
+        if items.is_empty() {
+            let (message, loading) = if app.loading {
+                ("Завантаження серій…", true)
+            } else if app.selected_dubbing_choice().is_none() {
+                ("Оберіть озвучку", false)
+            } else {
+                ("Серій не знайдено", false)
+            };
+            render_list_message(
+                f,
+                list_chunks[idx],
+                " Серії ",
+                app.focus == FocusPanel::EpisodeList,
+                message,
+                loading,
+            );
+        } else {
+            let list = create_list(" Серії ", items, app.focus == FocusPanel::EpisodeList);
+            f.render_stateful_widget(list, list_chunks[idx], &mut app.episode_list_state);
+        }
     }
 }
 
@@ -1925,12 +1965,27 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 ))
             })
             .collect();
-        let season_list = create_list(
-            " Випуски ",
-            season_items,
-            app.mode == AppMode::LibrarySeason,
-        );
-        f.render_stateful_widget(season_list, chunks[1], &mut app.season_list_state);
+        if season_items.is_empty() {
+            render_list_message(
+                f,
+                chunks[1],
+                " Випуски ",
+                app.mode == AppMode::LibrarySeason,
+                if app.loading {
+                    "Завантаження випусків…"
+                } else {
+                    "Випусків не знайдено"
+                },
+                app.loading,
+            );
+        } else {
+            let season_list = create_list(
+                " Випуски ",
+                season_items,
+                app.mode == AppMode::LibrarySeason,
+            );
+            f.render_stateful_widget(season_list, chunks[1], &mut app.season_list_state);
+        }
     }
 
     if chunks.len() >= 3 {
@@ -1948,12 +2003,30 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         } else {
             vec![]
         };
-        let dubbing_list = create_list(
-            " Озвучки ",
-            dubbing_items,
-            app.mode == AppMode::LibraryDubbing,
-        );
-        f.render_stateful_widget(dubbing_list, chunks[2], &mut app.dubbing_list_state);
+        if dubbing_items.is_empty() {
+            let (message, loading) = if app.loading {
+                ("Завантаження озвучок…", true)
+            } else if app.selected_season_num().is_none() {
+                ("Оберіть випуск", false)
+            } else {
+                ("Озвучок не знайдено", false)
+            };
+            render_list_message(
+                f,
+                chunks[2],
+                " Озвучки ",
+                app.mode == AppMode::LibraryDubbing,
+                message,
+                loading,
+            );
+        } else {
+            let dubbing_list = create_list(
+                " Озвучки ",
+                dubbing_items,
+                app.mode == AppMode::LibraryDubbing,
+            );
+            f.render_stateful_widget(dubbing_list, chunks[2], &mut app.dubbing_list_state);
+        }
     }
 
     if chunks.len() >= 4 {
@@ -2011,12 +2084,30 @@ fn render_library_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         } else {
             vec![]
         };
-        let episode_list = create_list(
-            " Серії ",
-            episode_items,
-            app.mode == AppMode::LibraryEpisode,
-        );
-        f.render_stateful_widget(episode_list, chunks[3], &mut app.episode_list_state);
+        if episode_items.is_empty() {
+            let (message, loading) = if app.loading {
+                ("Завантаження серій…", true)
+            } else if app.selected_dubbing_choice().is_none() {
+                ("Оберіть озвучку", false)
+            } else {
+                ("Серій не знайдено", false)
+            };
+            render_list_message(
+                f,
+                chunks[3],
+                " Серії ",
+                app.mode == AppMode::LibraryEpisode,
+                message,
+                loading,
+            );
+        } else {
+            let episode_list = create_list(
+                " Серії ",
+                episode_items,
+                app.mode == AppMode::LibraryEpisode,
+            );
+            f.render_stateful_widget(episode_list, chunks[3], &mut app.episode_list_state);
+        }
     }
 }
 
@@ -2547,6 +2638,63 @@ fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -
         )
         .highlight_style(selection_style())
         .highlight_symbol(">> ")
+}
+
+fn render_list_message(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    is_focused: bool,
+    message: &str,
+    loading: bool,
+) {
+    let border_style = if is_focused {
+        Style::default().fg(color_highlight())
+    } else {
+        Style::default().fg(color_dim())
+    };
+    let title_style = if is_focused {
+        Style::default()
+            .fg(color_secondary())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color_dim())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title.to_string(), title_style))
+        .title_alignment(Alignment::Center)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+    let label = if loading {
+        format!("⟳ {message}")
+    } else {
+        message.to_string()
+    };
+    let style = if loading {
+        Style::default()
+            .fg(color_secondary())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color_dim())
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_with_ellipsis(&label, inner.width.saturating_sub(2) as usize),
+            style,
+        ))
+        .alignment(Alignment::Center),
+        rows[1],
+    );
 }
 
 fn render_settings(f: &mut Frame, app: &AppState, area: Rect) {
@@ -3384,7 +3532,7 @@ fn render_clear_library_popup(f: &mut Frame) {
     );
 }
 
-fn render_error_popup(f: &mut Frame, message: &str) {
+fn render_error_popup(f: &mut Frame, message: &str, retry_available: bool) {
     let chunks = wrap_text(message, 46);
     let mut body = Vec::with_capacity(chunks.len());
     for chunk in chunks {
@@ -3394,15 +3542,15 @@ fn render_error_popup(f: &mut Frame, message: &str) {
         )));
     }
     let height = (body.len() as u16).saturating_add(4).clamp(6, 12);
-    render_confirm_dialog(
-        f,
-        " Помилка ",
-        color_error(),
-        &body,
-        &[("Esc", "", color_dim())],
-        50,
-        height,
-    );
+    let actions = if retry_available {
+        vec![
+            ("r", "Повторити", color_highlight()),
+            ("Esc", "Закрити", color_dim()),
+        ]
+    } else {
+        vec![("Esc", "Закрити", color_dim())]
+    };
+    render_confirm_dialog(f, " Помилка ", color_error(), &body, &actions, 50, height);
 }
 
 fn render_status_editor_popup(f: &mut Frame, app: &AppState) {
@@ -3897,6 +4045,70 @@ fn count_seasons(items: &[crate::api::AnimeItem], group: &[usize]) -> (usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn loading_panel_renders_at_supported_terminal_sizes() {
+        set_active_theme(
+            ColorMode::AniHubRgb,
+            ThemePreset::CatppuccinMocha,
+            SurfaceMode::Auto,
+            true,
+        );
+        for (width, height) in [(80, 24), (120, 35), (192, 55)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_list_message(
+                        frame,
+                        frame.area(),
+                        " Озвучки ",
+                        true,
+                        "Завантаження озвучок…",
+                        true,
+                    );
+                })
+                .unwrap();
+            let output = rendered_text(&terminal);
+            assert!(output.contains("Озвучки"));
+            assert!(output.contains("Завантаження озвучок"));
+        }
+    }
+
+    #[test]
+    fn retryable_error_dialog_exposes_retry_action() {
+        set_active_theme(
+            ColorMode::AniHubRgb,
+            ThemePreset::CatppuccinMocha,
+            SurfaceMode::Auto,
+            true,
+        );
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_error_popup(
+                    frame,
+                    "Не вдалося виконати пошук\nНемає з’єднання з AniHub",
+                    true,
+                );
+            })
+            .unwrap();
+        let output = rendered_text(&terminal);
+        assert!(output.contains("Повторити"));
+        assert!(output.contains("Закрити"));
+    }
 
     #[test]
     fn original_anihub_rgb_theme_remains_the_default_render_palette() {

@@ -12,6 +12,7 @@ mod ui;
 use crate::discord::{DiscordPresence, PresenceActivity};
 use crate::playback::*;
 use anyhow::{Result, bail};
+use api::resource::LoadError;
 use api::{
     EpisodeSourcesKey, EpisodeSourcesResponse, RequestId, ResourceEvent, ResourceKey,
     ResourceValue, ResourceWorker, ResourceWorkerRuntime, ViewGeneration,
@@ -63,6 +64,7 @@ struct ResourceCoordinator {
     ready_playback: Option<(PlayTarget, Vec<PlayTarget>)>,
     cached_search_used: Option<(String, bool)>,
     poster_candidate: Option<(u32, Instant)>,
+    force_reload: bool,
 }
 
 impl ResourceCoordinator {
@@ -77,6 +79,7 @@ impl ResourceCoordinator {
             ready_playback: None,
             cached_search_used: None,
             poster_candidate: None,
+            force_reload: false,
         }
     }
 
@@ -100,6 +103,26 @@ impl ResourceCoordinator {
 
         self.schedule_poster(app).await;
         self.finish_continue_if_ready(app);
+    }
+
+    fn retry_current_context(&mut self) {
+        // `sync` will create a fresh generation and resubmit the same desired
+        // context. Completed worker entries may still satisfy it immediately.
+        self.context = None;
+        self.cached_search_used = None;
+        self.force_reload = true;
+    }
+
+    async fn load_resource(
+        &self,
+        key: ResourceKey,
+        force_reload: bool,
+    ) -> Result<RequestId, api::resource::ResourceCommandError> {
+        if force_reload {
+            self.runtime.handle.reload(self.generation, key).await
+        } else {
+            self.runtime.handle.load(self.generation, key).await
+        }
     }
 
     fn desired_context(&self, app: &AppState) -> Option<ResourceContext> {
@@ -243,18 +266,17 @@ impl ResourceCoordinator {
     }
 
     async fn start_context(&mut self, app: &mut AppState, context: ResourceContext) {
+        let force_reload = std::mem::take(&mut self.force_reload);
         match context {
             ResourceContext::Search { query, extended } => {
                 app.set_activity("Пошук аніме…");
                 if let Some(cached) = app.metadata_cache.search(&query, extended) {
                     apply_search_results(app, cached.items, cached.anilist_media, false);
                     self.cached_search_used = Some((query.clone(), extended));
-                    app.set_activity("Показано кеш · оновлення у фоні…");
+                    app.set_activity("Кешовані результати · перевіряємо мережу…");
                 }
                 if self
-                    .runtime
-                    .handle
-                    .load(self.generation, ResourceKey::search(query, extended))
+                    .load_resource(ResourceKey::search(query, extended), force_reload)
                     .await
                     .is_err()
                 {
@@ -280,9 +302,7 @@ impl ResourceCoordinator {
                     || !app.metadata_cache.details_are_fresh(details_key.anime_id);
                 if details_need_refresh {
                     let request = self
-                        .runtime
-                        .handle
-                        .load(self.generation, ResourceKey::details(details_key.anime_id))
+                        .load_resource(ResourceKey::details(details_key.anime_id), force_reload)
                         .await;
                     if request.is_err() {
                         app.clear_activity();
@@ -315,22 +335,18 @@ impl ResourceCoordinator {
                 // release identity instead of being normalized and merged.
                 if !app.sources_cache.contains_key(&details_key) {
                     let _ = self
-                        .runtime
-                        .handle
-                        .load(
-                            self.generation,
+                        .load_resource(
                             ResourceKey::sources(details_key.anime_id, details_key.season),
+                            force_reload,
                         )
                         .await;
                 }
                 for source_key in &source_keys {
                     if *source_key != details_key && !app.sources_cache.contains_key(source_key) {
                         let _ = self
-                            .runtime
-                            .handle
-                            .load(
-                                self.generation,
+                            .load_resource(
                                 ResourceKey::sources(source_key.anime_id, source_key.season),
+                                force_reload,
                             )
                             .await;
                     }
@@ -441,7 +457,7 @@ impl ResourceCoordinator {
                 generation,
                 key,
                 error,
-            } => (request_id, generation, key, Err(error.to_string())),
+            } => (request_id, generation, key, Err(error)),
         };
         if generation != self.generation {
             return;
@@ -473,7 +489,7 @@ impl ResourceCoordinator {
                     );
                 } else {
                     app.clear_activity();
-                    app.set_error_status(format!("Помилка пошуку: {error}"));
+                    set_resource_error(app, "Не вдалося виконати пошук", &error);
                 }
             }
             (ResourceKey::Details(anime_id), Ok(ResourceValue::Details(details))) => {
@@ -535,7 +551,7 @@ impl ResourceCoordinator {
                 if app.details_cache.contains_key(&anime_id) {
                     app.set_info_status("Показано кешовані метадані · оновлення не вдалося");
                 } else {
-                    app.set_error_status(format!("Помилка метаданих: {error}"));
+                    set_resource_error(app, "Не вдалося завантажити метадані", &error);
                 }
             }
             (ResourceKey::Sources(source_key), Ok(ResourceValue::Sources(sources))) => {
@@ -562,7 +578,7 @@ impl ResourceCoordinator {
                 );
                 if is_current {
                     app.clear_activity();
-                    app.set_error_status(format!("Не вдалося завантажити випуск: {error}"));
+                    set_resource_error(app, "Не вдалося завантажити випуск", &error);
                 }
             }
             (ResourceKey::AniHubByAniList(_), Ok(ResourceValue::AniHubId(Some(anime_id))))
@@ -595,6 +611,42 @@ impl ResourceCoordinator {
 
     async fn shutdown(self) {
         let _ = self.runtime.shutdown().await;
+    }
+}
+
+fn resource_error_hint(error: &LoadError) -> String {
+    match error {
+        LoadError::Network(_) => "Немає з’єднання з AniHub".to_string(),
+        LoadError::Http {
+            status: 429,
+            retry_after,
+            ..
+        } => retry_after.map_or_else(
+            || "AniHub тимчасово обмежив кількість запитів".to_string(),
+            |delay| {
+                format!(
+                    "AniHub обмежив запити · повторіть приблизно через {} с",
+                    delay.as_secs().max(1)
+                )
+            },
+        ),
+        LoadError::Http { status, .. } if (500..=599).contains(status) => {
+            format!("AniHub тимчасово недоступний · HTTP {status}")
+        }
+        LoadError::Http { status, .. } => format!("AniHub повернув HTTP {status}"),
+        LoadError::NotFound => "Дані більше не доступні на AniHub".to_string(),
+        LoadError::Parse(_) | LoadError::Decode(_) => "AniHub повернув некоректні дані".to_string(),
+        LoadError::Unsupported(_) => "Цей ресурс не підтримується".to_string(),
+        LoadError::Shutdown => "Сервіс завантаження завершує роботу".to_string(),
+    }
+}
+
+fn set_resource_error(app: &mut AppState, context: &str, error: &LoadError) {
+    let message = format!("{context}\n{}", resource_error_hint(error));
+    if error.is_transient() {
+        app.set_retryable_error_status(message);
+    } else {
+        app.set_error_status(message);
     }
 }
 
@@ -852,6 +904,9 @@ async fn main() -> Result<()> {
         // Apply the latest UI selection before accepting worker completions.
         // Otherwise a late S1 response can be installed after the cursor has
         // already moved to S2/S3 but before the generation is canceled.
+        if app.take_retry_request() {
+            resources.retry_current_context();
+        }
         resources.sync(&mut app).await;
         resources.drain(&mut app).await;
         if app.take_discord_config_changed() {
@@ -1462,5 +1517,21 @@ mod staged_source_loading_tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn network_failures_get_short_user_facing_hints() {
+        assert_eq!(
+            resource_error_hint(&LoadError::Network("dns details".to_string())),
+            "Немає з’єднання з AniHub"
+        );
+        assert_eq!(
+            resource_error_hint(&LoadError::Http {
+                status: 503,
+                message: "upstream".to_string(),
+                retry_after: None,
+            }),
+            "AniHub тимчасово недоступний · HTTP 503"
+        );
     }
 }

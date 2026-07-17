@@ -436,6 +436,8 @@ pub struct AppState {
     pub continue_request: Option<ContinueRequest>,
     pub status_message: Option<(String, StatusKind)>,
     pub status_expires_at: Option<Instant>,
+    pub status_retry_available: bool,
+    pub retry_requested: bool,
     pub show_help: bool,
     /// (display title, direct MoonAnime iframe URL)
     pub moonanime_browser_prompt: Option<(String, String)>,
@@ -550,6 +552,8 @@ impl AppState {
             continue_request: None,
             status_message: None,
             status_expires_at: None,
+            status_retry_available: false,
+            retry_requested: false,
             show_help: false,
             moonanime_browser_prompt: None,
 
@@ -1379,8 +1383,14 @@ impl AppState {
                         return Ok(());
                     }
                     if matches!(self.status_message, Some((_, StatusKind::Error))) {
-                        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                            self.clear_status();
+                        match key.code {
+                            KeyCode::Char('r') if self.status_retry_available => {
+                                self.clear_status();
+                                self.retry_requested = true;
+                                self.set_activity("Повторна спроба…");
+                            }
+                            KeyCode::Esc | KeyCode::Enter => self.clear_status(),
+                            _ => {}
                         }
                         return Ok(());
                     }
@@ -3046,12 +3056,20 @@ impl AppState {
     pub fn set_info_status(&mut self, message: impl Into<String>) {
         self.status_message = Some((message.into(), StatusKind::Info));
         self.status_expires_at = Some(Instant::now() + Duration::from_secs(4));
+        self.status_retry_available = false;
     }
 
     pub fn set_error_status(&mut self, message: impl Into<String>) {
+        self.loading = false;
         self.activity_message = None;
         self.status_message = Some((message.into(), StatusKind::Error));
         self.status_expires_at = None;
+        self.status_retry_available = false;
+    }
+
+    pub fn set_retryable_error_status(&mut self, message: impl Into<String>) {
+        self.set_error_status(message);
+        self.status_retry_available = true;
     }
 
     pub fn set_activity(&mut self, message: impl Into<String>) {
@@ -3084,6 +3102,11 @@ impl AppState {
     pub fn clear_status(&mut self) {
         self.status_message = None;
         self.status_expires_at = None;
+        self.status_retry_available = false;
+    }
+
+    pub fn take_retry_request(&mut self) -> bool {
+        std::mem::take(&mut self.retry_requested)
     }
 
     fn clear_info_status(&mut self) {

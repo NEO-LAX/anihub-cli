@@ -7,6 +7,7 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 ## Unreleased
 
 - The original AniHub RGB theme remains the default, with opt-in ANSI 16 and ANSI 256 modes offering Catppuccin Mocha, Tokyo Night, Kanagawa Wave, Rosé Pine, Gruvbox Dark, Everforest Dark, and Ayu Dark palettes. Theme hover affects only the dedicated preview; Auto/Dark/Light surfaces and terminal background transparency are controlled independently.
+- Search, metadata, release, dubbing, and episode panels expose contextual loading and empty states. Transient AniHub failures use short user-facing messages and can be retried with `r` without waiting for the negative cache to expire.
 - Optional Discord Rich Presence for mpv/Ashdi playback, including title, season, episode, dubbing studio, application uptime, and poster artwork.
 - Persistent 150 MiB poster cache with offline fallback, automatic pruning, corruption recovery, and an explicit clear action in Settings.
 
@@ -129,6 +130,7 @@ The footer shows shortcuts for the current screen. Press `?` or `h` outside sear
 | `Home` / `End` | Jump to the beginning or end of the active list |
 | `Right` or `Enter` | Open the selected level or play the selected episode |
 | `Left` or `Esc` | Return to the previous level |
+| `r` | Retry the current request when a transient network error is open |
 | `q` | Save final playback progress, stop owned processes, and quit |
 | `Ctrl+C` | Quit from any screen, including search input |
 

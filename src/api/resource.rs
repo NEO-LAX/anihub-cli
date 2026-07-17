@@ -179,6 +179,7 @@ pub enum ResourceCommand {
         request_id: RequestId,
         generation: ViewGeneration,
         key: ResourceKey,
+        bypass_negative_cache: bool,
     },
     CancelGeneration {
         generation: ViewGeneration,
@@ -254,6 +255,28 @@ impl ResourceHandle {
                 request_id,
                 generation,
                 key,
+                bypass_negative_cache: false,
+            })
+            .await
+            .map_err(|_| ResourceCommandError::Closed)?;
+        Ok(request_id)
+    }
+
+    /// Resubmit a failed resource immediately instead of serving the worker's
+    /// short-lived negative cache entry. Successful completed entries are
+    /// still reused.
+    pub async fn reload(
+        &self,
+        generation: ViewGeneration,
+        key: ResourceKey,
+    ) -> Result<RequestId, ResourceCommandError> {
+        let request_id = self.allocate_request_id();
+        self.command_tx
+            .send(ResourceCommand::Load {
+                request_id,
+                generation,
+                key,
+                bypass_negative_cache: true,
             })
             .await
             .map_err(|_| ResourceCommandError::Closed)?;
@@ -523,7 +546,11 @@ impl Actor {
                 request_id,
                 generation,
                 key,
+                bypass_negative_cache,
             } => {
+                if bypass_negative_cache {
+                    self.negative.remove(&key);
+                }
                 self.enqueue(
                     Waiter {
                         request_id,
@@ -1151,6 +1178,24 @@ mod tests {
             }
         ));
         assert_eq!(server.request_count(), 1);
+
+        runtime
+            .handle
+            .reload(generation, ResourceKey::Details(7))
+            .await
+            .unwrap();
+        let retried = timeout(Duration::from_secs(1), runtime.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            retried,
+            ResourceEvent::Failed {
+                error: LoadError::NotFound,
+                ..
+            }
+        ));
+        assert_eq!(server.request_count(), 2);
         runtime.shutdown().await.unwrap();
         server.stop().await;
     }
