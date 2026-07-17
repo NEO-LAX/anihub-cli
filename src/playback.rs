@@ -31,7 +31,7 @@ pub struct PlayTarget {
 /// A complete, ordered playback timeline with one selected entry.
 ///
 /// The full timeline is logical (progress, autoplay, franchise order). Only a
-/// sliding window (~50 streams: 20 behind + current + 29 ahead) is resolved and
+/// sliding window (~97 streams: 48 behind + current + 48 ahead) is resolved and
 /// handed to mpv so huge seasons do not explode argv / IPC playlist snapshots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackTimeline {
@@ -40,11 +40,11 @@ pub struct PlaybackTimeline {
 }
 
 /// Episodes kept behind / ahead of the current title in the native mpv playlist.
-/// Total window size is at most `behind + 1 + ahead` (50 with the values below).
-const PLAYLIST_WINDOW_BEHIND: usize = 20;
-const PLAYLIST_WINDOW_AHEAD: usize = 29;
+/// Total window size is at most `behind + 1 + ahead` (97 with ±48).
+const PLAYLIST_WINDOW_BEHIND: usize = 48;
+const PLAYLIST_WINDOW_AHEAD: usize = 48;
 /// Re-center the window once the playhead sits this close to either edge.
-const PLAYLIST_REWINDOW_EDGE: usize = 2;
+const PLAYLIST_REWINDOW_EDGE: usize = 3;
 
 /// Inclusive-exclusive timeline range loaded into mpv around `current`.
 fn playlist_window(current: usize, len: usize) -> (usize, usize) {
@@ -1458,28 +1458,28 @@ mod supervisor_tests {
     }
 
     #[test]
-    fn playlist_window_keeps_about_fifty_episodes() {
-        // 20 behind + current + 29 ahead = 50 when not clipped.
-        assert_eq!(playlist_window(0, 270), (0, 30));
-        assert_eq!(playlist_window(12, 270), (0, 42));
-        assert_eq!(playlist_window(231, 270), (211, 261));
-        assert_eq!(playlist_window(269, 270), (249, 270));
+    fn playlist_window_keeps_forty_eight_behind_and_ahead() {
+        // 48 behind + current + 48 ahead = 97 when not clipped.
+        assert_eq!(playlist_window(0, 270), (0, 49));
+        assert_eq!(playlist_window(12, 270), (0, 61));
+        assert_eq!(playlist_window(231, 270), (183, 270));
+        assert_eq!(playlist_window(269, 270), (221, 270));
         assert_eq!(
             playlist_window(100, 270).1 - playlist_window(100, 270).0,
-            50
+            97
         );
     }
 
     #[test]
     fn rewindow_triggers_near_loaded_edges_only() {
-        // Window [211, 261) while sitting on 231 — middle, no rewindow.
-        assert!(!should_rewindow(211, 50, 231, 270));
+        // Window [52, 149) while sitting on 100 — middle, no rewindow.
+        assert!(!should_rewindow(52, 97, 100, 270));
         // Near end of window with more timeline ahead.
-        assert!(should_rewindow(211, 50, 258, 270));
+        assert!(should_rewindow(52, 97, 145, 270));
         // Near start with more timeline behind.
-        assert!(should_rewindow(211, 50, 213, 270));
+        assert!(should_rewindow(52, 97, 55, 270));
         // Whole season fits — never rewindow.
-        assert!(!should_rewindow(0, 40, 20, 40));
+        assert!(!should_rewindow(0, 80, 40, 80));
     }
 
     #[test]
