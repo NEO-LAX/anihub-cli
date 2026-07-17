@@ -7,7 +7,18 @@ Unofficial terminal client for [AniHub](https://anihub.in.ua) — search, librar
 ![Demo](assets/demo.gif)
 
 <p align="center">
-  <img src="assets/installer.png" alt="Installer" width="520" />
+  <img src="assets/library.jpg" alt="Library" width="48%" />
+  <img src="assets/themes.jpg" alt="Themes" width="48%" />
+</p>
+<p align="center">
+  <img src="assets/mpv-terminal.jpg" alt="mpv + terminal" width="48%" />
+  <img src="assets/discord.jpg" alt="Discord Rich Presence" width="48%" />
+</p>
+<p align="center">
+  <img src="assets/continue.gif" alt="Continue watching" width="72%" />
+</p>
+<p align="center">
+  <img src="assets/installer.png" alt="Installer" width="420" />
 </p>
 
 ---
