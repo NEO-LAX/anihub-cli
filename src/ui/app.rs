@@ -1069,16 +1069,19 @@ impl AppState {
 
     fn activate_theme_setting(&mut self) {
         if self.settings_selected == 0 {
-            self.settings.ansi_themes = !self.settings.ansi_themes;
+            self.settings.cycle_color_mode();
+            self.persist_settings();
+        } else if self.settings_selected == 1 {
+            self.settings.transparent_background = !self.settings.transparent_background;
             self.persist_settings();
         } else if let Some(theme) = ThemePreset::ALL
-            .get(self.settings_selected.saturating_sub(1))
+            .get(self.settings_selected.saturating_sub(2))
             .copied()
         {
             self.settings.theme = theme;
             self.persist_settings();
             if !self.settings.ansi_themes {
-                self.set_info_status("Увімкніть ANSI-кольори, щоб застосувати тему");
+                self.set_info_status("Оберіть ANSI 16 або ANSI 256, щоб застосувати тему");
             }
         }
     }
@@ -1310,7 +1313,7 @@ impl AppState {
     fn handle_settings_key(&mut self, key_code: KeyCode) {
         let rows = match self.settings_tab {
             SettingsTab::General => 10,
-            SettingsTab::Themes => ThemePreset::ALL.len() + 1,
+            SettingsTab::Themes => ThemePreset::ALL.len() + 2,
             SettingsTab::About => 5,
         };
         match key_code {

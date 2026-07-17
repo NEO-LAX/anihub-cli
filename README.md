@@ -6,8 +6,8 @@ AniHub CLI is an unofficial Rust terminal client for browsing and watching anime
 
 ## Unreleased
 
-- The original AniHub RGB theme remains the default, with an opt-in ANSI mode offering Neon, Ocean, Amber, Sakura, Matrix, and Mono palettes with live keyboard preview.
-- Optional Discord Rich Presence for mpv/Ashdi playback, including title, season, episode, dubbing studio, elapsed time, and poster artwork.
+- The original AniHub RGB theme remains the default, with opt-in ANSI 16 and ANSI 256 modes offering Neon, Ocean, Amber, Sakura, Matrix, and Mono palettes. Theme hover affects only the dedicated preview, and terminal background transparency can be toggled independently.
+- Optional Discord Rich Presence for mpv/Ashdi playback, including title, season, episode, dubbing studio, application uptime, and poster artwork.
 - Persistent 150 MiB poster cache with offline fallback, automatic pruning, corruption recovery, and an explicit clear action in Settings.
 
 ## What's new in v0.6.0
@@ -150,7 +150,7 @@ While editing a search query, use `Left`/`Right`, `Home`/`End`, `Backspace`, and
 
 ### Settings
 
-Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). The original AniHub RGB palette is the default. The Themes tab can explicitly enable ANSI colors and choose a terminal-native palette that respects the terminal's own color configuration. Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
+Settings are persisted in `settings.json` beside the history file. Existing `settings-v1.json` data is imported automatically and retained as a safety copy. In the Settings screen, use `Tab` / `Shift+Tab` to switch General, Themes, and About; use `Up`/`Down` to select a row and `Space` or `Enter` to change it. **Search mode** switches between strict (20 results) and extended (up to 100 results). The Themes tab cycles between the original AniHub RGB palette, terminal-native ANSI 16 colors, and curated ANSI 256 colors; background transparency is a separate toggle. Hovering a theme updates only the preview pane, while `Space` or `Enter` applies it. Text values for the `mpv` path and extra arguments open a small editor; `Enter` saves and `Esc` cancels. About shows data paths and runtime diagnostics, clears the disposable poster cache, opens the project/data directory on explicit action, and checks the latest GitHub release without installing anything automatically.
 
 ### Discord Rich Presence
 

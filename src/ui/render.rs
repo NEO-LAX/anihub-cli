@@ -8,7 +8,7 @@ use ratatui::{
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 
 use crate::api;
-use crate::settings::ThemePreset;
+use crate::settings::{ColorMode, ThemePreset};
 use crate::storage::{AnimeStatus, LibraryReleaseKind};
 use crate::ui::app::{
     AppMode, AppState, FocusPanel, LibraryFilter, PrimaryTab, SettingsChoiceKind, SettingsInput,
@@ -20,6 +20,8 @@ struct ThemePalette {
     primary: Color,
     secondary: Color,
     highlight: Color,
+    success: Color,
+    warning: Color,
     error: Color,
     dim: Color,
     text: Color,
@@ -31,6 +33,8 @@ const ANIHUB_PALETTE: ThemePalette = ThemePalette {
     primary: Color::Rgb(147, 51, 234),
     secondary: Color::Rgb(168, 85, 247),
     highlight: Color::Rgb(59, 130, 246),
+    success: Color::Rgb(34, 197, 94),
+    warning: Color::Rgb(234, 179, 8),
     error: Color::Rgb(239, 68, 68),
     dim: Color::Rgb(107, 114, 128),
     text: Color::Rgb(243, 244, 246),
@@ -38,15 +42,17 @@ const ANIHUB_PALETTE: ThemePalette = ThemePalette {
     dark: Color::Rgb(17, 24, 39),
 };
 
-const fn palette_for(theme: ThemePreset) -> ThemePalette {
+const fn ansi16_palette(theme: ThemePreset) -> ThemePalette {
     match theme {
         ThemePreset::Violet => ThemePalette {
             primary: Color::Magenta,
             secondary: Color::LightMagenta,
             highlight: Color::LightBlue,
+            success: Color::LightGreen,
+            warning: Color::LightYellow,
             error: Color::LightRed,
             dim: Color::DarkGray,
-            text: Color::White,
+            text: Color::Reset,
             on_primary: Color::White,
             dark: Color::Black,
         },
@@ -54,19 +60,23 @@ const fn palette_for(theme: ThemePreset) -> ThemePalette {
             primary: Color::Blue,
             secondary: Color::LightCyan,
             highlight: Color::Cyan,
+            success: Color::LightGreen,
+            warning: Color::LightYellow,
             error: Color::LightRed,
             dim: Color::DarkGray,
-            text: Color::White,
+            text: Color::Reset,
             on_primary: Color::White,
             dark: Color::Black,
         },
         ThemePreset::Amber => ThemePalette {
             primary: Color::Yellow,
             secondary: Color::LightYellow,
-            highlight: Color::Cyan,
+            highlight: Color::LightRed,
+            success: Color::LightGreen,
+            warning: Color::Yellow,
             error: Color::LightRed,
             dim: Color::DarkGray,
-            text: Color::White,
+            text: Color::Reset,
             on_primary: Color::Black,
             dark: Color::Black,
         },
@@ -74,19 +84,23 @@ const fn palette_for(theme: ThemePreset) -> ThemePalette {
             primary: Color::LightMagenta,
             secondary: Color::LightRed,
             highlight: Color::Magenta,
+            success: Color::LightGreen,
+            warning: Color::LightYellow,
             error: Color::Red,
             dim: Color::DarkGray,
-            text: Color::White,
+            text: Color::Reset,
             on_primary: Color::Black,
             dark: Color::Black,
         },
         ThemePreset::Matrix => ThemePalette {
             primary: Color::Green,
             secondary: Color::LightGreen,
-            highlight: Color::LightGreen,
+            highlight: Color::Green,
+            success: Color::LightGreen,
+            warning: Color::LightYellow,
             error: Color::LightRed,
             dim: Color::DarkGray,
-            text: Color::White,
+            text: Color::Reset,
             on_primary: Color::Black,
             dark: Color::Black,
         },
@@ -94,35 +108,80 @@ const fn palette_for(theme: ThemePreset) -> ThemePalette {
             primary: Color::White,
             secondary: Color::Gray,
             highlight: Color::White,
+            success: Color::LightGreen,
+            warning: Color::LightYellow,
             error: Color::LightRed,
             dim: Color::DarkGray,
-            text: Color::White,
+            text: Color::Reset,
             on_primary: Color::Black,
             dark: Color::Black,
         },
     }
 }
 
+const fn ansi256_palette(theme: ThemePreset) -> ThemePalette {
+    let (primary, secondary, highlight) = match theme {
+        ThemePreset::Violet => (Color::Indexed(135), Color::Indexed(177), Color::Indexed(75)),
+        ThemePreset::Ocean => (Color::Indexed(33), Color::Indexed(44), Color::Indexed(81)),
+        ThemePreset::Amber => (
+            Color::Indexed(214),
+            Color::Indexed(220),
+            Color::Indexed(209),
+        ),
+        ThemePreset::Sakura => (
+            Color::Indexed(205),
+            Color::Indexed(211),
+            Color::Indexed(177),
+        ),
+        ThemePreset::Matrix => (Color::Indexed(40), Color::Indexed(82), Color::Indexed(118)),
+        ThemePreset::Monochrome => (
+            Color::Indexed(250),
+            Color::Indexed(245),
+            Color::Indexed(255),
+        ),
+    };
+    ThemePalette {
+        primary,
+        secondary,
+        highlight,
+        success: Color::Indexed(82),
+        warning: Color::Indexed(220),
+        error: Color::Indexed(203),
+        dim: Color::Indexed(245),
+        text: Color::Reset,
+        on_primary: Color::Indexed(231),
+        dark: Color::Indexed(234),
+    }
+}
+
+const fn palette_for_mode(mode: ColorMode, theme: ThemePreset) -> ThemePalette {
+    match mode {
+        ColorMode::AniHubRgb => ANIHUB_PALETTE,
+        ColorMode::Ansi16 => ansi16_palette(theme),
+        ColorMode::Ansi256 => ansi256_palette(theme),
+    }
+}
+
 thread_local! {
-    static ANSI_THEMES_ENABLED: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
+    static ACTIVE_COLOR_MODE: std::cell::Cell<ColorMode> = const {
+        std::cell::Cell::new(ColorMode::AniHubRgb)
     };
     static ACTIVE_THEME: std::cell::Cell<ThemePreset> = const {
         std::cell::Cell::new(ThemePreset::Violet)
     };
+    static TRANSPARENT_BACKGROUND: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(true)
+    };
 }
 
-fn set_active_theme(ansi_enabled: bool, theme: ThemePreset) {
-    ANSI_THEMES_ENABLED.set(ansi_enabled);
+fn set_active_theme(mode: ColorMode, theme: ThemePreset, transparent_background: bool) {
+    ACTIVE_COLOR_MODE.set(mode);
     ACTIVE_THEME.set(theme);
+    TRANSPARENT_BACKGROUND.set(transparent_background);
 }
 
 fn active_palette() -> ThemePalette {
-    if ANSI_THEMES_ENABLED.get() {
-        palette_for(ACTIVE_THEME.get())
-    } else {
-        ANIHUB_PALETTE
-    }
+    palette_for_mode(ACTIVE_COLOR_MODE.get(), ACTIVE_THEME.get())
 }
 
 fn color_primary() -> Color {
@@ -134,6 +193,12 @@ fn color_secondary() -> Color {
 fn color_highlight() -> Color {
     active_palette().highlight
 }
+fn color_success() -> Color {
+    active_palette().success
+}
+fn color_warning() -> Color {
+    active_palette().warning
+}
 fn color_error() -> Color {
     active_palette().error
 }
@@ -143,18 +208,36 @@ fn color_dim() -> Color {
 fn color_text() -> Color {
     active_palette().text
 }
-fn color_on_primary() -> Color {
-    active_palette().on_primary
+fn color_background() -> Color {
+    if TRANSPARENT_BACKGROUND.get() {
+        Color::Reset
+    } else {
+        active_palette().dark
+    }
 }
-fn color_bg_dark() -> Color {
-    active_palette().dark
+
+fn selection_style_for(mode: ColorMode, palette: ThemePalette) -> Style {
+    match mode {
+        ColorMode::AniHubRgb => Style::default()
+            .fg(palette.on_primary)
+            .bg(palette.primary)
+            .add_modifier(Modifier::BOLD),
+        ColorMode::Ansi16 | ColorMode::Ansi256 => {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        }
+    }
 }
-const fn color_bg_transparent() -> Color {
-    Color::Reset
+
+fn selection_style() -> Style {
+    selection_style_for(ACTIVE_COLOR_MODE.get(), active_palette())
 }
 
 pub fn render(f: &mut Frame, app: &mut AppState) {
-    set_active_theme(app.settings.ansi_themes, app.settings.theme);
+    set_active_theme(
+        app.settings.color_mode(),
+        app.settings.theme,
+        app.settings.transparent_background,
+    );
     let size = f.area();
     // One tab row plus a compact context field. Breadcrumbs intentionally stay
     // out of the chrome: the active columns already show the same hierarchy.
@@ -170,10 +253,10 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         ])
         .split(size);
 
-    // Respect the terminal's own background/opacity instead of painting an
-    // opaque full-frame wash.
+    // Paint either the selected theme background or the terminal's own
+    // background when transparency is enabled.
     f.render_widget(
-        Block::default().style(Style::default().bg(color_bg_transparent())),
+        Block::default().style(Style::default().bg(color_background())),
         size,
     );
 
@@ -231,10 +314,7 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
         top.push(Span::styled(
             format!(" {} · {} ", index + 1, tab.label()),
             if active {
-                Style::default()
-                    .fg(color_on_primary())
-                    .bg(color_primary())
-                    .add_modifier(Modifier::BOLD)
+                selection_style()
             } else {
                 Style::default().fg(color_dim())
             },
@@ -243,7 +323,7 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(top))
             .alignment(Alignment::Center)
-            .style(Style::default().bg(color_bg_transparent())),
+            .style(Style::default().bg(color_background())),
         rows[0],
     );
 
@@ -306,10 +386,10 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
                         .title_alignment(Alignment::Center)
                         .border_style(Style::default().fg(context_border))
                         .padding(Padding::horizontal(1))
-                        .style(Style::default().bg(color_bg_transparent())),
+                        .style(Style::default().bg(color_background())),
                 )
                 .alignment(alignment)
-                .style(Style::default().bg(color_bg_transparent()).fg(color_text())),
+                .style(Style::default().bg(color_background()).fg(color_text())),
             context_area,
         );
         if editing {
@@ -326,7 +406,7 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
         f.render_widget(
             Paragraph::new(context)
                 .alignment(Alignment::Center)
-                .style(Style::default().bg(color_bg_transparent())),
+                .style(Style::default().bg(color_background())),
             context_area,
         );
         if editing {
@@ -359,10 +439,7 @@ fn settings_tabs_context(app: &AppState) -> Line<'static> {
         spans.push(Span::styled(
             format!(" {} ", tab.label()),
             if active {
-                Style::default()
-                    .fg(color_on_primary())
-                    .bg(color_primary())
-                    .add_modifier(Modifier::BOLD)
+                selection_style()
             } else {
                 Style::default().fg(color_dim())
             },
@@ -427,10 +504,7 @@ fn library_filter_context(app: &AppState) -> Line<'static> {
             let active = *filter == app.library_filter;
             let label = filter.label();
             let style = if active {
-                Style::default()
-                    .fg(color_on_primary())
-                    .bg(color_primary())
-                    .add_modifier(Modifier::BOLD)
+                selection_style()
             } else {
                 Style::default().fg(color_dim())
             };
@@ -829,7 +903,7 @@ fn render_sidebar_details_area(
                     .join(", ");
                 text.push(Line::from(vec![
                     Span::styled("Озвучка: ", Style::default().fg(color_dim())),
-                    Span::styled(s, Style::default().fg(Color::Green)),
+                    Span::styled(s, Style::default().fg(color_success())),
                 ]));
             }
         }
@@ -907,7 +981,7 @@ fn render_sidebar_details_area(
                             .join(", ");
                         text.push(Line::from(vec![
                             Span::styled("Озвучка: ", Style::default().fg(color_dim())),
-                            Span::styled(s, Style::default().fg(Color::Green)),
+                            Span::styled(s, Style::default().fg(color_success())),
                         ]));
                     }
                 }
@@ -1000,7 +1074,7 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
             .style(
                 Style::default()
                     .fg(color_secondary())
-                    .bg(color_bg_transparent())
+                    .bg(color_background())
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(Alignment::Center),
@@ -1048,20 +1122,20 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
                     Style::default().fg(color_dim()),
                 ),
             ]))
-            .style(Style::default().bg(color_bg_transparent()))
+            .style(Style::default().bg(color_background()))
             .alignment(Alignment::Left),
             columns[0],
         );
         // Centered framed keybinds: │ Enter Далі  ·  e Статус │
         f.render_widget(
             Paragraph::new(framed_shortcuts_line(&context_shortcuts(app)))
-                .style(Style::default().bg(color_bg_transparent()))
+                .style(Style::default().bg(color_background()))
                 .alignment(Alignment::Center),
             columns[1],
         );
         // Symmetric empty side keeps the bind strip visually centered.
         f.render_widget(
-            Paragraph::new("").style(Style::default().bg(color_bg_transparent())),
+            Paragraph::new("").style(Style::default().bg(color_background())),
             columns[2],
         );
     }
@@ -1932,7 +2006,7 @@ fn render_library_sidebar_details_area(
                     .join(", ");
                 text.push(Line::from(vec![
                     Span::styled("Озвучка: ", Style::default().fg(color_dim())),
-                    Span::styled(s, Style::default().fg(Color::Green)),
+                    Span::styled(s, Style::default().fg(color_success())),
                 ]));
             }
         }
@@ -2082,7 +2156,7 @@ fn compact_metadata_line(
         values.push((
             format!("★ {rating:.1}"),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(color_warning())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -2356,12 +2430,7 @@ fn create_list<'a>(title: &'a str, items: Vec<ListItem<'a>>, is_focused: bool) -
                 .border_style(border_style)
                 .title_alignment(Alignment::Center),
         )
-        .highlight_style(
-            Style::default()
-                .bg(color_primary())
-                .fg(color_on_primary())
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_style())
         .highlight_symbol(">> ")
 }
 
@@ -2451,50 +2520,65 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
     let list = List::new(items)
         .block(block)
         .highlight_symbol(">> ")
-        .highlight_style(
-            Style::default()
-                .bg(color_primary())
-                .fg(color_on_primary())
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(selection_style());
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(5)])
-        .split(area);
-    let mut items = vec![ListItem::new(Line::from(vec![
-        Span::styled(
-            if app.settings.ansi_themes {
-                "✓ "
-            } else {
-                "  "
-            },
-            Style::default().fg(color_highlight()),
+    let chunks = if area.width >= 86 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(10), Constraint::Min(6)])
+            .split(area)
+    };
+
+    let mode = app.settings.color_mode();
+    let swatch_mode = if mode == ColorMode::AniHubRgb {
+        ColorMode::Ansi256
+    } else {
+        mode
+    };
+    let on_off = |enabled| {
+        if enabled {
+            "увімкнено"
+        } else {
+            "вимкнено"
+        }
+    };
+    let controls_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Оформлення ")
+        .title_alignment(Alignment::Center)
+        .border_style(Style::default().fg(color_highlight()))
+        .padding(Padding::horizontal(2));
+    let controls_width = controls_block.inner(chunks[0]).width.saturating_sub(4) as usize;
+    let mut items = vec![
+        settings_item("Колірний режим", mode.label(), controls_width),
+        settings_item(
+            "Прозорий фон",
+            on_off(app.settings.transparent_background),
+            controls_width,
         ),
-        Span::styled("ANSI-кольори", Style::default().fg(color_text())),
-        Span::styled(
-            if app.settings.ansi_themes {
-                "  увімкнено"
-            } else {
-                "  вимкнено · фірмова AniHub"
-            },
-            Style::default().fg(color_dim()),
-        ),
-    ]))];
+    ];
     items.extend(ThemePreset::ALL.into_iter().map(|theme| {
-        let palette = palette_for(theme);
-        let active = app.settings.ansi_themes && theme == app.settings.theme;
+        let palette = palette_for_mode(swatch_mode, theme);
         ListItem::new(Line::from(vec![
             Span::styled(
-                if active { "✓ " } else { "  " },
+                if theme == app.settings.theme {
+                    "● "
+                } else {
+                    "  "
+                },
                 Style::default().fg(palette.highlight),
             ),
             Span::styled(
-                format!("{:<14}", theme.label()),
-                Style::default().fg(palette.text),
+                format!("{:<11}", theme.label()),
+                Style::default().fg(color_text()),
             ),
             Span::styled("■ ", Style::default().fg(palette.primary)),
             Span::styled("■ ", Style::default().fg(palette.secondary)),
@@ -2508,62 +2592,67 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
     ));
     f.render_stateful_widget(
         List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Теми ")
-                    .title_alignment(Alignment::Center)
-                    .border_style(Style::default().fg(color_highlight()))
-                    .padding(Padding::horizontal(2)),
-            )
+            .block(controls_block)
             .highlight_symbol(">> ")
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+            .highlight_style(selection_style()),
         chunks[0],
         &mut state,
     );
 
     let hovered_theme = selected_theme_preview(app.settings_selected);
-    let (preview_palette, preview_label) = if let Some(theme) = hovered_theme {
-        (palette_for(theme), format!("{} · ANSI", theme.label()))
-    } else if app.settings.ansi_themes {
-        (
-            palette_for(app.settings.theme),
-            format!("{} · ANSI", app.settings.theme.label()),
-        )
+    let preview_theme = hovered_theme.unwrap_or(app.settings.theme);
+    let preview_mode = if hovered_theme.is_some() && mode == ColorMode::AniHubRgb {
+        ColorMode::Ansi256
     } else {
-        (ANIHUB_PALETTE, "AniHub · RGB".to_string())
+        mode
     };
+    let preview_palette = palette_for_mode(preview_mode, preview_theme);
+    let preview_background = if app.settings.transparent_background {
+        Color::Reset
+    } else {
+        preview_palette.dark
+    };
+    let preview_label = format!("{} · {}", preview_theme.label(), preview_mode.label());
     let preview = vec![
         Line::from(vec![
             Span::styled(
                 " 1 · Пошук ",
-                Style::default()
-                    .fg(preview_palette.on_primary)
-                    .bg(preview_palette.primary)
-                    .add_modifier(Modifier::BOLD),
+                selection_style_for(preview_mode, preview_palette),
             ),
             Span::styled("  |  ", Style::default().fg(preview_palette.dim)),
             Span::styled(
-                "Сезон 2 · Серія 4",
+                "2 · Бібліотека",
                 Style::default()
                     .fg(preview_palette.secondary)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
+        Line::from(Span::styled(
+            "Результати пошуку",
+            Style::default()
+                .fg(preview_palette.secondary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![Span::styled(
+            ">> Каґуя-сама: Кохання як війна ",
+            selection_style_for(preview_mode, preview_palette),
+        )]),
         Line::from(vec![
-            Span::styled(">> ", Style::default().fg(preview_palette.highlight)),
-            Span::styled(
-                "Каґуя-сама: Кохання як війна",
-                Style::default().fg(preview_palette.text),
-            ),
+            Span::styled("TV · 2022 · ", Style::default().fg(preview_palette.text)),
+            Span::styled("★ 8.7", Style::default().fg(preview_palette.warning)),
+            Span::styled(" · 12 сер.", Style::default().fg(preview_palette.text)),
         ]),
         Line::from(vec![
             Span::styled(
                 "✓ Переглянуто",
-                Style::default().fg(preview_palette.secondary),
+                Style::default().fg(preview_palette.success),
             ),
             Span::styled("  ·  ", Style::default().fg(preview_palette.dim)),
-            Span::styled("Помилка", Style::default().fg(preview_palette.error)),
+            Span::styled("FanVoxUA", Style::default().fg(preview_palette.highlight)),
+        ]),
+        Line::from(vec![
+            Span::styled("Помилка мережі", Style::default().fg(preview_palette.error)),
+            Span::styled("  ·  підказка", Style::default().fg(preview_palette.dim)),
         ]),
     ];
     f.render_widget(
@@ -2572,7 +2661,8 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .title(format!(" Попередній перегляд · {preview_label} "))
                 .title_alignment(Alignment::Center)
-                .border_style(Style::default().fg(color_dim()))
+                .border_style(Style::default().fg(preview_palette.highlight))
+                .style(Style::default().bg(preview_background))
                 .padding(Padding::horizontal(2)),
         ),
         chunks[1],
@@ -2581,7 +2671,7 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
 
 fn selected_theme_preview(selected_row: usize) -> Option<ThemePreset> {
     selected_row
-        .checked_sub(1)
+        .checked_sub(2)
         .and_then(|index| ThemePreset::ALL.get(index).copied())
 }
 
@@ -2611,12 +2701,7 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
                     .padding(Padding::horizontal(2)),
             )
             .highlight_symbol(">> ")
-            .highlight_style(
-                Style::default()
-                    .bg(color_primary())
-                    .fg(color_on_primary())
-                    .add_modifier(Modifier::BOLD),
-            ),
+            .highlight_style(selection_style()),
         chunks[0],
         &mut state,
     );
@@ -2685,7 +2770,7 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
                     "не знайдено"
                 },
                 Style::default().fg(if app.mpv_available {
-                    Color::Green
+                    color_success()
                 } else {
                     color_error()
                 }),
@@ -2778,10 +2863,7 @@ fn render_settings_choice_popup(f: &mut Frame, app: &AppState) {
             let selected = index == editor.selected;
             let radio = if selected { "●" } else { "○" };
             let style = if selected {
-                Style::default()
-                    .fg(color_on_primary())
-                    .bg(color_primary())
-                    .add_modifier(Modifier::BOLD)
+                selection_style()
             } else {
                 Style::default().fg(color_dim())
             };
@@ -2843,7 +2925,7 @@ fn render_settings_text_popup(f: &mut Frame, app: &AppState) {
     let field = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color_highlight()))
-        .style(Style::default().bg(color_bg_transparent()));
+        .style(Style::default().bg(color_background()));
     let field_inner = field.inner(layout[1]);
     f.render_widget(field, layout[1]);
     f.render_widget(
@@ -3218,10 +3300,7 @@ fn render_status_editor_popup(f: &mut Frame, app: &AppState) {
             let radio = if selected { "●" } else { "○" };
             let label = pad_display(status.label(), label_w);
             let style = if selected {
-                Style::default()
-                    .fg(color_on_primary())
-                    .bg(color_primary())
-                    .add_modifier(Modifier::BOLD)
+                selection_style()
             } else {
                 Style::default().fg(color_dim())
             };
@@ -3260,7 +3339,7 @@ fn render_help_popup(f: &mut Frame) {
             format!(" {label} "),
             Style::default()
                 .bg(color_secondary())
-                .fg(color_bg_dark())
+                .fg(active_palette().dark)
                 .add_modifier(Modifier::BOLD),
         ))
     };
@@ -3354,8 +3433,8 @@ fn dialog_block(title: &str, border: Color, title_color: Color) -> Block<'_> {
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        // Transparent fill so the terminal/app behind shows through (legacy look).
-        .style(Style::default().bg(color_bg_transparent()))
+        // Respect the global transparent/opaque background preference.
+        .style(Style::default().bg(color_background()))
 }
 
 fn action_footer_line(actions: &[(&str, &str, Color)]) -> Line<'static> {
@@ -3560,7 +3639,7 @@ fn release_catalog_items(
                         .fg(color_primary())
                         .add_modifier(Modifier::BOLD),
                 )))
-                .style(Style::default().bg(color_bg_transparent())),
+                .style(Style::default().bg(color_background())),
             );
             previous_extra = Some(is_extra);
         }
@@ -3664,30 +3743,39 @@ mod tests {
 
     #[test]
     fn original_anihub_rgb_theme_remains_the_default_render_palette() {
-        set_active_theme(false, ThemePreset::Amber);
+        set_active_theme(ColorMode::AniHubRgb, ThemePreset::Amber, true);
         assert_eq!(color_primary(), Color::Rgb(147, 51, 234));
         assert_eq!(color_secondary(), Color::Rgb(168, 85, 247));
         assert_eq!(color_highlight(), Color::Rgb(59, 130, 246));
+        assert_eq!(color_background(), Color::Reset);
 
-        set_active_theme(true, ThemePreset::Amber);
+        set_active_theme(ColorMode::Ansi16, ThemePreset::Amber, true);
         assert_eq!(color_primary(), Color::Yellow);
+
+        set_active_theme(ColorMode::Ansi256, ThemePreset::Amber, false);
+        assert_eq!(color_primary(), Color::Indexed(214));
+        assert_eq!(color_background(), Color::Indexed(234));
     }
 
     #[test]
-    fn every_theme_uses_terminal_ansi_colors_instead_of_rgb() {
+    fn ansi_themes_use_terminal_or_indexed_colors_instead_of_rgb() {
         for theme in ThemePreset::ALL {
-            let palette = palette_for(theme);
-            for color in [
-                palette.primary,
-                palette.secondary,
-                palette.highlight,
-                palette.error,
-                palette.dim,
-                palette.text,
-                palette.on_primary,
-                palette.dark,
-            ] {
-                assert!(!matches!(color, Color::Rgb(_, _, _)));
+            for mode in [ColorMode::Ansi16, ColorMode::Ansi256] {
+                let palette = palette_for_mode(mode, theme);
+                for color in [
+                    palette.primary,
+                    palette.secondary,
+                    palette.highlight,
+                    palette.success,
+                    palette.warning,
+                    palette.error,
+                    palette.dim,
+                    palette.text,
+                    palette.on_primary,
+                    palette.dark,
+                ] {
+                    assert!(!matches!(color, Color::Rgb(_, _, _)));
+                }
             }
         }
     }
@@ -3695,10 +3783,22 @@ mod tests {
     #[test]
     fn theme_preview_follows_the_highlighted_row_before_apply() {
         assert_eq!(selected_theme_preview(0), None);
-        assert_eq!(selected_theme_preview(1), Some(ThemePreset::Violet));
-        assert_eq!(selected_theme_preview(4), Some(ThemePreset::Sakura));
-        assert_eq!(selected_theme_preview(6), Some(ThemePreset::Monochrome));
-        assert_eq!(selected_theme_preview(7), None);
+        assert_eq!(selected_theme_preview(1), None);
+        assert_eq!(selected_theme_preview(2), Some(ThemePreset::Violet));
+        assert_eq!(selected_theme_preview(5), Some(ThemePreset::Sakura));
+        assert_eq!(selected_theme_preview(7), Some(ThemePreset::Monochrome));
+        assert_eq!(selected_theme_preview(8), None);
+    }
+
+    #[test]
+    fn theme_hover_preview_does_not_mutate_the_active_palette() {
+        set_active_theme(ColorMode::Ansi16, ThemePreset::Ocean, true);
+        let active_primary = color_primary();
+        let active_background = color_background();
+
+        assert_eq!(selected_theme_preview(5), Some(ThemePreset::Sakura));
+        assert_eq!(color_primary(), active_primary);
+        assert_eq!(color_background(), active_background);
     }
 
     fn release(

@@ -40,6 +40,24 @@ pub enum ThemePreset {
     Monochrome,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ColorMode {
+    #[default]
+    AniHubRgb,
+    Ansi16,
+    Ansi256,
+}
+
+impl ColorMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AniHubRgb => "AniHub RGB",
+            Self::Ansi16 => "ANSI 16",
+            Self::Ansi256 => "ANSI 256",
+        }
+    }
+}
+
 impl ThemePreset {
     pub const ALL: [Self; 6] = [
         Self::Violet,
@@ -154,7 +172,9 @@ pub struct Settings {
     pub default_library_filter: DefaultLibraryFilter,
     pub show_posters: bool,
     pub ansi_themes: bool,
+    pub ansi_256_colors: bool,
     pub theme: ThemePreset,
+    pub transparent_background: bool,
     pub discord_presence: bool,
     /// Read only for migrating settings written before AniHub shipped a shared
     /// Discord application. New settings files omit this obsolete override.
@@ -176,11 +196,39 @@ impl Default for Settings {
             default_library_filter: DefaultLibraryFilter::All,
             show_posters: true,
             ansi_themes: false,
+            ansi_256_colors: false,
             theme: ThemePreset::Violet,
+            transparent_background: true,
             discord_presence: false,
             legacy_discord_application_id: String::new(),
             mpv_path: "mpv".to_string(),
             mpv_extra_args: String::new(),
+        }
+    }
+}
+
+impl Settings {
+    pub const fn color_mode(&self) -> ColorMode {
+        if !self.ansi_themes {
+            ColorMode::AniHubRgb
+        } else if self.ansi_256_colors {
+            ColorMode::Ansi256
+        } else {
+            ColorMode::Ansi16
+        }
+    }
+
+    pub fn cycle_color_mode(&mut self) {
+        match self.color_mode() {
+            ColorMode::AniHubRgb => {
+                self.ansi_themes = true;
+                self.ansi_256_colors = false;
+            }
+            ColorMode::Ansi16 => self.ansi_256_colors = true,
+            ColorMode::Ansi256 => {
+                self.ansi_themes = false;
+                self.ansi_256_colors = false;
+            }
         }
     }
 }
@@ -343,7 +391,10 @@ mod tests {
         assert_eq!(settings.watched_threshold_percent, Some(90));
         assert_eq!(settings.search_mode, SearchMode::Strict);
         assert!(!settings.ansi_themes);
+        assert!(!settings.ansi_256_colors);
+        assert_eq!(settings.color_mode(), ColorMode::AniHubRgb);
         assert_eq!(settings.theme, ThemePreset::Violet);
+        assert!(settings.transparent_background);
         assert!(!settings.discord_presence);
         assert!(settings.legacy_discord_application_id.is_empty());
         assert_eq!(settings.mpv_path, "mpv");
@@ -353,6 +404,17 @@ mod tests {
     fn search_mode_toggles_between_strict_and_extended() {
         assert_eq!(SearchMode::Strict.toggled(), SearchMode::Extended);
         assert_eq!(SearchMode::Extended.toggled(), SearchMode::Strict);
+    }
+
+    #[test]
+    fn color_mode_cycles_rgb_ansi16_and_ansi256() {
+        let mut settings = Settings::default();
+        settings.cycle_color_mode();
+        assert_eq!(settings.color_mode(), ColorMode::Ansi16);
+        settings.cycle_color_mode();
+        assert_eq!(settings.color_mode(), ColorMode::Ansi256);
+        settings.cycle_color_mode();
+        assert_eq!(settings.color_mode(), ColorMode::AniHubRgb);
     }
 
     #[test]
@@ -369,12 +431,16 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.remove("theme");
         object.remove("ansi_themes");
+        object.remove("ansi_256_colors");
+        object.remove("transparent_background");
         object.remove("discord_presence");
         object.remove("discord_application_id");
 
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert!(!settings.ansi_themes);
+        assert!(!settings.ansi_256_colors);
         assert_eq!(settings.theme, ThemePreset::Violet);
+        assert!(settings.transparent_background);
         assert!(!settings.discord_presence);
         assert!(settings.legacy_discord_application_id.is_empty());
     }
