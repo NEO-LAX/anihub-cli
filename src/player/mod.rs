@@ -338,9 +338,16 @@ pub enum MpvMonitorEvent {
     FileLoaded {
         playlist_entry_id: Option<i64>,
     },
+    Navigate(MpvNavigation),
     EndFile(EndFileEvent),
     MonitorFailed(String),
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MpvNavigation {
+    Previous,
+    Next,
 }
 
 #[derive(Default)]
@@ -419,12 +426,30 @@ pub(crate) fn parse_monitor_line(
         }
     } else {
         match value.get("event").and_then(Value::as_str)? {
-            "start-file" => Some(MpvMonitorEvent::FileStarted {
-                playlist_entry_id: event_entry_id(&value),
-            }),
+            "start-file" => {
+                let playlist_entry_id = event_entry_id(&value);
+                // Observed property values belong to the previous file until
+                // mpv publishes fresh values for this playlist entry.
+                state.set_time(None);
+                state.set_duration(None);
+                state.set_entry_id(playlist_entry_id);
+                Some(MpvMonitorEvent::FileStarted { playlist_entry_id })
+            }
             "file-loaded" => Some(MpvMonitorEvent::FileLoaded {
-                playlist_entry_id: event_entry_id(&value),
+                // mpv's file-loaded event normally omits the id; start-file
+                // already stored the matching playlist entry in monitor state.
+                playlist_entry_id: event_entry_id(&value).or_else(|| state.entry_id()),
             }),
+            "client-message" => match value
+                .get("args")
+                .and_then(Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(Value::as_str)
+            {
+                Some("anihub-previous") => Some(MpvMonitorEvent::Navigate(MpvNavigation::Previous)),
+                Some("anihub-next") => Some(MpvMonitorEvent::Navigate(MpvNavigation::Next)),
+                _ => None,
+            },
             "end-file" => Some(MpvMonitorEvent::EndFile(EndFileEvent {
                 reason: EndFileReason::parse(value.get("reason").and_then(Value::as_str)),
                 playlist_entry_id: event_entry_id(&value),
@@ -614,6 +639,12 @@ pub fn build_mpv_args(
         format!("--input-ipc-server={}", endpoint.display()),
         "--idle=yes".to_string(),
         "--keep-open=no".to_string(),
+        "--script-opts-append=osc-custom_button_1_content=⏮".to_string(),
+        "--script-opts-append=osc-custom_button_1_mbtn_left_command=script-message anihub-previous"
+            .to_string(),
+        "--script-opts-append=osc-custom_button_2_content=⏭".to_string(),
+        "--script-opts-append=osc-custom_button_2_mbtn_left_command=script-message anihub-next"
+            .to_string(),
         format!("--force-media-title={} - {}", anime_title, episode_title),
         format!("--referrer={referrer}"),
         "--force-window=yes".to_string(),
@@ -672,14 +703,50 @@ impl MpvSession {
             tx,
         ));
 
-        Ok(Self {
+        let mut session = Self {
             endpoint,
             ipc,
             child: Some(child),
             monitor_rx: Some(monitor_rx),
             monitor: Some(monitor),
             monitor_cancel: cancel,
-        })
+        };
+        if let Err(error) = session.install_anihub_navigation().await {
+            let _ = session.shutdown().await;
+            return Err(error.context("Failed to install AniHub mpv navigation bindings"));
+        }
+        Ok(session)
+    }
+
+    async fn install_anihub_navigation(&self) -> Result<()> {
+        let bindings = [
+            "> script-message anihub-next",
+            "NEXT script-message anihub-next",
+            "MBTN_FORWARD script-message anihub-next",
+            "< script-message anihub-previous",
+            "PREV script-message anihub-previous",
+            "MBTN_BACK script-message anihub-previous",
+        ]
+        .join("\n");
+        self.ipc
+            .send_command(json!([
+                "define-section",
+                "anihub-navigation",
+                bindings,
+                "force"
+            ]))
+            .await?;
+        self.ipc
+            .send_command(json!(["enable-section", "anihub-navigation"]))
+            .await?;
+        self.ipc
+            .send_command(json!([
+                "show-text",
+                "AniHub: < попередня серія · > наступна серія",
+                2500
+            ]))
+            .await?;
+        Ok(())
     }
 
     pub fn try_recv_event(&mut self) -> Result<Option<MpvMonitorEvent>> {
@@ -707,19 +774,32 @@ impl MpvSession {
         anime_title: &str,
         episode_title: &str,
     ) -> Result<()> {
+        let title = format!("{anime_title} - {episode_title}");
         let command =
             if let Some(start_time) = start_time.filter(|time| time.is_finite() && *time > 0.0) {
-                json!(["loadfile", media_url, "replace", -1, {"start": start_time}])
+                json!([
+                    "loadfile",
+                    media_url,
+                    "replace",
+                    -1,
+                    {"start": start_time, "force-media-title": title}
+                ])
             } else {
-                json!(["loadfile", media_url, "replace"])
+                json!([
+                    "loadfile",
+                    media_url,
+                    "replace",
+                    -1,
+                    {"force-media-title": title}
+                ])
             };
         self.ipc.send_command(command).await?;
+        Ok(())
+    }
+
+    pub async fn show_text(&self, message: &str, duration_ms: u32) -> Result<()> {
         self.ipc
-            .send_command(json!([
-                "set_property",
-                "force-media-title",
-                format!("{anime_title} - {episode_title}")
-            ]))
+            .send_command(json!(["show-text", message, duration_ms]))
             .await?;
         Ok(())
     }
@@ -820,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn mpv_args_use_idle_and_non_persistent_keep_open() {
+    fn mpv_args_install_always_available_custom_episode_buttons() {
         let endpoint = IpcEndpoint::for_session(1);
         let args = build_mpv_args(
             &endpoint,
@@ -833,6 +913,20 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--idle=yes"));
         assert!(args.iter().any(|arg| arg == "--keep-open=no"));
         assert!(args.iter().any(|arg| arg == "--start=42"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--script-opts-append=osc-custom_button_1_content=⏮")
+        );
+        assert!(args.iter().any(|arg| {
+            arg == "--script-opts-append=osc-custom_button_1_mbtn_left_command=script-message anihub-previous"
+        }));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--script-opts-append=osc-custom_button_2_content=⏭")
+        );
+        assert!(args.iter().any(|arg| {
+            arg == "--script-opts-append=osc-custom_button_2_mbtn_left_command=script-message anihub-next"
+        }));
     }
 
     #[test]
@@ -870,6 +964,56 @@ mod tests {
                 paused: true,
                 time_pos: Some(754.0),
             })
+        );
+    }
+
+    #[test]
+    fn start_file_clears_properties_from_the_previous_entry() {
+        let mut state = MonitorState::default();
+        let _ = parse_monitor_line(
+            r#"{"event":"property-change","name":"time-pos","data":754.0}"#,
+            &mut state,
+        );
+        let _ = parse_monitor_line(
+            r#"{"event":"property-change","name":"duration","data":1200.0}"#,
+            &mut state,
+        );
+        assert_eq!(
+            parse_monitor_line(
+                r#"{"event":"start-file","playlist_entry_id":22}"#,
+                &mut state,
+            ),
+            Some(MpvMonitorEvent::FileStarted {
+                playlist_entry_id: Some(22),
+            })
+        );
+        assert_eq!(state.time_pos, None);
+        assert_eq!(state.duration, None);
+        assert_eq!(state.playlist_entry_id, Some(22));
+        assert_eq!(
+            parse_monitor_line(r#"{"event":"file-loaded"}"#, &mut state),
+            Some(MpvMonitorEvent::FileLoaded {
+                playlist_entry_id: Some(22),
+            })
+        );
+    }
+
+    #[test]
+    fn monitor_parses_typed_anihub_navigation_messages() {
+        let mut state = MonitorState::default();
+        assert_eq!(
+            parse_monitor_line(
+                r#"{"event":"client-message","args":["anihub-previous"]}"#,
+                &mut state,
+            ),
+            Some(MpvMonitorEvent::Navigate(MpvNavigation::Previous))
+        );
+        assert_eq!(
+            parse_monitor_line(
+                r#"{"event":"client-message","args":["anihub-next"]}"#,
+                &mut state,
+            ),
+            Some(MpvMonitorEvent::Navigate(MpvNavigation::Next))
         );
     }
 

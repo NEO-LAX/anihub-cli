@@ -113,6 +113,15 @@ brew install mpv
 
 No separate command-line stream extractor is required: Ashdi page parsing is implemented in Rust.
 
+While an Ashdi episode is playing, use `<` / `>` (or the media
+`PREVIOUS` / `NEXT` keys and mouse back/forward buttons) to move through the
+complete loaded episode timeline. With mpv 0.41 or newer, AniHub CLI also adds
+always-available `⏮` / `⏭` buttons to the standard OSC. Opening episode 6
+therefore keeps both episodes 1–5 and the later episodes reachable. AniHub CLI
+resolves only the selected stream and keeps already visited streams in memory
+for the lifetime of that mpv session. Manual navigation remains available
+when automatic next-episode playback is disabled.
+
 ## Basic controls
 
 The footer shows shortcuts for the current screen. Press `?` or `h` outside search input to open the complete built-in help.

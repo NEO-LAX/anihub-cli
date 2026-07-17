@@ -61,7 +61,7 @@ struct ResourceCoordinator {
     poster_requests: HashMap<RequestId, u32>,
     posters_in_flight: HashSet<u32>,
     pending_continue: Option<PendingContinue>,
-    ready_playback: Option<(PlayTarget, Vec<PlayTarget>)>,
+    ready_playback: Option<PlaybackTimeline>,
     cached_search_used: Option<(String, bool)>,
     poster_candidate: Option<(u32, Instant)>,
     force_reload: bool,
@@ -255,13 +255,12 @@ impl ResourceCoordinator {
             studio_name: resolved.studio_name,
             referrer: "https://ashdi.vip/".to_string(),
         };
-        let queue = build_active_playback_queue(app, &target);
-        self.ready_playback = Some((target, queue));
+        self.ready_playback = Some(build_active_playback_timeline(app, &target));
         self.pending_continue = None;
         app.clear_activity();
     }
 
-    fn take_ready_playback(&mut self) -> Option<(PlayTarget, Vec<PlayTarget>)> {
+    fn take_ready_playback(&mut self) -> Option<PlaybackTimeline> {
         self.ready_playback.take()
     }
 
@@ -928,12 +927,12 @@ async fn main() -> Result<()> {
             app.finish_update_check(result);
         }
 
-        if let Some((mut target, mut queue)) = resources.take_ready_playback() {
-            if let Err(error) = apply_playback_settings(&app, &mut target, &mut queue) {
+        if let Some(mut timeline) = resources.take_ready_playback() {
+            if let Err(error) = apply_playback_settings(&app, &mut timeline) {
                 app.set_error_status(format!("Помилка відтворення: {error}"));
             } else {
-                app.prepare_playback(&target);
-                if let Err(error) = playback.play(target, queue).await {
+                app.prepare_playback(timeline.current());
+                if let Err(error) = playback.play(timeline, app.settings.autoplay_next).await {
                     app.set_error_status(format!("Помилка відтворення: {error}"));
                 }
             }
@@ -955,13 +954,13 @@ async fn main() -> Result<()> {
 
         if app.play_episode {
             app.play_episode = false;
-            if let Some(mut target) = selected_play_target(&app) {
-                let mut queue = build_active_playback_queue(&app, &target);
-                if let Err(error) = apply_playback_settings(&app, &mut target, &mut queue) {
+            if let Some(target) = selected_play_target(&app) {
+                let mut timeline = build_active_playback_timeline(&app, &target);
+                if let Err(error) = apply_playback_settings(&app, &mut timeline) {
                     app.set_error_status(format!("Помилка відтворення: {error}"));
                 } else {
-                    app.prepare_playback(&target);
-                    if let Err(error) = playback.play(target, queue).await {
+                    app.prepare_playback(timeline.current());
+                    if let Err(error) = playback.play(timeline, app.settings.autoplay_next).await {
                         app.set_error_status(format!("Помилка відтворення: {error}"));
                     }
                 }
@@ -1016,27 +1015,17 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
     ));
 }
 
-fn apply_playback_settings(
-    app: &AppState,
-    target: &mut PlayTarget,
-    queue: &mut Vec<PlayTarget>,
-) -> Result<()> {
+fn apply_playback_settings(app: &AppState, timeline: &mut PlaybackTimeline) -> Result<()> {
     player::configure_mpv(&app.settings.mpv_path, &app.settings.mpv_extra_args)?;
     if !app.settings.resume_from_timestamp {
-        target.start_time = None;
-        for queued in queue.iter_mut() {
-            queued.start_time = None;
-        }
-    }
-    if !app.settings.autoplay_next {
-        queue.clear();
+        timeline.clear_resume_positions();
     }
     Ok(())
 }
 
-fn build_active_playback_queue(app: &AppState, target: &PlayTarget) -> Vec<PlayTarget> {
+fn build_active_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
     let Some(catalog) = app.selected_franchise_catalog() else {
-        return build_playback_queue(app, target);
+        return build_playback_timeline(app, target);
     };
 
     let loaded = catalog
@@ -1065,7 +1054,7 @@ fn build_active_playback_queue(app: &AppState, target: &PlayTarget) -> Vec<PlayT
             sources,
         })
         .collect::<Vec<_>>();
-    build_release_playback_queue(target, &timeline)
+    build_release_playback_timeline(target, &timeline)
 }
 
 fn persist_playback_event(
@@ -1086,7 +1075,9 @@ fn persist_playback_event(
                 duration: 0.0,
                 paused: false,
             });
-            persisted_positions.entry(session_id).or_insert(0.0);
+            // One mpv process can now visit several logical episodes. Reset
+            // the persistence debounce for every selected timeline entry.
+            persisted_positions.insert(session_id, target.start_time.unwrap_or(0.0));
         }
         PlaybackEvent::ProgressSnapshot(snapshot) => {
             if let Some(now_playing) = app.now_playing.as_mut() {
@@ -1179,6 +1170,10 @@ fn persist_playback_event(
             app.now_playing = None;
             app.clear_activity();
             app.set_error_status(format!("Помилка відтворення: {message}"));
+        }
+        PlaybackEvent::NavigationFailed { message, .. } => {
+            app.clear_activity();
+            app.set_error_status(format!("Не вдалося переключити серію: {message}"));
         }
         PlaybackEvent::EndFile { .. } => {}
     }
