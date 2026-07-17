@@ -81,6 +81,12 @@ impl MetadataCache {
             .cloned()
     }
 
+    /// Iterate over persistent search payloads so callers can reconstruct a
+    /// franchise that was already discovered before the current process.
+    pub fn searches(&self) -> impl Iterator<Item = &CachedSearch> {
+        self.data.searches.values()
+    }
+
     pub fn put_search(
         &mut self,
         query: &str,

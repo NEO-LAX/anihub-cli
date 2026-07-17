@@ -471,6 +471,8 @@ impl AppState {
         let settings_store = SettingsStore::new()?;
         let settings = settings_store.load()?;
         let metadata_cache = MetadataCache::new(settings_store.data_dir())?;
+        let cached_library_catalogs =
+            cached_franchise_catalogs_for_history(&metadata_cache, &history);
         let poster_disk_cache = PosterCache::new(settings_store.data_dir())?;
         let details_cache = moka::sync::Cache::builder().max_capacity(500).build();
         for (anime_id, details) in metadata_cache.details() {
@@ -489,7 +491,10 @@ impl AppState {
 
             search_results: Vec::new(),
             franchise_groups: Vec::new(),
-            franchise_catalogs: Vec::new(),
+            // Cached searches retain AniList relation graphs. Keeping the
+            // catalogs that intersect history lets the first Library open
+            // restore sibling seasons before another network search.
+            franchise_catalogs: cached_library_catalogs,
             anilist_media: Vec::new(),
             selected_group_index: None,
             selected_result_index: None,
@@ -2772,7 +2777,7 @@ impl AppState {
             return;
         }
 
-        self.hydrate_legacy_library_metadata();
+        self.hydrate_library_catalog_metadata();
         self.library_all_items = build_library_items(&self.history);
         self.library_items.clear();
         self.mode = AppMode::Library;
@@ -2782,28 +2787,11 @@ impl AppState {
         }
     }
 
-    /// Older v2 records only stored an AniHub ID and a franchise title. When a
-    /// matching catalog is already available, enrich those records in place so
-    /// the library can distinguish seasons, cours, films and extras.
-    fn hydrate_legacy_library_metadata(&mut self) {
-        let updates = self
-            .franchise_catalogs
-            .iter()
-            .flat_map(|catalog| {
-                catalog.releases.iter().filter_map(|release| {
-                    let anime_id = release.anihub_id?;
-                    let record = self.history.library.get(&anime_id)?;
-                    (record.release.is_none()
-                        && release.availability == ReleaseAvailability::Available)
-                        .then(|| AnimeStatusUpdate {
-                            anime_id,
-                            title: catalog.canonical_title.clone(),
-                            status: record.status,
-                            release: Some(library_metadata_for_release(catalog, release)),
-                        })
-                })
-            })
-            .collect::<Vec<_>>();
+    /// Persist the complete available franchise whenever one of its releases
+    /// already belongs to the library or has playback progress. This both
+    /// upgrades old records and keeps future restarts independent of search.
+    pub(crate) fn hydrate_library_catalog_metadata(&mut self) {
+        let updates = library_catalog_updates(&self.history, &self.franchise_catalogs);
         if updates.is_empty() {
             return;
         }
@@ -3612,6 +3600,51 @@ impl AppState {
     }
 }
 
+fn cached_franchise_catalogs_for_history(
+    cache: &MetadataCache,
+    history: &AppHistory,
+) -> Vec<FranchiseCatalog> {
+    let history_ids = history
+        .progress
+        .values()
+        .map(|progress| progress.anime_id)
+        .chain(history.library.keys().copied())
+        .collect::<HashSet<_>>();
+    if history_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = BTreeMap::<u32, AnimeItem>::new();
+    let mut media = BTreeMap::<u32, AniListMedia>::new();
+    for cached in cache.searches().filter(|cached| {
+        cached
+            .items
+            .iter()
+            .any(|item| history_ids.contains(&item.id))
+    }) {
+        for item in &cached.items {
+            items.entry(item.id).or_insert_with(|| item.clone());
+        }
+        for node in &cached.anilist_media {
+            media.entry(node.id).or_insert_with(|| node.clone());
+        }
+    }
+
+    crate::api::build_franchise_catalogs(
+        &items.into_values().collect::<Vec<_>>(),
+        &media.into_values().collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .filter(|catalog| {
+        catalog.releases.iter().any(|release| {
+            release
+                .anihub_id
+                .is_some_and(|anime_id| history_ids.contains(&anime_id))
+        })
+    })
+    .collect()
+}
+
 fn library_metadata_for_release(
     catalog: &FranchiseCatalog,
     release: &ReleaseEntry,
@@ -3640,6 +3673,102 @@ fn library_metadata_for_release(
         part: release.part,
         episodes_count: release.available_episodes.or(release.episodes_count),
         first_episode: Some(offset.saturating_add(1)),
+    }
+}
+
+fn library_catalog_updates(
+    history: &AppHistory,
+    catalogs: &[FranchiseCatalog],
+) -> Vec<AnimeStatusUpdate> {
+    let mut updates = BTreeMap::<u32, AnimeStatusUpdate>::new();
+
+    for catalog in catalogs {
+        let available = catalog
+            .releases
+            .iter()
+            .filter(|release| release.availability == ReleaseAvailability::Available)
+            .filter_map(|release| release.anihub_id.map(|anime_id| (anime_id, release)))
+            .collect::<Vec<_>>();
+        if available.is_empty() {
+            continue;
+        }
+
+        let has_progress = available.iter().any(|(anime_id, _)| {
+            history
+                .progress
+                .values()
+                .any(|progress| progress.anime_id == *anime_id)
+        });
+        let records = available
+            .iter()
+            .filter_map(|(anime_id, _)| history.library.get(anime_id))
+            .collect::<Vec<_>>();
+        let has_active_record = records
+            .iter()
+            .any(|record| record.status != AnimeStatus::NotAdded);
+        let explicitly_removed = !has_active_record
+            && records
+                .iter()
+                .any(|record| record.status == AnimeStatus::NotAdded);
+        if explicitly_removed || (!has_progress && !has_active_record) {
+            continue;
+        }
+
+        for (anime_id, release) in available {
+            let metadata = library_metadata_for_release(catalog, release);
+            let existing = history.library.get(&anime_id);
+            let status = existing.map_or_else(
+                || inferred_release_status(history, anime_id, &metadata),
+                |record| record.status,
+            );
+            if existing.is_some_and(|record| {
+                record.title == catalog.canonical_title
+                    && record.release.as_ref() == Some(&metadata)
+            }) {
+                continue;
+            }
+            updates.insert(
+                anime_id,
+                AnimeStatusUpdate {
+                    anime_id,
+                    title: catalog.canonical_title.clone(),
+                    status,
+                    release: Some(metadata),
+                },
+            );
+        }
+    }
+
+    updates.into_values().collect()
+}
+
+fn inferred_release_status(
+    history: &AppHistory,
+    anime_id: u32,
+    metadata: &LibraryReleaseMetadata,
+) -> AnimeStatus {
+    let progress = history
+        .progress
+        .values()
+        .filter(|progress| progress.anime_id == anime_id)
+        .collect::<Vec<_>>();
+    if progress.is_empty() {
+        return AnimeStatus::Planned;
+    }
+
+    let watched = progress
+        .iter()
+        .filter(|progress| progress.watched)
+        .map(|progress| progress.episode)
+        .collect::<HashSet<_>>()
+        .len() as u32;
+    if metadata
+        .episodes_count
+        .is_some_and(|episodes| episodes > 0 && watched >= episodes)
+    {
+        AnimeStatus::Completed
+    } else {
+        AnimeStatus::Watching
     }
 }
 
@@ -3910,6 +4039,40 @@ fn anime_is_fully_watched(anime: &LibraryAnimeEntry) -> bool {
 mod tests {
     use super::*;
 
+    fn season_release(anime_id: u32, season: u32, title: &str, episodes: u32) -> ReleaseEntry {
+        ReleaseEntry {
+            anihub_id: Some(anime_id),
+            anilist_id: Some(anime_id + 10_000),
+            title: title.to_string(),
+            anime_type: "TV".to_string(),
+            year: Some(2014 + season),
+            poster_url: None,
+            episodes_count: Some(episodes),
+            available_episodes: Some(episodes),
+            description: None,
+            rating: None,
+            genres: None,
+            dubbing_studios: None,
+            conceptual_season: Some(season),
+            part: Some(1),
+            classification: ReleaseClassification::MainlineSeason,
+            availability: ReleaseAvailability::Available,
+        }
+    }
+
+    fn two_season_catalog() -> FranchiseCatalog {
+        FranchiseCatalog {
+            anchor_anilist_id: Some(10_001),
+            canonical_title: "Клас убивць".to_string(),
+            canonical_poster_url: None,
+            unresolved_anilist_ids: Vec::new(),
+            releases: vec![
+                season_release(1, 1, "Клас убивць", 22),
+                season_release(2, 2, "Клас убивць - 2 сезон", 25),
+            ],
+        }
+    }
+
     #[test]
     fn settings_tabs_cycle_in_both_directions() {
         assert_eq!(SettingsTab::General.next(), SettingsTab::Themes);
@@ -4115,6 +4278,79 @@ mod tests {
         assert_eq!(items[0].seasons[1].season, 2);
         assert_eq!(items[0].seasons[2].kind, LibraryReleaseKind::Movie);
         assert_eq!(items[0].status, AnimeStatus::Completed);
+    }
+
+    #[test]
+    fn cached_catalog_materializes_sibling_season_from_second_season_progress() {
+        let mut history = AppHistory::default();
+        history.progress.insert(
+            "2:2:20:FanWoxUA".to_string(),
+            WatchProgress {
+                anime_id: 2,
+                anime_title: "Клас убивць - 2 сезон".to_string(),
+                season: 2,
+                episode: 20,
+                studio_name: "FanWoxUA".to_string(),
+                timestamp: 25.0,
+                duration: 1380.0,
+                watched: false,
+                updated_at: 10,
+            },
+        );
+
+        let updates = library_catalog_updates(&history, &[two_season_catalog()]);
+        assert_eq!(updates.len(), 2);
+        for update in updates {
+            history.library.insert(
+                update.anime_id,
+                crate::storage::history::AnimeLibraryRecord {
+                    title: update.title,
+                    status: update.status,
+                    updated_at: 11,
+                    release: update.release,
+                },
+            );
+        }
+
+        let items = build_library_items(&history);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].anime_title, "Клас убивць");
+        assert_eq!(items[0].anime_ids, vec![1, 2]);
+        assert_eq!(items[0].seasons.len(), 2);
+        assert_eq!(items[0].seasons[0].season, 1);
+        assert_eq!(items[0].seasons[0].status, AnimeStatus::Planned);
+        assert_eq!(items[0].seasons[1].season, 2);
+        assert_eq!(items[0].seasons[1].status, AnimeStatus::Watching);
+    }
+
+    #[test]
+    fn cached_catalog_does_not_resurrect_explicitly_removed_franchise() {
+        let mut history = AppHistory::default();
+        history.progress.insert(
+            "2:2:20:FanWoxUA".to_string(),
+            WatchProgress {
+                anime_id: 2,
+                anime_title: "Клас убивць - 2 сезон".to_string(),
+                season: 2,
+                episode: 20,
+                studio_name: "FanWoxUA".to_string(),
+                timestamp: 25.0,
+                duration: 1380.0,
+                watched: false,
+                updated_at: 10,
+            },
+        );
+        history.library.insert(
+            2,
+            crate::storage::history::AnimeLibraryRecord {
+                title: "Клас убивць".to_string(),
+                status: AnimeStatus::NotAdded,
+                updated_at: 11,
+                release: None,
+            },
+        );
+
+        assert!(library_catalog_updates(&history, &[two_season_catalog()]).is_empty());
     }
 
     #[test]

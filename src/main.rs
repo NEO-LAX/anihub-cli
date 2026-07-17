@@ -1116,6 +1116,10 @@ fn persist_playback_event(
                     Ok(history) => {
                         app.history = history;
                         app.rebuild_history_indexes();
+                        // The active search catalog knows the whole AniList
+                        // franchise. Persist it on the first progress write so
+                        // Library can still show sibling seasons after restart.
+                        app.hydrate_library_catalog_metadata();
                         persisted_positions.insert(snapshot.session_id, snapshot.position);
                     }
                     Err(error) => {
@@ -1158,6 +1162,7 @@ fn persist_playback_event(
                 Ok(history) => {
                     app.history = history;
                     app.rebuild_history_indexes();
+                    app.hydrate_library_catalog_metadata();
                 }
                 Err(error) => {
                     app.set_error_status(format!("Не вдалося позначити серію: {error}"));
