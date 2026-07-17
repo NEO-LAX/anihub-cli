@@ -1381,14 +1381,19 @@ impl AppState {
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if key.code == KeyCode::Char('c')
+                    // Layout-independent shortcut key (ЙЦУКЕН → QWERTY). Typed
+                    // text in search/settings keeps the raw character below.
+                    let shortcut = super::keys::shortcut_code(key.code);
+                    let raw = key.code;
+
+                    if shortcut == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         self.should_quit = true;
                         return Ok(());
                     }
                     if matches!(self.status_message, Some((_, StatusKind::Error))) {
-                        match key.code {
+                        match shortcut {
                             KeyCode::Char('r') if self.status_retry_available => {
                                 self.clear_status();
                                 self.retry_requested = true;
@@ -1404,62 +1409,64 @@ impl AppState {
                         return Ok(());
                     }
 
-                    if self.handle_moonanime_browser_prompt(key.code) {
+                    if self.handle_moonanime_browser_prompt(shortcut) {
                         return Ok(());
                     }
 
-                    if self.handle_status_editor(key.code) {
+                    if self.handle_status_editor(shortcut) {
                         return Ok(());
                     }
 
-                    if self.handle_pending_delete_confirmation(key.code) {
+                    if self.handle_pending_delete_confirmation(shortcut) {
                         return Ok(());
                     }
 
-                    if self.handle_clear_library_confirmation(key.code) {
+                    if self.handle_clear_library_confirmation(shortcut) {
                         return Ok(());
                     }
 
-                    if self.handle_settings_update_popup(key.code) {
+                    if self.handle_settings_update_popup(shortcut) {
                         return Ok(());
                     }
 
-                    if self.handle_settings_threshold(key.code) {
+                    if self.handle_settings_threshold(shortcut) {
                         return Ok(());
                     }
 
-                    if self.handle_settings_choice(key.code) {
+                    if self.handle_settings_choice(shortcut) {
                         return Ok(());
                     }
 
-                    if self.handle_settings_input(key.code) {
+                    // Path/args editors must receive the raw glyph so non-Latin
+                    // paths and arguments can still be typed.
+                    if self.handle_settings_input(raw) {
                         return Ok(());
                     }
 
-                    if self.handle_primary_tab_key(key.code, key.modifiers) {
+                    if self.handle_primary_tab_key(shortcut, key.modifiers) {
                         return Ok(());
                     }
                     if self.library_search_editing {
-                        self.handle_library_search_key(key.code);
+                        self.handle_library_search_key(raw);
                         return Ok(());
                     }
                     self.clear_info_status();
 
                     if self.mode != AppMode::SearchInput
-                        && (key.code == KeyCode::Char('?') || key.code == KeyCode::Char('h'))
+                        && (shortcut == KeyCode::Char('?') || shortcut == KeyCode::Char('h'))
                     {
                         self.show_help = true;
                         return Ok(());
                     }
 
                     if !matches!(self.mode, AppMode::SearchInput | AppMode::Settings)
-                        && self.handle_list_navigation_key(key.code)
+                        && self.handle_list_navigation_key(shortcut)
                     {
                         return Ok(());
                     }
 
                     match self.mode {
-                        AppMode::Normal => match key.code {
+                        AppMode::Normal => match shortcut {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char('c') => self.request_continue(),
                             KeyCode::Char(' ') => self.toggle_search_selection_watched(),
@@ -1481,7 +1488,7 @@ impl AppState {
                             KeyCode::Enter => self.handle_enter(),
                             _ => {}
                         },
-                        AppMode::SearchInput => match key.code {
+                        AppMode::SearchInput => match raw {
                             KeyCode::Enter => {
                                 self.mode = AppMode::Normal;
                                 let query = self.search_query.trim().to_string();
@@ -1517,7 +1524,7 @@ impl AppState {
                             }
                             _ => {}
                         },
-                        AppMode::Library => match key.code {
+                        AppMode::Library => match shortcut {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char('c') => self.request_continue(),
                             KeyCode::Char('d') => self.delete_library_selection(),
@@ -1541,7 +1548,7 @@ impl AppState {
                             KeyCode::Right | KeyCode::Enter => self.enter_library_season(),
                             _ => {}
                         },
-                        AppMode::LibrarySeason => match key.code {
+                        AppMode::LibrarySeason => match shortcut {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char(' ') => self.toggle_library_selection_watched(),
                             KeyCode::Char('e') => self.open_status_editor(),
@@ -1556,7 +1563,7 @@ impl AppState {
                             KeyCode::Right | KeyCode::Enter => self.enter_library_dubbing(),
                             _ => {}
                         },
-                        AppMode::LibraryDubbing => match key.code {
+                        AppMode::LibraryDubbing => match shortcut {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char(' ') => self.toggle_library_selection_watched(),
                             KeyCode::Char('e') => self.open_status_editor(),
@@ -1571,7 +1578,7 @@ impl AppState {
                             KeyCode::Right | KeyCode::Enter => self.enter_library_episode(),
                             _ => {}
                         },
-                        AppMode::LibraryEpisode => match key.code {
+                        AppMode::LibraryEpisode => match shortcut {
                             KeyCode::Char('q') => self.should_quit = true,
                             KeyCode::Char(' ') => self.toggle_library_selection_watched(),
                             KeyCode::Backspace => self.clear_selected_episode_timestamp(),
@@ -1587,7 +1594,7 @@ impl AppState {
                             KeyCode::Enter => self.activate_selected_episode(),
                             _ => {}
                         },
-                        AppMode::Settings => self.handle_settings_key(key.code),
+                        AppMode::Settings => self.handle_settings_key(shortcut),
                     }
                 }
             }
