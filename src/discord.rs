@@ -9,8 +9,8 @@ const APPLICATION_ID: u64 = 1_527_419_150_761_328_810;
 const IMAGE_PROXY: &str = "https://wsrv.nl/";
 const MAX_ACTIVITY_ASSET_BYTES: usize = 256;
 /// How often the TUI should re-push watching progress so Discord stays aligned
-/// after seeks/pause and duration discovery. Discord itself animates the bar
-/// between start/end timestamps without per-second updates.
+/// after seeks and duration discovery. While playing, Discord animates the bar
+/// between start/end without per-second updates.
 pub const PRESENCE_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,18 +42,21 @@ impl PresenceMedia {
         }
     }
 
-    /// Discord animates between `start` and `end` wall-clock timestamps.
-    /// `start = now - position` so the bar sits at the current cursor; with an
-    /// `end` Discord draws the Spotify-like remaining-time progress bar.
+    /// Spotify-style progress while **playing**: `start = now - position`,
+    /// optional `end = start + duration`.
     ///
-    /// When paused we still emit both timestamps — callers re-sync every
-    /// [`PRESENCE_SYNC_INTERVAL`] so the bar does not drift while frozen.
-    pub fn timestamps_at(&self, now_unix: u64) -> (u64, Option<u64>) {
+    /// While **paused**, returns `None` so the activity has no timestamps —
+    /// Discord would keep advancing any start/end pair on the wall clock, and
+    /// SET_ACTIVITY is rate-limited (~15s), so a frozen bar is not practical.
+    pub fn timestamps_at(&self, now_unix: u64) -> Option<(u64, Option<u64>)> {
+        if self.paused {
+            return None;
+        }
         let start = now_unix.saturating_sub(self.position_secs);
         let end = self
             .duration_secs
             .map(|duration| start.saturating_add(duration));
-        (start, end)
+        Some((start, end))
     }
 }
 
@@ -336,18 +339,19 @@ fn queue_activity(client: &mut Client, activity: &PresenceActivity, started_at: 
             .details(activity.title.clone())
             .state(activity.state.clone());
         let builder = match &activity.media {
-            Some(media) => {
-                let (start, end) = media.timestamps_at(unix_now());
-                builder.timestamps(|timestamps| {
+            Some(media) => match media.timestamps_at(unix_now()) {
+                Some((start, end)) => builder.timestamps(|timestamps| {
                     let timestamps = timestamps.start(start);
                     if let Some(end) = end {
                         timestamps.end(end)
                     } else {
                         timestamps
                     }
-                })
-            }
-            // Idle (or media without a cursor) keeps a simple session timer.
+                }),
+                // Paused: no timestamps → Discord drops the progress bar.
+                None => builder,
+            },
+            // Idle keeps a simple session timer.
             None => builder.timestamps(|timestamps| timestamps.start(started_at)),
         };
         if let Some(poster_url) = &activity.poster_url {
@@ -468,19 +472,25 @@ mod tests {
         let paused = PresenceActivity::watching("Каґуя", 2, 4, "Dzuski", None, 17.4, 142.0, true);
         assert_eq!(paused.state, "Сезон 2 · Серія 4 · Dzuski · Пауза");
         assert!(paused.media.as_ref().is_some_and(|media| media.paused));
+        assert_eq!(paused.media.as_ref().unwrap().timestamps_at(1_000_000), None);
     }
 
     #[test]
-    fn media_timestamps_anchor_progress_like_spotify() {
+    fn media_timestamps_anchor_progress_like_spotify_only_while_playing() {
         let media = PresenceMedia::from_playback(17.4, 142.2, false);
-        let (start, end) = media.timestamps_at(1_000_000);
+        let (start, end) = media.timestamps_at(1_000_000).expect("playing has timestamps");
         assert_eq!(start, 1_000_000 - 17);
         assert_eq!(end, Some(1_000_000 - 17 + 143));
 
         let unknown_duration = PresenceMedia::from_playback(8.0, 0.0, false);
-        let (start, end) = unknown_duration.timestamps_at(500);
+        let (start, end) = unknown_duration
+            .timestamps_at(500)
+            .expect("playing has timestamps");
         assert_eq!(start, 492);
         assert_eq!(end, None);
+
+        let paused = PresenceMedia::from_playback(17.4, 142.2, true);
+        assert_eq!(paused.timestamps_at(1_000_000), None);
     }
 
     #[test]
