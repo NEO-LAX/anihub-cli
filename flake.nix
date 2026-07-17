@@ -18,7 +18,7 @@
       pkgs = nixpkgs.legacyPackages.${system};
       anihub-cli = pkgs.rustPlatform.buildRustPackage {
         pname = "anihub-cli";
-        version = "0.7.0";
+        version = "0.7.1";
         src = pkgs.lib.cleanSource ./.;
         cargoLock.lockFile = ./Cargo.lock;
 
