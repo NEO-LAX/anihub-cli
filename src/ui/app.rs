@@ -476,6 +476,9 @@ pub struct AppState {
     pub pending_delete_confirmation: Option<(Vec<u32>, String)>,
     pub pending_library_watched_confirmation: Option<LibraryWatchedConfirmation>,
     pub clear_library_confirmation: bool,
+    /// Set when Library becomes visible; consumed by the background resource
+    /// coordinator without affecting the active selection generation.
+    pub library_refresh_requested: bool,
     pub status_editor: Option<AnimeStatusEditor>,
 
     pub settings: Settings,
@@ -619,6 +622,7 @@ impl AppState {
             pending_delete_confirmation: None,
             pending_library_watched_confirmation: None,
             clear_library_confirmation: false,
+            library_refresh_requested: false,
             status_editor: None,
 
             settings,
@@ -2439,10 +2443,43 @@ impl AppState {
         self.library_all_items = build_library_items(&self.history);
         self.library_items.clear();
         self.mode = AppMode::Library;
+        self.library_refresh_requested = true;
         self.apply_library_filter();
         if self.library_all_items.is_empty() {
             self.set_info_status("Бібліотека порожня — додайте аніме через e, або / для пошуку");
         }
+    }
+
+    pub fn take_library_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.library_refresh_requested)
+    }
+
+    pub fn library_refresh_queries(&self) -> Vec<String> {
+        let mut queries = self
+            .library_all_items
+            .iter()
+            .map(|anime| anime.anime_title.trim().to_string())
+            .filter(|title| !title.is_empty())
+            .collect::<Vec<_>>();
+        queries.sort_by_key(|title| title.to_lowercase());
+        queries.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        queries
+    }
+
+    pub fn apply_library_refresh_catalogs(
+        &mut self,
+        catalogs: &[FranchiseCatalog],
+    ) -> anyhow::Result<()> {
+        let updates = library_catalog_updates(&self.history, catalogs);
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.history = self.storage.set_anime_statuses(&updates)?;
+        self.rebuild_history_indexes();
+        if self.is_library_mode() {
+            self.reload_library_after_mutation();
+        }
+        Ok(())
     }
 
     /// Persist the complete available franchise whenever one of its releases
@@ -3973,6 +4010,48 @@ mod tests {
         assert_eq!(items[0].seasons[0].status, AnimeStatus::Planned);
         assert_eq!(items[0].seasons[1].season, 2);
         assert_eq!(items[0].seasons[1].status, AnimeStatus::Watching);
+    }
+
+    #[test]
+    fn refreshed_catalog_adds_new_seasons_and_movies_as_planned() {
+        let mut history = AppHistory::default();
+        history.library.insert(
+            1,
+            crate::storage::history::AnimeLibraryRecord {
+                title: "Клас убивць".to_string(),
+                status: AnimeStatus::Watching,
+                updated_at: 10,
+                release: Some(library_metadata_for_release(
+                    &two_season_catalog(),
+                    &season_release(1, 1, "Клас убивць", 22),
+                )),
+            },
+        );
+        let mut catalog = two_season_catalog();
+        let mut movie = season_release(3, 2, "Клас убивць: Фільм", 1);
+        movie.anilist_id = Some(10_003);
+        movie.classification = ReleaseClassification::MainlineMovie;
+        catalog.releases.push(movie);
+
+        let updates = library_catalog_updates(&history, &[catalog]);
+        assert_eq!(updates.len(), 2);
+        assert!(!updates.iter().any(|update| update.anime_id == 1));
+        assert_eq!(
+            updates
+                .iter()
+                .find(|update| update.anime_id == 2)
+                .map(|update| update.status),
+            Some(AnimeStatus::Planned)
+        );
+        let movie = updates
+            .iter()
+            .find(|update| update.anime_id == 3)
+            .expect("new movie update");
+        assert_eq!(movie.status, AnimeStatus::Planned);
+        assert_eq!(
+            movie.release.as_ref().map(|release| release.kind),
+            Some(LibraryReleaseKind::Movie)
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod api;
 mod cache;
 mod discord;
+mod library_refresh;
 mod platform;
 mod playback;
 mod player;
@@ -65,6 +66,7 @@ struct ResourceCoordinator {
     cached_search_used: Option<(String, bool)>,
     poster_candidate: Option<(u32, Instant)>,
     force_reload: bool,
+    library_refresh: library_refresh::LibraryRefreshCoordinator,
 }
 
 impl ResourceCoordinator {
@@ -80,6 +82,7 @@ impl ResourceCoordinator {
             cached_search_used: None,
             poster_candidate: None,
             force_reload: false,
+            library_refresh: library_refresh::LibraryRefreshCoordinator::default(),
         }
     }
 
@@ -100,6 +103,12 @@ impl ResourceCoordinator {
                 self.start_context(app, context).await;
             }
         }
+
+        // Foreground details/sources are submitted before background library
+        // work so refreshing a large collection cannot delay navigation.
+        self.library_refresh
+            .start_if_requested(app, &self.runtime.handle)
+            .await;
 
         self.schedule_poster(app).await;
         self.finish_continue_if_ready(app);
@@ -458,6 +467,12 @@ impl ResourceCoordinator {
                 error,
             } => (request_id, generation, key, Err(error)),
         };
+        if self.library_refresh.generation() == Some(generation) {
+            self.library_refresh
+                .apply_event(app, &self.runtime.handle, request_id, key, result)
+                .await;
+            return;
+        }
         if generation != self.generation {
             return;
         }

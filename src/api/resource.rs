@@ -123,6 +123,9 @@ pub enum ResourceValue {
 pub struct SearchResultBundle {
     pub items: Vec<AnimeItem>,
     pub anilist_media: Vec<AniListMedia>,
+    /// AniHub results remain usable when AniList is down, but callers that
+    /// refresh franchise relations need to know that the graph is stale.
+    pub anilist_enrichment_failed: bool,
 }
 
 /// Worker failure model.  HTTP status and retry-after are retained for
@@ -788,13 +791,15 @@ async fn load_once(
             // Franchise enrichment is optional: AniHub search remains useful
             // during an AniList outage, and the UI falls back to conservative
             // one-release catalogs instead of failing the entire search.
-            let anilist_media = api_client
-                .get_anilist_media_batch(&anilist_ids)
-                .await
-                .unwrap_or_default();
+            let (anilist_media, anilist_enrichment_failed) =
+                match api_client.get_anilist_media_batch(&anilist_ids).await {
+                    Ok(media) => (media, false),
+                    Err(_) => (Vec::new(), true),
+                };
             Ok(ResourceValue::Search(SearchResultBundle {
                 items,
                 anilist_media,
+                anilist_enrichment_failed,
             }))
         }
         ResourceKey::AniHubByAniList(anilist_id) => api_client
