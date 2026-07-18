@@ -561,6 +561,7 @@ pub struct MpvSession {
     pub(crate) monitor: Option<JoinHandle<()>>,
     pub(crate) monitor_cancel: TaskCancellation,
     playlist_entry_ids: HashMap<i64, usize>,
+    playlist_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -613,6 +614,42 @@ pub struct MpvPlaylistEntry {
     pub title: String,
     pub start_time: Option<f64>,
     pub referrer: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PlaylistExtensionOutcome {
+    pub prepended: usize,
+    pub appended: usize,
+    /// A failed insertion leaves the already inserted entries usable. The
+    /// playback actor updates its loaded range from the counts before showing
+    /// this non-fatal error.
+    pub error: Option<String>,
+}
+
+fn loadfile_insert_command(entry: &MpvPlaylistEntry, index: usize) -> Value {
+    let mut options = serde_json::Map::from_iter([
+        (
+            "force-media-title".to_string(),
+            Value::String(entry.title.clone()),
+        ),
+        (
+            "referrer".to_string(),
+            Value::String(entry.referrer.clone()),
+        ),
+    ]);
+    if let Some(start_time) = entry
+        .start_time
+        .filter(|time| time.is_finite() && *time > 0.0)
+    {
+        options.insert("start".to_string(), Value::String(start_time.to_string()));
+    }
+    json!([
+        "loadfile",
+        entry.media_url,
+        "insert-at",
+        index,
+        Value::Object(options)
+    ])
 }
 
 pub fn build_mpv_args(
@@ -693,6 +730,7 @@ impl MpvSession {
             monitor: Some(monitor),
             monitor_cancel: cancel,
             playlist_entry_ids: HashMap::new(),
+            playlist_len: entries.len(),
         };
         if let Err(error) = session.refresh_playlist_entry_ids(entries.len()).await {
             let _ = session.shutdown().await;
@@ -714,11 +752,65 @@ impl MpvSession {
             );
         }
         self.playlist_entry_ids = entry_ids;
+        self.playlist_len = expected_count;
         Ok(())
     }
 
     pub fn playlist_index(&self, entry_id: i64) -> Option<usize> {
         self.playlist_entry_ids.get(&entry_id).copied()
+    }
+
+    /// Grow the native playlist around its current contiguous range without
+    /// restarting mpv. `before` and `after` must already be in timeline order.
+    pub(crate) async fn extend_playlist(
+        &mut self,
+        before: &[MpvPlaylistEntry],
+        after: &[MpvPlaylistEntry],
+    ) -> PlaylistExtensionOutcome {
+        let original_len = self.playlist_len;
+        let mut outcome = PlaylistExtensionOutcome::default();
+
+        for entry in before {
+            let index = outcome.prepended;
+            if let Err(error) = self
+                .ipc
+                .send_command(loadfile_insert_command(entry, index))
+                .await
+            {
+                outcome.error = Some(format!("не вдалося додати попередню серію: {error}"));
+                break;
+            }
+            outcome.prepended += 1;
+        }
+
+        if outcome.error.is_none() {
+            for entry in after {
+                let index = original_len + outcome.prepended + outcome.appended;
+                if let Err(error) = self
+                    .ipc
+                    .send_command(loadfile_insert_command(entry, index))
+                    .await
+                {
+                    outcome.error = Some(format!("не вдалося додати наступну серію: {error}"));
+                    break;
+                }
+                outcome.appended += 1;
+            }
+        }
+
+        let expected_len = original_len + outcome.prepended + outcome.appended;
+        self.playlist_len = expected_len;
+        if let Err(error) = self.refresh_playlist_entry_ids(expected_len).await {
+            // Stale IDs are worse than no IDs: monitor events can still use
+            // playlist-playing-pos as the pending index until a later refresh.
+            self.playlist_entry_ids.clear();
+            let message = format!("не вдалося оновити mpv-плейлист: {error}");
+            outcome.error = Some(match outcome.error.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+        outcome
     }
 
     pub fn try_recv_event(&mut self) -> Result<Option<MpvMonitorEvent>> {
@@ -839,6 +931,85 @@ impl Drop for MpvSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
+
+    #[cfg(unix)]
+    async fn run_fake_playlist_server(
+        listener: UnixListener,
+        expected_requests: usize,
+        fail_load_number: Option<usize>,
+    ) -> (Vec<(i64, String)>, Vec<Value>) {
+        let mut playlist = vec![(10_i64, "two".to_string()), (11, "three".to_string())];
+        let mut next_id = 20_i64;
+        let mut load_number = 0;
+        let mut commands = Vec::new();
+        for _ in 0..expected_requests {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(line.trim_end()).unwrap();
+            let request_id = request["request_id"].as_u64().unwrap();
+            let command = request["command"].clone();
+            let mut command_error = None;
+            let data = if command[0] == "loadfile" {
+                load_number += 1;
+                if fail_load_number == Some(load_number) {
+                    command_error = Some("command error");
+                    Value::Null
+                } else {
+                    let index = command[3].as_u64().unwrap() as usize;
+                    playlist.insert(index, (next_id, command[1].as_str().unwrap().to_string()));
+                    next_id += 1;
+                    Value::Null
+                }
+            } else {
+                assert_eq!(command, json!(["get_property", "playlist"]));
+                Value::Array(
+                    playlist
+                        .iter()
+                        .map(|(id, filename)| json!({"id": id, "filename": filename}))
+                        .collect(),
+                )
+            };
+            commands.push(command);
+            let response = serde_json::to_vec(&json!({
+                "request_id": request_id,
+                "error": command_error.unwrap_or("success"),
+                "data": data,
+            }))
+            .unwrap();
+            reader.get_mut().write_all(&response).await.unwrap();
+            reader.get_mut().write_all(b"\n").await.unwrap();
+        }
+        (playlist, commands)
+    }
+
+    #[cfg(unix)]
+    fn fake_session(endpoint: IpcEndpoint) -> MpvSession {
+        let ipc = MpvIpc::with_request_ids(endpoint.clone(), Arc::new(AtomicU64::new(1)));
+        MpvSession {
+            endpoint,
+            ipc,
+            child: None,
+            monitor_rx: None,
+            monitor: None,
+            monitor_cancel: TaskCancellation::new(),
+            playlist_entry_ids: HashMap::from([(10, 0), (11, 1)]),
+            playlist_len: 2,
+        }
+    }
+
+    #[cfg(unix)]
+    fn playlist_entry(episode: u32) -> MpvPlaylistEntry {
+        MpvPlaylistEntry {
+            media_url: format!("https://media.test/{episode}.m3u8"),
+            title: format!("Anime - Ep {episode}"),
+            start_time: None,
+            referrer: "https://ref.test/".to_string(),
+        }
+    }
 
     #[test]
     fn endpoint_is_unique_per_session() {
@@ -891,6 +1062,100 @@ mod tests {
         );
         assert!(!args.iter().any(|arg| arg.contains("anihub-next")));
         assert!(!args.iter().any(|arg| arg.contains("osc-custom_button")));
+    }
+
+    #[test]
+    fn dynamic_playlist_entries_use_structured_file_local_options() {
+        let entry = MpvPlaylistEntry {
+            media_url: "https://media.test/2.m3u8".to_string(),
+            title: "Anime - Ep 2".to_string(),
+            start_time: Some(42.5),
+            referrer: "https://ref.test/".to_string(),
+        };
+        assert_eq!(
+            loadfile_insert_command(&entry, 3),
+            json!([
+                "loadfile",
+                "https://media.test/2.m3u8",
+                "insert-at",
+                3,
+                {
+                    "force-media-title": "Anime - Ep 2",
+                    "referrer": "https://ref.test/",
+                    "start": "42.5"
+                }
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_mpv_ipc_prepends_and_appends_without_restarting_session() {
+        let endpoint = IpcEndpoint::for_session(77);
+        endpoint.cleanup();
+        let listener = UnixListener::bind(endpoint.path()).unwrap();
+        let server = tokio::spawn(run_fake_playlist_server(listener, 3, None));
+
+        let mut session = fake_session(endpoint);
+        let before = [playlist_entry(1)];
+        let after = [playlist_entry(4)];
+
+        let outcome = session.extend_playlist(&before, &after).await;
+        assert_eq!(
+            outcome,
+            PlaylistExtensionOutcome {
+                prepended: 1,
+                appended: 1,
+                error: None,
+            }
+        );
+        assert_eq!(session.playlist_index(20), Some(0));
+        assert_eq!(session.playlist_index(10), Some(1));
+        assert_eq!(session.playlist_index(11), Some(2));
+        assert_eq!(session.playlist_index(21), Some(3));
+
+        let (playlist, commands) = server.await.unwrap();
+        assert_eq!(
+            playlist.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![20, 10, 11, 21]
+        );
+        assert_eq!(commands[0][2], "insert-at");
+        assert_eq!(commands[0][3], 0);
+        assert_eq!(commands[1][3], 3);
+        assert_eq!(commands[2], json!(["get_property", "playlist"]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_mpv_ipc_keeps_successful_prefix_after_nonfatal_insert_error() {
+        let endpoint = IpcEndpoint::for_session(78);
+        endpoint.cleanup();
+        let listener = UnixListener::bind(endpoint.path()).unwrap();
+        let server = tokio::spawn(run_fake_playlist_server(listener, 3, Some(2)));
+        let mut session = fake_session(endpoint);
+
+        let outcome = session
+            .extend_playlist(&[playlist_entry(1)], &[playlist_entry(4)])
+            .await;
+        assert_eq!(outcome.prepended, 1);
+        assert_eq!(outcome.appended, 0);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("наступну серію"))
+        );
+        assert_eq!(session.playlist_index(20), Some(0));
+        assert_eq!(session.playlist_index(10), Some(1));
+        assert_eq!(session.playlist_index(11), Some(2));
+
+        let (playlist, commands) = server.await.unwrap();
+        assert_eq!(
+            playlist.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![20, 10, 11]
+        );
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[2], json!(["get_property", "playlist"]));
     }
 
     #[test]
