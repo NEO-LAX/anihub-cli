@@ -1,6 +1,7 @@
 //! Library tab renderers.
 
 use super::*;
+use chrono::{Local, TimeZone};
 
 pub(super) fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     let block = Block::default()
@@ -181,6 +182,14 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 if let Some((watched, total)) = anime_progress(item) {
                     metadata.push(format!("{watched}/{total}"));
                 }
+                let new_episodes = item
+                    .seasons
+                    .iter()
+                    .map(|release| new_episode_count(&app.settings.seen_episode_counts, release))
+                    .sum::<u32>();
+                if new_episodes > 0 {
+                    metadata.push(format!("+{new_episodes} нових"));
+                }
                 ListItem::new(label_with_metadata(&item.anime_title, &metadata))
             })
             .collect();
@@ -201,6 +210,13 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     .collect::<Vec<_>>();
                 if count > 1 {
                     metadata.push(format!("{count} озвучок"));
+                }
+                let new_episodes = new_episode_count(&app.settings.seen_episode_counts, release);
+                if new_episodes > 0 {
+                    metadata.push(format!("+{new_episodes} нових"));
+                }
+                if let Some(next_airing) = next_airing_label(release) {
+                    metadata.push(next_airing);
                 }
                 let release_label = match release.kind {
                     LibraryReleaseKind::Season => match release.part {
@@ -492,6 +508,32 @@ fn anime_progress(anime: &crate::ui::app::LibraryAnimeEntry) -> Option<(u32, u32
     })
 }
 
+fn new_episode_count(
+    seen_episode_counts: &std::collections::BTreeMap<u32, u32>,
+    release: &crate::ui::app::LibrarySeasonEntry,
+) -> u32 {
+    let Some(current) = release.episodes_count else {
+        return 0;
+    };
+    seen_episode_counts
+        .get(&release.anime_id)
+        .map_or(0, |seen| current.saturating_sub(*seen))
+}
+
+fn next_airing_label(release: &crate::ui::app::LibrarySeasonEntry) -> Option<String> {
+    next_airing_label_at(release, chrono::Utc::now().timestamp())
+}
+
+fn next_airing_label_at(release: &crate::ui::app::LibrarySeasonEntry, now: i64) -> Option<String> {
+    let episode = release.next_airing_episode?;
+    let airing_at = release.next_airing_at?;
+    if airing_at <= now {
+        return None;
+    }
+    let local = Local.timestamp_opt(airing_at, 0).single()?;
+    Some(format!("далі E{episode} · {}", local.format("%d.%m %H:%M")))
+}
+
 fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(details) = &app.current_details {
@@ -652,4 +694,41 @@ fn render_library_sidebar_details_area(
             .wrap(ratatui::widgets::Wrap { trim: true }),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ongoing_release() -> crate::ui::app::LibrarySeasonEntry {
+        crate::ui::app::LibrarySeasonEntry {
+            anime_id: 42,
+            season: 1,
+            part: Some(1),
+            title: "Онгоінг".to_string(),
+            kind: LibraryReleaseKind::Season,
+            episodes_count: Some(8),
+            first_episode: Some(1),
+            airing_status: Some("RELEASING".to_string()),
+            next_airing_episode: Some(9),
+            next_airing_at: Some(2_000),
+            status: AnimeStatus::Watching,
+            episodes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn episode_badge_uses_the_acknowledged_count() {
+        let release = ongoing_release();
+        let seen = std::collections::BTreeMap::from([(42, 6)]);
+        assert_eq!(new_episode_count(&seen, &release), 2);
+        assert_eq!(new_episode_count(&Default::default(), &release), 0);
+    }
+
+    #[test]
+    fn future_airing_is_rendered_but_expired_airing_is_hidden() {
+        let release = ongoing_release();
+        assert!(next_airing_label_at(&release, 1_000).is_some());
+        assert!(next_airing_label_at(&release, 2_000).is_none());
+    }
 }

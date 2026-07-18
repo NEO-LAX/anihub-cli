@@ -30,6 +30,8 @@ impl AppState {
                     self.library_sort = selected_sort;
                     self.library_sort_reversed = false;
                 }
+                self.settings.library_sort = library_sort_to_setting(self.library_sort);
+                self.settings.library_sort_reversed = self.library_sort_reversed;
                 self.library_sort_popup = None;
                 self.apply_library_filter();
             }
@@ -37,6 +39,29 @@ impl AppState {
             _ => {}
         }
         true
+    }
+
+    pub(super) fn remember_library_selection(&mut self) {
+        if let Some(anime_id) = self.library_selected_anime_id() {
+            self.settings.last_library_anime_id = Some(anime_id);
+        }
+    }
+
+    pub(super) fn acknowledge_selected_library_release(&mut self) {
+        let Some(release) = self.library_selected_season() else {
+            return;
+        };
+        let (anime_id, episodes_count) = (release.anime_id, release.episodes_count);
+        if let Some(episodes_count) = episodes_count {
+            self.settings
+                .seen_episode_counts
+                .insert(anime_id, episodes_count);
+        }
+    }
+
+    pub fn persist_library_session(&mut self) -> anyhow::Result<()> {
+        self.remember_library_selection();
+        self.settings_store.save(&self.settings)
     }
 
     pub(super) fn episode_targets_for_release(

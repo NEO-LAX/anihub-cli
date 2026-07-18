@@ -84,6 +84,12 @@ pub struct LibraryReleaseMetadata {
     pub episodes_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_episode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub airing_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_airing_episode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_airing_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1580,6 +1586,9 @@ mod tests {
                 part: Some(1),
                 episodes_count: Some(1),
                 first_episode: Some(1),
+                airing_status: None,
+                next_airing_episode: None,
+                next_airing_at: None,
             }),
         });
         let episodes = [11, 12].map(|anime_id| EpisodeWatchedUpdate {

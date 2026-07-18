@@ -6,8 +6,8 @@ use crate::api::{
 use crate::cache::MetadataCache;
 use crate::poster_cache::PosterCache;
 use crate::settings::{
-    DefaultLibraryFilter, GITHUB_URL, Settings, SettingsStore, StartScreen, ThemePreset,
-    UpdateCheck, mpv_is_available,
+    DefaultLibraryFilter, GITHUB_URL, LibrarySortPreference, Settings, SettingsStore, StartScreen,
+    ThemePreset, UpdateCheck, mpv_is_available,
 };
 use crate::storage::{
     AnimeStatus, AnimeStatusUpdate, AppHistory, EpisodeWatchedUpdate, LibraryReleaseKind,
@@ -330,6 +330,9 @@ pub struct LibrarySeasonEntry {
     pub kind: LibraryReleaseKind,
     pub episodes_count: Option<u32>,
     pub first_episode: Option<u32>,
+    pub airing_status: Option<String>,
+    pub next_airing_episode: Option<u32>,
+    pub next_airing_at: Option<i64>,
     pub status: AnimeStatus,
     pub episodes: Vec<WatchProgress>,
 }
@@ -350,6 +353,9 @@ impl LibrarySeasonEntry {
             part: self.part,
             episodes_count: self.episodes_count,
             first_episode: self.first_episode,
+            airing_status: self.airing_status.clone(),
+            next_airing_episode: self.next_airing_episode,
+            next_airing_at: self.next_airing_at,
         }
     }
 }
@@ -532,7 +538,19 @@ impl AppState {
         let history = storage.load_history()?;
         let (watched_index, progress_index) = Self::build_history_indexes(&history);
         let settings_store = SettingsStore::new()?;
-        let settings = settings_store.load()?;
+        let mut settings = settings_store.load()?;
+        for (&anime_id, record) in &history.library {
+            if let Some(episodes) = record
+                .release
+                .as_ref()
+                .and_then(|release| release.episodes_count)
+            {
+                settings
+                    .seen_episode_counts
+                    .entry(anime_id)
+                    .or_insert(episodes);
+            }
+        }
         let metadata_cache = MetadataCache::new(settings_store.data_dir())?;
         let cached_library_catalogs =
             cached_franchise_catalogs_for_history(&metadata_cache, &history);
@@ -542,7 +560,12 @@ impl AppState {
             details_cache.insert(anime_id, details);
         }
         let mpv_available = mpv_is_available(&settings.mpv_path);
-        let default_library_filter = library_filter_from_setting(settings.default_library_filter);
+        let default_library_filter = library_filter_from_setting(
+            settings
+                .last_library_filter
+                .unwrap_or(settings.default_library_filter),
+        );
+        let library_sort = library_sort_from_setting(settings.library_sort);
         let start_in_library = settings.start_screen == StartScreen::Library;
 
         let mut app = Self {
@@ -580,8 +603,8 @@ impl AppState {
             library_items: Vec::new(),
             library_all_items: Vec::new(),
             library_filter: default_library_filter,
-            library_sort: LibrarySort::Recent,
-            library_sort_reversed: false,
+            library_sort,
+            library_sort_reversed: settings.library_sort_reversed,
             library_sort_popup: None,
             library_search_query: String::new(),
             library_search_cursor: 0,
@@ -1394,6 +1417,7 @@ impl AppState {
 
     fn set_library_filter(&mut self, filter: LibraryFilter) {
         self.library_filter = filter;
+        self.settings.last_library_filter = Some(library_filter_to_setting(filter));
         self.mode = AppMode::Library;
         self.apply_library_filter();
     }
@@ -1422,6 +1446,15 @@ impl AppState {
                 self.library_items
                     .iter()
                     .position(|anime| anime.anime_ids.iter().any(|id| ids.contains(id)))
+            })
+            .or_else(|| {
+                self.settings
+                    .last_library_anime_id
+                    .and_then(|remembered_id| {
+                        self.library_items
+                            .iter()
+                            .position(|anime| anime.anime_ids.contains(&remembered_id))
+                    })
             })
             .or_else(|| (!self.library_items.is_empty()).then_some(0));
         self.library_anime_list_state
@@ -2519,6 +2552,7 @@ impl AppState {
         let Some(season_num) = self.selected_season_num() else {
             return;
         };
+        self.acknowledge_selected_library_release();
         if self.dubbing_choices_for_season(season_num).is_empty() {
             return;
         }
@@ -2553,6 +2587,7 @@ impl AppState {
                 };
                 self.library_anime_index = Some(next);
                 self.library_anime_list_state.select(Some(next));
+                self.remember_library_selection();
                 self.prepare_library_anime_selection();
             }
             AppMode::LibrarySeason => {
@@ -2616,6 +2651,7 @@ impl AppState {
                 };
                 self.library_anime_index = Some(next);
                 self.library_anime_list_state.select(Some(next));
+                self.remember_library_selection();
                 self.prepare_library_anime_selection();
             }
             AppMode::LibrarySeason => {
@@ -3262,6 +3298,9 @@ fn library_metadata_for_release(
         part: release.part,
         episodes_count: release.available_episodes.or(release.episodes_count),
         first_episode: Some(offset.saturating_add(1)),
+        airing_status: release.airing_status.clone(),
+        next_airing_episode: release.next_airing_episode,
+        next_airing_at: release.next_airing_at,
     }
 }
 
@@ -3452,6 +3491,13 @@ fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
                         .as_ref()
                         .and_then(|release| release.first_episode)
                         .or_else(|| episodes.iter().map(|progress| progress.episode).min()),
+                    airing_status: metadata
+                        .as_ref()
+                        .and_then(|release| release.airing_status.clone()),
+                    next_airing_episode: metadata
+                        .as_ref()
+                        .and_then(|release| release.next_airing_episode),
+                    next_airing_at: metadata.as_ref().and_then(|release| release.next_airing_at),
                     status: record.map_or(AnimeStatus::Watching, |record| record.status),
                     episodes,
                 }
@@ -3660,6 +3706,37 @@ const fn library_filter_from_setting(filter: DefaultLibraryFilter) -> LibraryFil
     }
 }
 
+const fn library_filter_to_setting(filter: LibraryFilter) -> DefaultLibraryFilter {
+    match filter {
+        LibraryFilter::All => DefaultLibraryFilter::All,
+        LibraryFilter::Watching => DefaultLibraryFilter::Watching,
+        LibraryFilter::Planned => DefaultLibraryFilter::Planned,
+        LibraryFilter::Completed => DefaultLibraryFilter::Completed,
+        LibraryFilter::OnHold => DefaultLibraryFilter::OnHold,
+        LibraryFilter::Dropped => DefaultLibraryFilter::Dropped,
+    }
+}
+
+const fn library_sort_from_setting(sort: LibrarySortPreference) -> LibrarySort {
+    match sort {
+        LibrarySortPreference::Recent => LibrarySort::Recent,
+        LibrarySortPreference::Title => LibrarySort::Title,
+        LibrarySortPreference::Year => LibrarySort::Year,
+        LibrarySortPreference::Rating => LibrarySort::Rating,
+        LibrarySortPreference::Progress => LibrarySort::Progress,
+    }
+}
+
+const fn library_sort_to_setting(sort: LibrarySort) -> LibrarySortPreference {
+    match sort {
+        LibrarySort::Recent => LibrarySortPreference::Recent,
+        LibrarySort::Title => LibrarySortPreference::Title,
+        LibrarySort::Year => LibrarySortPreference::Year,
+        LibrarySort::Rating => LibrarySortPreference::Rating,
+        LibrarySort::Progress => LibrarySortPreference::Progress,
+    }
+}
+
 fn byte_index_for_char(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
@@ -3751,6 +3828,9 @@ mod tests {
             poster_url: None,
             episodes_count: Some(episodes),
             available_episodes: Some(episodes),
+            airing_status: None,
+            next_airing_episode: None,
+            next_airing_at: None,
             description: None,
             rating: None,
             genres: None,
@@ -3802,6 +3882,9 @@ mod tests {
             poster_url: None,
             episodes_count: None,
             available_episodes: None,
+            airing_status: None,
+            next_airing_episode: None,
+            next_airing_at: None,
             description: None,
             rating: None,
             genres: None,
@@ -3925,6 +4008,9 @@ mod tests {
                         part: Some(1),
                         episodes_count: Some(4),
                         first_episode: Some(1),
+                        airing_status: None,
+                        next_airing_episode: None,
+                        next_airing_at: None,
                     }),
                 },
             );
@@ -4045,6 +4131,9 @@ mod tests {
                             12
                         }),
                         first_episode: Some(1),
+                        airing_status: None,
+                        next_airing_episode: None,
+                        next_airing_at: None,
                     }),
                 },
             );

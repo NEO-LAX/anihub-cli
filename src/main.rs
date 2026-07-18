@@ -995,6 +995,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    let session_settings_error = app.persist_library_session().err();
     let playback_shutdown_error = playback.shutdown().await.err();
     for event in playback.drain_events() {
         persist_playback_event(&mut app, &mut persisted_positions, event);
@@ -1006,6 +1007,9 @@ async fn main() -> Result<()> {
     }
     discord_presence.shutdown();
     if let Some(error) = playback_shutdown_error {
+        return Err(error);
+    }
+    if let Some(error) = session_settings_error {
         return Err(error);
     }
     Ok(())

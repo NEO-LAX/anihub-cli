@@ -156,6 +156,12 @@ pub struct ReleaseEntry {
     /// Episodes that have actually aired. AniHub may expose future placeholder
     /// VOD rows for an ongoing release, so source lists are capped to this.
     pub available_episodes: Option<u32>,
+    #[serde(default)]
+    pub airing_status: Option<String>,
+    #[serde(default)]
+    pub next_airing_episode: Option<u32>,
+    #[serde(default)]
+    pub next_airing_at: Option<i64>,
     pub description: Option<String>,
     pub rating: Option<f32>,
     pub genres: Option<Vec<String>>,
@@ -189,6 +195,7 @@ struct NodeRecord {
     year: Option<u32>,
     episodes: Option<u32>,
     next_airing_episode: Option<u32>,
+    next_airing_at: Option<i64>,
     title: AniListTitle,
     poster_url: Option<String>,
 }
@@ -205,6 +212,10 @@ impl From<&AniListMedia> for NodeRecord {
                 .next_airing_episode
                 .as_ref()
                 .map(|airing| airing.episode),
+            next_airing_at: media
+                .next_airing_episode
+                .as_ref()
+                .and_then(|airing| airing.airing_at),
             title: media.title.clone(),
             poster_url: media.cover_image.large.clone(),
         }
@@ -223,6 +234,10 @@ impl From<&AniListMediaNode> for NodeRecord {
                 .next_airing_episode
                 .as_ref()
                 .map(|airing| airing.episode),
+            next_airing_at: media
+                .next_airing_episode
+                .as_ref()
+                .and_then(|airing| airing.airing_at),
             title: media.title.clone(),
             poster_url: media.cover_image.large.clone(),
         }
@@ -310,6 +325,7 @@ pub fn build_franchise_catalogs(
             year: release.year,
             episodes: release.episodes_count,
             next_airing_episode: None,
+            next_airing_at: None,
             title: AniListTitle {
                 english: release.title_english.clone(),
                 romaji: release.title_original.clone(),
@@ -545,6 +561,9 @@ fn build_component_catalog(
                     .and_then(|release| release.episodes_count)
                     .or(node.episodes),
                 available_episodes: aired_episode_count(node, local),
+                airing_status: node.status.clone(),
+                next_airing_episode: node.next_airing_episode,
+                next_airing_at: node.next_airing_at,
                 description: local.and_then(|release| release.description.clone()),
                 rating: local.and_then(|release| release.rating),
                 genres: local.and_then(|release| release.genres.clone()),
@@ -596,6 +615,9 @@ fn single_release_catalog(release: AnimeItem) -> FranchiseCatalog {
         poster_url: release.poster_url.clone(),
         episodes_count: release.episodes_count,
         available_episodes: release.episodes_count,
+        airing_status: Some(release.status.clone()),
+        next_airing_episode: None,
+        next_airing_at: None,
         description: release.description,
         rating: release.rating,
         genres: release.genres,
@@ -939,7 +961,7 @@ mod tests {
         n3.episodes = Some(14);
         n3.next_airing_episode = Some(AniListNextAiringEpisode {
             episode: 4,
-            airing_at: None,
+            airing_at: Some(1_800_000_000),
         });
         let extra = node(141534, "Eris the Goblin Slayer", "SPECIAL", 2022);
         let graph = vec![
@@ -967,6 +989,8 @@ mod tests {
         assert_eq!(release(catalog, 4986).part, Some(2));
         assert_eq!(release(catalog, 24675).conceptual_season, Some(3));
         assert_eq!(release(catalog, 24675).available_episodes, Some(3));
+        assert_eq!(release(catalog, 24675).next_airing_episode, Some(4));
+        assert_eq!(release(catalog, 24675).next_airing_at, Some(1_800_000_000));
         assert_eq!(
             release(catalog, 5895).classification,
             ReleaseClassification::Extra

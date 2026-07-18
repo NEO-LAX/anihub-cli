@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -164,6 +165,17 @@ pub enum DefaultLibraryFilter {
     Dropped,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarySortPreference {
+    #[default]
+    Recent,
+    Title,
+    Year,
+    Rating,
+    Progress,
+}
+
 impl DefaultLibraryFilter {
     pub const ALL: [Self; 6] = [
         Self::All,
@@ -206,6 +218,14 @@ pub struct Settings {
     pub search_mode: SearchMode,
     pub start_screen: StartScreen,
     pub default_library_filter: DefaultLibraryFilter,
+    /// Last interactive library state. Unlike `default_library_filter`, these
+    /// values follow the user's latest session rather than a settings choice.
+    pub last_library_filter: Option<DefaultLibraryFilter>,
+    pub library_sort: LibrarySortPreference,
+    pub library_sort_reversed: bool,
+    pub last_library_anime_id: Option<u32>,
+    /// Highest episode count acknowledged by opening each release.
+    pub seen_episode_counts: BTreeMap<u32, u32>,
     pub show_posters: bool,
     pub ansi_themes: bool,
     pub ansi_256_colors: bool,
@@ -231,6 +251,11 @@ impl Default for Settings {
             search_mode: SearchMode::Strict,
             start_screen: StartScreen::Search,
             default_library_filter: DefaultLibraryFilter::All,
+            last_library_filter: None,
+            library_sort: LibrarySortPreference::Recent,
+            library_sort_reversed: false,
+            last_library_anime_id: None,
+            seen_episode_counts: BTreeMap::new(),
             show_posters: true,
             ansi_themes: false,
             ansi_256_colors: false,
@@ -482,6 +507,11 @@ mod tests {
         object.remove("transparent_background");
         object.remove("discord_presence");
         object.remove("discord_application_id");
+        object.remove("last_library_filter");
+        object.remove("library_sort");
+        object.remove("library_sort_reversed");
+        object.remove("last_library_anime_id");
+        object.remove("seen_episode_counts");
 
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert!(!settings.ansi_themes);
@@ -491,6 +521,11 @@ mod tests {
         assert!(settings.transparent_background);
         assert!(!settings.discord_presence);
         assert!(settings.legacy_discord_application_id.is_empty());
+        assert_eq!(settings.last_library_filter, None);
+        assert_eq!(settings.library_sort, LibrarySortPreference::Recent);
+        assert!(!settings.library_sort_reversed);
+        assert_eq!(settings.last_library_anime_id, None);
+        assert!(settings.seen_episode_counts.is_empty());
     }
 
     #[test]
@@ -562,6 +597,11 @@ mod tests {
         store.save(&settings).unwrap();
         settings.autoplay_next = false;
         settings.mpv_extra_args = "--fs --hwdec=auto".to_string();
+        settings.last_library_filter = Some(DefaultLibraryFilter::Watching);
+        settings.library_sort = LibrarySortPreference::Progress;
+        settings.library_sort_reversed = true;
+        settings.last_library_anime_id = Some(42);
+        settings.seen_episode_counts.insert(42, 8);
         store.save(&settings).unwrap();
 
         assert_eq!(store.load().unwrap(), settings);
