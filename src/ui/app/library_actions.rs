@@ -154,15 +154,16 @@ impl AppState {
         match key_code {
             KeyCode::Enter => {
                 self.library.pending_watched_confirmation = None;
-                let status = if confirmation.mark_watched {
-                    AnimeStatus::Completed
-                } else {
-                    AnimeStatus::Watching
-                };
                 let mut status_updates = Vec::with_capacity(confirmation.releases.len());
                 let mut episode_updates = Vec::new();
                 for release in &confirmation.releases {
                     let metadata = release.metadata();
+                    let status =
+                        if confirmation.mark_watched && !release_metadata_is_ongoing(&metadata) {
+                            AnimeStatus::Completed
+                        } else {
+                            AnimeStatus::Watching
+                        };
                     status_updates.push(AnimeStatusUpdate {
                         anime_id: release.anime_id,
                         title: confirmation.anime_title.clone(),

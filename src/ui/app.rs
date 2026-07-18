@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 mod input;
 mod library_actions;
 mod library_navigation;
+mod search_actions;
 mod settings_ui;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +98,61 @@ pub enum LibrarySort {
     Year,
     Rating,
     Progress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchSort {
+    Relevance,
+    Title,
+    Year,
+    Rating,
+}
+
+impl SearchSort {
+    pub const ALL: [Self; 4] = [Self::Relevance, Self::Title, Self::Year, Self::Rating];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Relevance => "Збіг",
+            Self::Title => "Назва",
+            Self::Year => "Рік",
+            Self::Rating => "Рейтинг",
+        }
+    }
+
+    pub const fn order_label(self, reversed: bool) -> &'static str {
+        match (self, reversed) {
+            (Self::Relevance, false) => "кращі → слабші",
+            (Self::Relevance, true) => "слабші → кращі",
+            (Self::Title, false) => "А → Я",
+            (Self::Title, true) => "Я → А",
+            (Self::Year, false) => "новіші → старіші",
+            (Self::Year, true) => "старіші → новіші",
+            (Self::Rating, false) => "вищий → нижчий",
+            (Self::Rating, true) => "нижчий → вищий",
+        }
+    }
+
+    pub const fn direction_symbol(self, reversed: bool) -> &'static str {
+        let ascending = matches!(self, Self::Title) != reversed;
+        if ascending { "↑" } else { "↓" }
+    }
+}
+
+pub struct SearchOrderingState {
+    pub sort: SearchSort,
+    pub reversed: bool,
+    pub popup: Option<usize>,
+}
+
+impl Default for SearchOrderingState {
+    fn default() -> Self {
+        Self {
+            sort: SearchSort::Relevance,
+            reversed: false,
+            popup: None,
+        }
+    }
 }
 
 impl LibrarySort {
@@ -469,6 +525,7 @@ pub struct AppState {
     pub search_cursor: usize,
 
     pub search_results: Vec<AnimeItem>,
+    pub search_ordering: SearchOrderingState,
     pub franchise_groups: Vec<Vec<usize>>,
     /// Release catalogs aligned with `franchise_groups` by index.
     pub franchise_catalogs: Vec<FranchiseCatalog>,
@@ -607,6 +664,7 @@ impl AppState {
             search_cursor: 0,
 
             search_results: Vec::new(),
+            search_ordering: SearchOrderingState::default(),
             franchise_groups: Vec::new(),
             // Cached searches retain AniList relation graphs. Keeping the
             // catalogs that intersect history lets the first Library open
@@ -1079,6 +1137,7 @@ impl AppState {
 
     fn switch_primary_tab(&mut self, tab: PrimaryTab) {
         self.status_editor = None;
+        self.search_ordering.popup = None;
         self.library.sort_popup = None;
         self.library.pending_watched_confirmation = None;
         self.library.pending_delete_confirmation = None;
@@ -1185,6 +1244,10 @@ impl AppState {
                     }
 
                     if self.handle_status_editor(shortcut) {
+                        return Ok(());
+                    }
+
+                    if self.handle_search_sort_popup(shortcut) {
                         return Ok(());
                     }
 
@@ -2412,6 +2475,7 @@ impl AppState {
             self.restore_representative_poster();
         }
         self.library.episode_list_state.select(None);
+        self.search_ordering.popup = None;
         self.library.sort_popup = None;
         self.library.pending_watched_confirmation = None;
         self.library.pending_delete_confirmation = None;
@@ -2767,7 +2831,7 @@ impl AppState {
         let status_update = AnimeStatusUpdate {
             anime_id,
             title: anime_title,
-            status: if mark_watched {
+            status: if mark_watched && !release_metadata_is_ongoing(&release) {
                 AnimeStatus::Completed
             } else {
                 AnimeStatus::Watching
@@ -3188,12 +3252,19 @@ fn library_catalog_updates(
         for (anime_id, release) in available {
             let metadata = library_metadata_for_release(catalog, release);
             let existing = history.library.get(&anime_id);
-            let status = existing.map_or_else(
-                || inferred_release_status(history, anime_id, &metadata),
-                |record| record.status,
-            );
+            let status = match existing {
+                Some(record)
+                    if record.status == AnimeStatus::Completed
+                        && release_metadata_is_ongoing(&metadata) =>
+                {
+                    AnimeStatus::Watching
+                }
+                Some(record) => record.status,
+                None => inferred_release_status(history, anime_id, &metadata),
+            };
             if existing.is_some_and(|record| {
                 record.title == catalog.canonical_title
+                    && record.status == status
                     && record.release.as_ref() == Some(&metadata)
             }) {
                 continue;
@@ -3224,7 +3295,7 @@ fn inferred_release_status(
         .filter(|progress| progress.anime_id == anime_id)
         .collect::<Vec<_>>();
     if progress.is_empty() {
-        return AnimeStatus::Planned;
+        return AnimeStatus::NotAdded;
     }
 
     let watched = progress
@@ -3233,7 +3304,9 @@ fn inferred_release_status(
         .map(|progress| progress.episode)
         .collect::<HashSet<_>>()
         .len() as u32;
-    if metadata
+    if release_metadata_is_ongoing(metadata) {
+        AnimeStatus::Watching
+    } else if metadata
         .episodes_count
         .is_some_and(|episodes| episodes > 0 && watched >= episodes)
     {
@@ -3241,6 +3314,14 @@ fn inferred_release_status(
     } else {
         AnimeStatus::Watching
     }
+}
+
+fn release_metadata_is_ongoing(metadata: &LibraryReleaseMetadata) -> bool {
+    metadata.next_airing_episode.is_some()
+        || metadata
+            .airing_status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("RELEASING"))
 }
 
 fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
@@ -3263,19 +3344,25 @@ fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
     for (anime_title, mut anime_ids) in ids_by_title {
         anime_ids.sort_unstable();
         anime_ids.dedup();
-        anime_ids.retain(|anime_id| {
-            history
-                .library
-                .get(anime_id)
-                .is_none_or(|record| record.status != AnimeStatus::NotAdded)
+        let franchise_active = anime_ids.iter().any(|anime_id| {
+            history.library.get(anime_id).map_or_else(
+                || {
+                    history
+                        .progress
+                        .values()
+                        .any(|progress| progress.anime_id == *anime_id)
+                },
+                |record| record.status != AnimeStatus::NotAdded,
+            )
         });
-        if anime_ids.is_empty() {
+        if !franchise_active {
             continue;
         }
 
         let explicit_statuses = anime_ids
             .iter()
             .filter_map(|anime_id| history.library.get(anime_id))
+            .filter(|record| record.status != AnimeStatus::NotAdded)
             .collect::<Vec<_>>();
         let status = if !explicit_statuses.is_empty()
             && explicit_statuses
@@ -4030,19 +4117,19 @@ mod tests {
         assert_eq!(items[0].anime_ids, vec![1, 2]);
         assert_eq!(items[0].seasons.len(), 2);
         assert_eq!(items[0].seasons[0].season, 1);
-        assert_eq!(items[0].seasons[0].status, AnimeStatus::Planned);
+        assert_eq!(items[0].seasons[0].status, AnimeStatus::NotAdded);
         assert_eq!(items[0].seasons[1].season, 2);
         assert_eq!(items[0].seasons[1].status, AnimeStatus::Watching);
     }
 
     #[test]
-    fn refreshed_catalog_adds_new_seasons_and_movies_as_planned() {
+    fn refreshed_catalog_keeps_new_seasons_and_movies_unplanned_but_visible() {
         let mut history = AppHistory::default();
         history.library.insert(
             1,
             crate::storage::history::AnimeLibraryRecord {
                 title: "Клас убивць".to_string(),
-                status: AnimeStatus::Watching,
+                status: AnimeStatus::Completed,
                 updated_at: 10,
                 release: Some(library_metadata_for_release(
                     &two_season_catalog(),
@@ -4068,13 +4155,13 @@ mod tests {
                 .iter()
                 .find(|update| update.anime_id == 2)
                 .map(|update| update.status),
-            Some(AnimeStatus::Planned)
+            Some(AnimeStatus::NotAdded)
         );
         let movie = updates
             .iter()
             .find(|update| update.anime_id == 3)
             .expect("new movie update");
-        assert_eq!(movie.status, AnimeStatus::Planned);
+        assert_eq!(movie.status, AnimeStatus::NotAdded);
         assert_eq!(
             movie.release.as_ref().map(|release| release.kind),
             Some(LibraryReleaseKind::Movie)
@@ -4083,11 +4170,104 @@ mod tests {
             .iter()
             .find(|update| update.anime_id == 4)
             .expect("new OVA update");
-        assert_eq!(ova.status, AnimeStatus::Planned);
+        assert_eq!(ova.status, AnimeStatus::NotAdded);
         assert_eq!(
             ova.release.as_ref().map(|release| release.kind),
             Some(LibraryReleaseKind::Special)
         );
+
+        for update in updates {
+            history.library.insert(
+                update.anime_id,
+                crate::storage::history::AnimeLibraryRecord {
+                    title: update.title,
+                    status: update.status,
+                    updated_at: 11,
+                    release: update.release,
+                },
+            );
+        }
+        let items = build_library_items(&history);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seasons.len(), 4);
+        assert_eq!(items[0].status, AnimeStatus::Completed);
+        assert_eq!(
+            items[0]
+                .seasons
+                .iter()
+                .filter(|release| release.status == AnimeStatus::NotAdded)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn fully_watched_ongoing_release_stays_watching() {
+        let mut history = AppHistory::default();
+        for episode in 1..=3 {
+            history.progress.insert(
+                StorageManager::make_progress_key(7, 1, episode, "Dub"),
+                WatchProgress {
+                    anime_id: 7,
+                    anime_title: "Онгоінг".to_string(),
+                    season: 1,
+                    episode,
+                    studio_name: "Dub".to_string(),
+                    timestamp: 1_200.0,
+                    duration: 1_200.0,
+                    watched: true,
+                    updated_at: i64::from(episode),
+                },
+            );
+        }
+        let metadata = LibraryReleaseMetadata {
+            title: "Онгоінг".to_string(),
+            kind: LibraryReleaseKind::Season,
+            season: 1,
+            part: Some(1),
+            episodes_count: Some(3),
+            first_episode: Some(1),
+            airing_status: Some("RELEASING".to_string()),
+            next_airing_episode: Some(4),
+            next_airing_at: Some(2_000_000_000),
+        };
+
+        assert_eq!(
+            inferred_release_status(&history, 7, &metadata),
+            AnimeStatus::Watching
+        );
+
+        let mut finished = metadata;
+        finished.airing_status = Some("FINISHED".to_string());
+        finished.next_airing_episode = None;
+        finished.next_airing_at = None;
+        assert_eq!(
+            inferred_release_status(&history, 7, &finished),
+            AnimeStatus::Completed
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_reopens_completed_ongoing_release() {
+        let mut history = AppHistory::default();
+        let mut catalog = two_season_catalog();
+        catalog.releases.truncate(1);
+        catalog.releases[0].airing_status = Some("RELEASING".to_string());
+        catalog.releases[0].next_airing_episode = Some(23);
+        catalog.releases[0].next_airing_at = Some(2_000_000_000);
+        history.library.insert(
+            1,
+            crate::storage::history::AnimeLibraryRecord {
+                title: "Клас убивць".to_string(),
+                status: AnimeStatus::Completed,
+                updated_at: 10,
+                release: Some(library_metadata_for_release(&catalog, &catalog.releases[0])),
+            },
+        );
+
+        let updates = library_catalog_updates(&history, &[catalog]);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, AnimeStatus::Watching);
     }
 
     #[test]

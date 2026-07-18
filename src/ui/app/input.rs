@@ -25,6 +25,7 @@ fn handle_search_results_key(app: &mut AppState, key: KeyCode) {
         KeyCode::Char(' ') => app.toggle_search_selection_watched(),
         KeyCode::Backspace => app.clear_selected_episode_timestamp(),
         KeyCode::Char('e') => app.open_status_editor(),
+        KeyCode::Char('s') => app.open_search_sort_popup(),
         KeyCode::Char('o') => app.open_in_browser(),
         KeyCode::Char('l') => app.open_library(),
         KeyCode::Esc => app.handle_esc(),

@@ -11,11 +11,12 @@ use crate::api;
 use crate::settings::{ColorMode, SurfaceMode, ThemePreset};
 use crate::storage::{AnimeStatus, LibraryReleaseKind};
 use crate::ui::app::{
-    AppMode, AppState, FocusPanel, LibraryFilter, LibrarySort, PrimaryTab, SettingsChoiceKind,
-    SettingsInput, SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
+    AppMode, AppState, FocusPanel, LibraryFilter, LibrarySort, PrimaryTab, SearchSort,
+    SettingsChoiceKind, SettingsInput, SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
 };
 
 mod library;
+mod search;
 mod settings;
 #[cfg(test)]
 use settings::{selected_theme_preview, theme_settings_display_row};
@@ -402,6 +403,8 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         render_moonanime_popup(f, &title);
     } else if app.status_editor.is_some() {
         render_status_editor_popup(f, app);
+    } else if app.search_ordering.popup.is_some() {
+        search::render_sort_popup(f, app);
     } else if app.library.sort_popup.is_some() {
         library::render_sort_popup(f, app);
     } else if app.library.pending_watched_confirmation.is_some() {
@@ -1313,7 +1316,7 @@ fn context_shortcuts(app: &AppState) -> String {
     }
     match app.focus {
         FocusPanel::SearchList => {
-            "Enter Далі  e Статус  c Продовжити  / Пошук  2 Бібліотека".to_string()
+            "Enter Далі  s Сортування  e Статус  c Продовжити  / Пошук".to_string()
         }
         FocusPanel::ReleaseList
             if app.has_release_catalog() && !app.selected_release_available() =>
@@ -1416,6 +1419,13 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
 
     if chunk_count >= 1 {
         let list_width = list_chunks[0].width.saturating_sub(6) as usize;
+        let search_title = format!(
+            " Результати · {} {} ",
+            app.search_ordering.sort.label(),
+            app.search_ordering
+                .sort
+                .direction_symbol(app.search_ordering.reversed)
+        );
         let mut items: Vec<ListItem> = Vec::new();
         for (group_index, group) in app.franchise_groups.iter().enumerate() {
             let Some(&representative_index) = group.first() else {
@@ -1458,17 +1468,13 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             render_list_message(
                 f,
                 list_chunks[0],
-                " Результати пошуку ",
+                &search_title,
                 app.focus == FocusPanel::SearchList,
                 message,
                 loading,
             );
         } else {
-            let list = create_list(
-                " Результати пошуку ",
-                items,
-                app.focus == FocusPanel::SearchList,
-            );
+            let list = create_list(&search_title, items, app.focus == FocusPanel::SearchList);
             f.render_stateful_widget(list, list_chunks[0], &mut app.result_list_state);
         }
     }
@@ -2427,7 +2433,7 @@ fn render_help_popup(f: &mut Frame) {
         row("Space", "Переглянуто"),
         row("Backsp.", "Очистити таймкод"),
         row("d", "Видалити прогрес"),
-        row("s", "Сортування бібліотеки"),
+        row("s", "Сортування списку"),
         row("o", "У браузері"),
         row("Tab", "Категорія"),
     ];

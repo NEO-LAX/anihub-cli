@@ -1393,6 +1393,9 @@ fn rebuild_franchise_projection(app: &mut AppState) {
     let selected_anchor = app
         .selected_franchise_catalog()
         .and_then(|catalog| catalog.anchor_anilist_id);
+    let selected_title = app
+        .selected_franchise_catalog()
+        .map(|catalog| catalog.canonical_title.clone());
     let selected_release_anilist = app
         .selected_release()
         .and_then(|release| release.anilist_id);
@@ -1416,12 +1419,18 @@ fn rebuild_franchise_projection(app: &mut AppState) {
 
     app.franchise_catalogs = catalogs;
     app.franchise_groups = groups;
+    app.sort_search_projection();
 
     if let Some(anchor) = selected_anchor {
         app.selected_group_index = app
             .franchise_catalogs
             .iter()
             .position(|catalog| catalog.anchor_anilist_id == Some(anchor));
+    } else if let Some(title) = selected_title {
+        app.selected_group_index = app
+            .franchise_catalogs
+            .iter()
+            .position(|catalog| catalog.canonical_title == title);
     }
     if app.selected_group_index.is_none() && !app.franchise_catalogs.is_empty() {
         app.selected_group_index = Some(0);
