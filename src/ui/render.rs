@@ -710,31 +710,6 @@ fn search_sidebar_tracking_context(app: &AppState) -> (Vec<u32>, Option<u32>) {
     (anime_ids, total)
 }
 
-fn library_sidebar_tracking_context(
-    app: &AppState,
-) -> (Vec<u32>, Option<AnimeStatus>, Option<u32>) {
-    let Some(anime) = app.library_selected_anime() else {
-        return (Vec::new(), None, None);
-    };
-    let totals = anime
-        .anime_ids
-        .iter()
-        .filter_map(|anime_id| {
-            app.details_cache
-                .get(anime_id)
-                .and_then(|details| details.episodes_count)
-        })
-        .collect::<Vec<_>>();
-    let total = if totals.is_empty() {
-        app.current_details
-            .as_ref()
-            .and_then(|details| details.episodes_count)
-    } else {
-        Some(totals.into_iter().sum())
-    };
-    (anime.anime_ids.clone(), Some(anime.status), total)
-}
-
 fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     if app.is_library_mode() {
         library::render_sidebar(f, app, area);
@@ -1903,6 +1878,23 @@ fn watched_episode_count(app: &AppState, anime_ids: &[u32]) -> usize {
         .len()
 }
 
+#[derive(Clone, Copy)]
+struct TrackingPosition {
+    season: u32,
+    episode: u32,
+    timestamp: f64,
+}
+
+impl From<&crate::storage::WatchProgress> for TrackingPosition {
+    fn from(progress: &crate::storage::WatchProgress) -> Self {
+        Self {
+            season: progress.season,
+            episode: progress.episode,
+            timestamp: progress.timestamp,
+        }
+    }
+}
+
 fn tracking_lines(
     app: &AppState,
     anime_ids: &[u32],
@@ -1916,7 +1908,21 @@ fn tracking_lines(
     let status = explicit_status
         .or_else(|| anime_status_for_ids(app, anime_ids))
         .unwrap_or(AnimeStatus::NotAdded);
-    let watched = watched_episode_count(app, anime_ids);
+    let watched = watched_episode_count(app, anime_ids) as u32;
+    tracking_summary_lines(
+        status,
+        watched,
+        total_episodes,
+        latest_progress_for_ids(app, anime_ids).map(TrackingPosition::from),
+    )
+}
+
+fn tracking_summary_lines(
+    status: AnimeStatus,
+    watched: u32,
+    total_episodes: Option<u32>,
+    latest_progress: Option<TrackingPosition>,
+) -> Vec<Line<'static>> {
     let watched_label = total_episodes.map_or_else(
         || format!("✓ {watched} сер."),
         |total| format!("✓ {watched}/{total} сер."),
@@ -1936,7 +1942,7 @@ fn tracking_lines(
         ])
         .alignment(Alignment::Center),
     ];
-    if let Some(progress) = latest_progress_for_ids(app, anime_ids) {
+    if let Some(progress) = latest_progress {
         lines.push(
             Line::from(Span::styled(
                 format!(

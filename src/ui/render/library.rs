@@ -508,6 +508,69 @@ fn anime_progress(anime: &crate::ui::app::LibraryAnimeEntry) -> Option<(u32, u32
     })
 }
 
+fn displayed_library_progress(
+    mode: AppMode,
+    anime: &crate::ui::app::LibraryAnimeEntry,
+    release: Option<&crate::ui::app::LibrarySeasonEntry>,
+) -> Option<(u32, u32)> {
+    if mode == AppMode::Library {
+        anime_progress(anime)
+    } else {
+        release.and_then(release_progress)
+    }
+}
+
+fn latest_progress_for_release(
+    release: &crate::ui::app::LibrarySeasonEntry,
+) -> Option<&crate::storage::WatchProgress> {
+    let first = release.first_episode.unwrap_or(1);
+    let end = release
+        .episodes_count
+        .map(|total| first.saturating_add(total));
+    release
+        .episodes
+        .iter()
+        .filter(|progress| {
+            progress.episode >= first && end.is_none_or(|end| progress.episode < end)
+        })
+        .max_by_key(|progress| progress.updated_at)
+}
+
+fn library_tracking_lines(app: &AppState) -> Vec<Line<'static>> {
+    let Some(anime) = app.library_selected_anime() else {
+        return Vec::new();
+    };
+
+    if app.mode == AppMode::Library {
+        let Some((watched, total)) = displayed_library_progress(app.mode, anime, None) else {
+            return Vec::new();
+        };
+        return tracking_summary_lines(
+            anime.status,
+            watched,
+            Some(total),
+            latest_progress_for_ids(app, &anime.anime_ids).map(TrackingPosition::from),
+        );
+    }
+
+    let Some(release) = app.library_selected_season() else {
+        return Vec::new();
+    };
+    let Some((watched, total)) = displayed_library_progress(app.mode, anime, Some(release)) else {
+        return Vec::new();
+    };
+    tracking_summary_lines(
+        release.status,
+        watched,
+        Some(total),
+        latest_progress_for_release(release).map(|progress| TrackingPosition {
+            season: release.season,
+            episode: progress.episode,
+            timestamp: progress.timestamp,
+        }),
+    )
+}
+
 fn new_episode_count(
     seen_episode_counts: &std::collections::BTreeMap<u32, u32>,
     release: &crate::ui::app::LibrarySeasonEntry,
@@ -613,9 +676,8 @@ fn render_library_sidebar_details_area(
             details.rating,
             details.episodes_count.map(|episodes| episodes.to_string()),
         ));
-        let (anime_ids, status, total) = library_sidebar_tracking_context(app);
         text.push(mk_sep());
-        text.extend(tracking_lines(app, &anime_ids, status, total));
+        text.extend(library_tracking_lines(app));
 
         let has_extra = details.genres.as_ref().is_some_and(|g| !g.is_empty())
             || details
@@ -674,8 +736,7 @@ fn render_library_sidebar_details_area(
                 .alignment(Alignment::Center),
             );
         }
-        let (anime_ids, status, total) = library_sidebar_tracking_context(app);
-        text.extend(tracking_lines(app, &anime_ids, status, total));
+        text.extend(library_tracking_lines(app));
     } else {
         text.push(
             Line::from(Span::styled(
@@ -699,6 +760,20 @@ fn render_library_sidebar_details_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress(episode: u32, watched: bool) -> crate::storage::WatchProgress {
+        crate::storage::WatchProgress {
+            anime_id: 42,
+            anime_title: "Онгоінг".to_string(),
+            season: 1,
+            episode,
+            studio_name: "Test".to_string(),
+            timestamp: 0.0,
+            duration: 0.0,
+            watched,
+            updated_at: i64::from(episode),
+        }
+    }
 
     fn ongoing_release() -> crate::ui::app::LibrarySeasonEntry {
         crate::ui::app::LibrarySeasonEntry {
@@ -730,5 +805,46 @@ mod tests {
         let release = ongoing_release();
         assert!(next_airing_label_at(&release, 1_000).is_some());
         assert!(next_airing_label_at(&release, 2_000).is_none());
+    }
+
+    #[test]
+    fn sidebar_progress_switches_between_franchise_and_selected_release() {
+        let mut completed = ongoing_release();
+        completed.episodes_count = Some(12);
+        completed.status = AnimeStatus::Completed;
+
+        let mut current = ongoing_release();
+        current.anime_id = 43;
+        current.season = 2;
+        current.episodes = (1..=8).map(|episode| progress(episode, true)).collect();
+        for entry in &mut current.episodes {
+            entry.anime_id = 43;
+            entry.season = 2;
+        }
+        current.episodes.push(crate::storage::WatchProgress {
+            anime_id: 43,
+            season: 2,
+            episode: 13,
+            ..progress(13, true)
+        });
+        current.episodes_count = Some(12);
+        current.status = AnimeStatus::Watching;
+
+        let anime = crate::ui::app::LibraryAnimeEntry {
+            anime_ids: vec![42, 43],
+            anime_title: "Франшиза".to_string(),
+            latest_progress: current.episodes[0].clone(),
+            seasons: vec![completed, current.clone()],
+            status: AnimeStatus::Watching,
+        };
+
+        assert_eq!(
+            displayed_library_progress(AppMode::Library, &anime, None),
+            Some((20, 24))
+        );
+        assert_eq!(
+            displayed_library_progress(AppMode::LibrarySeason, &anime, Some(&current)),
+            Some((8, 12))
+        );
     }
 }
