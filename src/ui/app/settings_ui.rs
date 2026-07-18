@@ -129,7 +129,7 @@ impl AppState {
                     self.set_error_status(format!("Не вдалося очистити постери: {error}"));
                 }
             },
-            4 => self.clear_library_confirmation = true,
+            4 => self.library.clear_confirmation = true,
             _ => {}
         }
     }
@@ -261,7 +261,7 @@ impl AppState {
                             .copied()
                             .unwrap_or(DefaultLibraryFilter::All);
                         self.settings.default_library_filter = filter;
-                        self.library_filter = library_filter_from_setting(filter);
+                        self.library.filter = library_filter_from_setting(filter);
                     }
                 }
                 self.persist_settings();

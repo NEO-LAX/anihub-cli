@@ -345,6 +345,54 @@ pub struct LibraryWatchedConfirmation {
     pub mark_watched: bool,
 }
 
+pub struct LibraryState {
+    pub items: Vec<LibraryAnimeEntry>,
+    pub all_items: Vec<LibraryAnimeEntry>,
+    pub filter: LibraryFilter,
+    pub sort: LibrarySort,
+    pub sort_reversed: bool,
+    pub sort_popup: Option<usize>,
+    pub search_query: String,
+    pub search_cursor: usize,
+    pub search_editing: bool,
+    pub anime_index: Option<usize>,
+    pub season_index: Option<usize>,
+    pub episode_index: Option<usize>,
+    pub anime_list_state: ListState,
+    pub season_list_state: ListState,
+    pub episode_list_state: ListState,
+    pub pending_delete_confirmation: Option<(Vec<u32>, String)>,
+    pub pending_watched_confirmation: Option<LibraryWatchedConfirmation>,
+    pub clear_confirmation: bool,
+    pub refresh_requested: bool,
+}
+
+impl LibraryState {
+    fn new(filter: LibraryFilter, sort: LibrarySort, sort_reversed: bool) -> Self {
+        Self {
+            items: Vec::new(),
+            all_items: Vec::new(),
+            filter,
+            sort,
+            sort_reversed,
+            sort_popup: None,
+            search_query: String::new(),
+            search_cursor: 0,
+            search_editing: false,
+            anime_index: None,
+            season_index: None,
+            episode_index: None,
+            anime_list_state: ListState::default(),
+            season_list_state: ListState::default(),
+            episode_list_state: ListState::default(),
+            pending_delete_confirmation: None,
+            pending_watched_confirmation: None,
+            clear_confirmation: false,
+            refresh_requested: false,
+        }
+    }
+}
+
 impl LibrarySeasonEntry {
     fn metadata(&self) -> LibraryReleaseMetadata {
         LibraryReleaseMetadata {
@@ -457,28 +505,7 @@ pub struct AppState {
     pub dubbing_list_state: ListState,
     pub episode_list_state: ListState,
 
-    pub library_items: Vec<LibraryAnimeEntry>,
-    pub library_all_items: Vec<LibraryAnimeEntry>,
-    pub library_filter: LibraryFilter,
-    pub library_sort: LibrarySort,
-    pub library_sort_reversed: bool,
-    /// Selected row while the library sort popup is open.
-    pub library_sort_popup: Option<usize>,
-    pub library_search_query: String,
-    pub library_search_cursor: usize,
-    pub library_search_editing: bool,
-    pub library_anime_index: Option<usize>,
-    pub library_season_index: Option<usize>,
-    pub library_episode_index: Option<usize>,
-    pub library_anime_list_state: ListState,
-    pub library_season_list_state: ListState,
-    pub library_episode_list_state: ListState,
-    pub pending_delete_confirmation: Option<(Vec<u32>, String)>,
-    pub pending_library_watched_confirmation: Option<LibraryWatchedConfirmation>,
-    pub clear_library_confirmation: bool,
-    /// Set when Library becomes visible; consumed by the background resource
-    /// coordinator without affecting the active selection generation.
-    pub library_refresh_requested: bool,
+    pub library: LibraryState,
     pub status_editor: Option<AnimeStatusEditor>,
 
     pub settings: Settings,
@@ -604,25 +631,11 @@ impl AppState {
             dubbing_list_state: ListState::default(),
             episode_list_state: ListState::default(),
 
-            library_items: Vec::new(),
-            library_all_items: Vec::new(),
-            library_filter: default_library_filter,
-            library_sort,
-            library_sort_reversed: settings.library_sort_reversed,
-            library_sort_popup: None,
-            library_search_query: String::new(),
-            library_search_cursor: 0,
-            library_search_editing: false,
-            library_anime_index: None,
-            library_season_index: None,
-            library_episode_index: None,
-            library_anime_list_state: ListState::default(),
-            library_season_list_state: ListState::default(),
-            library_episode_list_state: ListState::default(),
-            pending_delete_confirmation: None,
-            pending_library_watched_confirmation: None,
-            clear_library_confirmation: false,
-            library_refresh_requested: false,
+            library: LibraryState::new(
+                default_library_filter,
+                library_sort,
+                settings.library_sort_reversed,
+            ),
             status_editor: None,
 
             settings,
@@ -1016,8 +1029,9 @@ impl AppState {
     }
 
     pub fn library_selected_anime(&self) -> Option<&LibraryAnimeEntry> {
-        self.library_anime_index
-            .and_then(|idx| self.library_items.get(idx))
+        self.library
+            .anime_index
+            .and_then(|idx| self.library.items.get(idx))
     }
 
     pub fn library_season_numbers(&self) -> Vec<u32> {
@@ -1037,7 +1051,8 @@ impl AppState {
     #[allow(dead_code)]
     pub fn library_selected_episode(&self) -> Option<&WatchProgress> {
         let season = self.library_selected_season()?;
-        self.library_episode_index
+        self.library
+            .episode_index
             .and_then(|idx| season.episodes.get(idx))
     }
 
@@ -1064,12 +1079,12 @@ impl AppState {
 
     fn switch_primary_tab(&mut self, tab: PrimaryTab) {
         self.status_editor = None;
-        self.library_sort_popup = None;
-        self.pending_library_watched_confirmation = None;
-        self.pending_delete_confirmation = None;
-        self.clear_library_confirmation = false;
+        self.library.sort_popup = None;
+        self.library.pending_watched_confirmation = None;
+        self.library.pending_delete_confirmation = None;
+        self.library.clear_confirmation = false;
         self.moonanime_browser_prompt = None;
-        self.library_search_editing = false;
+        self.library.search_editing = false;
         self.settings_input = None;
         self.settings_input_value.clear();
         self.settings_input_cursor = 0;
@@ -1099,7 +1114,7 @@ impl AppState {
         // While typing a query, bare 1/2/3 must remain insertable. Tab switches
         // still work with Alt or Ctrl so the user is never trapped in the editor.
         let chord = modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        if (self.mode == AppMode::SearchInput || self.library_search_editing) && !chord {
+        if (self.mode == AppMode::SearchInput || self.library.search_editing) && !chord {
             return false;
         }
         match code {
@@ -1210,7 +1225,7 @@ impl AppState {
                     if self.handle_primary_tab_key(shortcut, key.modifiers) {
                         return Ok(());
                     }
-                    if self.library_search_editing {
+                    if self.library.search_editing {
                         self.handle_library_search_key(raw);
                         return Ok(());
                     }
@@ -1264,51 +1279,51 @@ impl AppState {
 
     fn handle_library_search_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Enter => self.library_search_editing = false,
+            KeyCode::Enter => self.library.search_editing = false,
             KeyCode::Esc => {
-                self.library_search_editing = false;
-                self.library_search_query.clear();
-                self.library_search_cursor = 0;
+                self.library.search_editing = false;
+                self.library.search_query.clear();
+                self.library.search_cursor = 0;
                 self.apply_library_filter();
             }
             KeyCode::Tab => self.cycle_library_filter(false),
             KeyCode::BackTab => self.cycle_library_filter(true),
             KeyCode::Char(character) => {
                 let byte_index =
-                    byte_index_for_char(&self.library_search_query, self.library_search_cursor);
-                self.library_search_query.insert(byte_index, character);
-                self.library_search_cursor += 1;
+                    byte_index_for_char(&self.library.search_query, self.library.search_cursor);
+                self.library.search_query.insert(byte_index, character);
+                self.library.search_cursor += 1;
                 self.apply_library_filter();
             }
-            KeyCode::Backspace if self.library_search_cursor > 0 => {
+            KeyCode::Backspace if self.library.search_cursor > 0 => {
                 let start =
-                    byte_index_for_char(&self.library_search_query, self.library_search_cursor - 1);
+                    byte_index_for_char(&self.library.search_query, self.library.search_cursor - 1);
                 let end =
-                    byte_index_for_char(&self.library_search_query, self.library_search_cursor);
-                self.library_search_query.replace_range(start..end, "");
-                self.library_search_cursor -= 1;
+                    byte_index_for_char(&self.library.search_query, self.library.search_cursor);
+                self.library.search_query.replace_range(start..end, "");
+                self.library.search_cursor -= 1;
                 self.apply_library_filter();
             }
             KeyCode::Delete
-                if self.library_search_cursor < self.library_search_query.chars().count() =>
+                if self.library.search_cursor < self.library.search_query.chars().count() =>
             {
                 let start =
-                    byte_index_for_char(&self.library_search_query, self.library_search_cursor);
+                    byte_index_for_char(&self.library.search_query, self.library.search_cursor);
                 let end =
-                    byte_index_for_char(&self.library_search_query, self.library_search_cursor + 1);
-                self.library_search_query.replace_range(start..end, "");
+                    byte_index_for_char(&self.library.search_query, self.library.search_cursor + 1);
+                self.library.search_query.replace_range(start..end, "");
                 self.apply_library_filter();
             }
             KeyCode::Left => {
-                self.library_search_cursor = self.library_search_cursor.saturating_sub(1);
+                self.library.search_cursor = self.library.search_cursor.saturating_sub(1);
             }
             KeyCode::Right => {
-                self.library_search_cursor =
-                    (self.library_search_cursor + 1).min(self.library_search_query.chars().count());
+                self.library.search_cursor =
+                    (self.library.search_cursor + 1).min(self.library.search_query.chars().count());
             }
-            KeyCode::Home => self.library_search_cursor = 0,
+            KeyCode::Home => self.library.search_cursor = 0,
             KeyCode::End => {
-                self.library_search_cursor = self.library_search_query.chars().count();
+                self.library.search_cursor = self.library.search_query.chars().count();
             }
             _ => {}
         }
@@ -1368,8 +1383,8 @@ impl AppState {
         if self.is_library_mode() {
             return match self.mode {
                 AppMode::Library => (
-                    self.library_anime_list_state.selected().unwrap_or(0),
-                    self.library_items.len(),
+                    self.library.anime_list_state.selected().unwrap_or(0),
+                    self.library.items.len(),
                 ),
                 AppMode::LibrarySeason => (
                     self.season_list_state.selected().unwrap_or(0),
@@ -1413,15 +1428,15 @@ impl AppState {
 
     fn cycle_library_filter(&mut self, backwards: bool) {
         let filter = if backwards {
-            self.library_filter.previous()
+            self.library.filter.previous()
         } else {
-            self.library_filter.next()
+            self.library.filter.next()
         };
         self.set_library_filter(filter);
     }
 
     fn set_library_filter(&mut self, filter: LibraryFilter) {
-        self.library_filter = filter;
+        self.library.filter = filter;
         self.settings.last_library_filter = Some(library_filter_to_setting(filter));
         self.mode = AppMode::Library;
         self.apply_library_filter();
@@ -1431,24 +1446,26 @@ impl AppState {
         let selected_ids = self
             .library_selected_anime()
             .map(|anime| anime.anime_ids.clone());
-        self.library_items = self
-            .library_all_items
+        self.library.items = self
+            .library
+            .all_items
             .iter()
             .filter(|anime| {
-                library_item_matches(anime, self.library_filter, &self.library_search_query)
+                library_item_matches(anime, self.library.filter, &self.library.search_query)
             })
             .cloned()
             .collect();
         sort_library_items(
-            &mut self.library_items,
-            self.library_sort,
-            self.library_sort_reversed,
+            &mut self.library.items,
+            self.library.sort,
+            self.library.sort_reversed,
             &self.details_cache,
             &self.watched_index,
         );
-        self.library_anime_index = selected_ids
+        self.library.anime_index = selected_ids
             .and_then(|ids| {
-                self.library_items
+                self.library
+                    .items
                     .iter()
                     .position(|anime| anime.anime_ids.iter().any(|id| ids.contains(id)))
             })
@@ -1456,21 +1473,23 @@ impl AppState {
                 self.settings
                     .last_library_anime_id
                     .and_then(|remembered_id| {
-                        self.library_items
+                        self.library
+                            .items
                             .iter()
                             .position(|anime| anime.anime_ids.contains(&remembered_id))
                     })
             })
-            .or_else(|| (!self.library_items.is_empty()).then_some(0));
-        self.library_anime_list_state
-            .select(self.library_anime_index);
-        self.library_season_index = None;
-        self.library_episode_index = None;
+            .or_else(|| (!self.library.items.is_empty()).then_some(0));
+        self.library
+            .anime_list_state
+            .select(self.library.anime_index);
+        self.library.season_index = None;
+        self.library.episode_index = None;
         self.season_list_state.select(None);
         self.dubbing_list_state.select(None);
         self.episode_list_state.select(None);
-        self.pending_delete_confirmation = None;
-        if self.library_items.is_empty() {
+        self.library.pending_delete_confirmation = None;
+        if self.library.items.is_empty() {
             self.current_sources = None;
             self.current_sources_key = None;
             self.current_details = None;
@@ -2382,30 +2401,30 @@ impl AppState {
         self.clear_status();
         self.current_poster = None;
         self.poster_fetch_pending = None;
-        self.library_items.clear();
-        self.library_all_items.clear();
-        self.library_anime_index = None;
-        self.library_season_index = None;
-        self.library_episode_index = None;
-        self.library_anime_list_state.select(None);
-        self.library_season_list_state.select(None);
+        self.library.items.clear();
+        self.library.all_items.clear();
+        self.library.anime_index = None;
+        self.library.season_index = None;
+        self.library.episode_index = None;
+        self.library.anime_list_state.select(None);
+        self.library.season_list_state.select(None);
         if self.mode == AppMode::Normal && self.selected_result_index.is_some() {
             self.restore_representative_poster();
         }
-        self.library_episode_list_state.select(None);
-        self.library_sort_popup = None;
-        self.pending_library_watched_confirmation = None;
-        self.pending_delete_confirmation = None;
+        self.library.episode_list_state.select(None);
+        self.library.sort_popup = None;
+        self.library.pending_watched_confirmation = None;
+        self.library.pending_delete_confirmation = None;
         self.status_editor = None;
     }
 
     fn open_library_search(&mut self) {
         self.open_library();
-        self.library_search_editing = true;
-        self.library_search_cursor = self.library_search_query.chars().count();
-        self.library_sort_popup = None;
-        self.pending_library_watched_confirmation = None;
-        self.pending_delete_confirmation = None;
+        self.library.search_editing = true;
+        self.library.search_cursor = self.library.search_query.chars().count();
+        self.library.sort_popup = None;
+        self.library.pending_watched_confirmation = None;
+        self.library.pending_delete_confirmation = None;
         self.status_editor = None;
         self.clear_activity();
         self.clear_status();
@@ -2416,13 +2435,13 @@ impl AppState {
             // Re-pressing 2 while already in the library jumps to the root list.
             if self.mode != AppMode::Library {
                 self.mode = AppMode::Library;
-                self.library_season_index = None;
-                self.library_episode_index = None;
+                self.library.season_index = None;
+                self.library.episode_index = None;
                 self.selected_season_index = None;
                 self.selected_dubbing_index = None;
                 self.selected_episode_index = None;
-                self.library_season_list_state.select(None);
-                self.library_episode_list_state.select(None);
+                self.library.season_list_state.select(None);
+                self.library.episode_list_state.select(None);
                 self.season_list_state.select(None);
                 self.dubbing_list_state.select(None);
                 self.episode_list_state.select(None);
@@ -2431,32 +2450,33 @@ impl AppState {
                 self.current_details = None;
                 self.current_poster = None;
                 self.studio_anime_ids.clear();
-                if let Some(index) = self.library_anime_index {
+                if let Some(index) = self.library.anime_index {
                     self.prepare_library_anime_selection();
-                    self.library_anime_list_state.select(Some(index));
+                    self.library.anime_list_state.select(Some(index));
                 }
             }
             return;
         }
 
         self.hydrate_library_catalog_metadata();
-        self.library_all_items = build_library_items(&self.history);
-        self.library_items.clear();
+        self.library.all_items = build_library_items(&self.history);
+        self.library.items.clear();
         self.mode = AppMode::Library;
-        self.library_refresh_requested = true;
+        self.library.refresh_requested = true;
         self.apply_library_filter();
-        if self.library_all_items.is_empty() {
+        if self.library.all_items.is_empty() {
             self.set_info_status("Бібліотека порожня — додайте аніме через e, або / для пошуку");
         }
     }
 
     pub fn take_library_refresh_request(&mut self) -> bool {
-        std::mem::take(&mut self.library_refresh_requested)
+        std::mem::take(&mut self.library.refresh_requested)
     }
 
     pub fn library_refresh_queries(&self) -> Vec<String> {
         let mut queries = self
-            .library_all_items
+            .library
+            .all_items
             .iter()
             .map(|anime| anime.anime_title.trim().to_string())
             .filter(|title| !title.is_empty())
@@ -2633,13 +2653,14 @@ impl AppState {
     }
 
     fn handle_pending_delete_confirmation(&mut self, key_code: KeyCode) -> bool {
-        let Some((anime_ids, anime_title)) = self.pending_delete_confirmation.clone() else {
+        let Some((anime_ids, anime_title)) = self.library.pending_delete_confirmation.clone()
+        else {
             return false;
         };
 
         match key_code {
             KeyCode::Enter => {
-                self.pending_delete_confirmation = None;
+                self.library.pending_delete_confirmation = None;
                 match self.storage.delete_library_entries(&anime_ids) {
                     Ok(history) => {
                         self.history = history;
@@ -2652,7 +2673,7 @@ impl AppState {
                 true
             }
             KeyCode::Esc => {
-                self.pending_delete_confirmation = None;
+                self.library.pending_delete_confirmation = None;
                 true
             }
             // Ignore other keys while the confirm dialog is open.
@@ -2661,23 +2682,23 @@ impl AppState {
     }
 
     fn handle_clear_library_confirmation(&mut self, key_code: KeyCode) -> bool {
-        if !self.clear_library_confirmation {
+        if !self.library.clear_confirmation {
             return false;
         }
         match key_code {
             KeyCode::Enter => {
-                self.clear_library_confirmation = false;
+                self.library.clear_confirmation = false;
                 match self.storage.clear_library() {
                     Ok(history) => {
                         self.history = history;
                         self.rebuild_history_indexes();
-                        self.library_all_items.clear();
-                        self.library_items.clear();
-                        self.library_anime_index = None;
+                        self.library.all_items.clear();
+                        self.library.items.clear();
+                        self.library.anime_index = None;
                         self.selected_season_index = None;
                         self.selected_dubbing_index = None;
                         self.selected_episode_index = None;
-                        self.library_anime_list_state.select(None);
+                        self.library.anime_list_state.select(None);
                         self.season_list_state.select(None);
                         self.dubbing_list_state.select(None);
                         self.episode_list_state.select(None);
@@ -2693,7 +2714,7 @@ impl AppState {
                     }
                 }
             }
-            KeyCode::Esc => self.clear_library_confirmation = false,
+            KeyCode::Esc => self.library.clear_confirmation = false,
             _ => {}
         }
         true
@@ -2703,7 +2724,7 @@ impl AppState {
         if self.mode == AppMode::Library {
             if let Some(anime) = self.library_selected_anime() {
                 if !anime.anime_ids.is_empty() {
-                    self.pending_delete_confirmation =
+                    self.library.pending_delete_confirmation =
                         Some((anime.anime_ids.clone(), anime.anime_title.clone()));
                 }
             }
@@ -2921,21 +2942,23 @@ impl AppState {
         let prev_dubbing = self.selected_dubbing_index;
         let prev_episode = self.selected_episode_index;
 
-        self.library_all_items = build_library_items(&self.history);
+        self.library.all_items = build_library_items(&self.history);
         self.apply_library_filter();
 
-        self.library_anime_index = prev_anime_title
+        self.library.anime_index = prev_anime_title
             .clone()
             .and_then(|anime_title| {
-                self.library_items
+                self.library
+                    .items
                     .iter()
                     .position(|item| item.anime_title == anime_title)
             })
-            .or_else(|| (!self.library_items.is_empty()).then_some(0));
-        self.library_anime_list_state
-            .select(self.library_anime_index);
+            .or_else(|| (!self.library.items.is_empty()).then_some(0));
+        self.library
+            .anime_list_state
+            .select(self.library.anime_index);
 
-        if self.library_items.is_empty()
+        if self.library.items.is_empty()
             || (self.mode != AppMode::Library && self.library_selected_anime().is_none())
         {
             self.mode = AppMode::Library;
@@ -4032,9 +4055,13 @@ mod tests {
         movie.anilist_id = Some(10_003);
         movie.classification = ReleaseClassification::MainlineMovie;
         catalog.releases.push(movie);
+        let mut ova = season_release(4, 2, "Клас убивць: OVA", 1);
+        ova.anilist_id = Some(10_004);
+        ova.classification = ReleaseClassification::MainlineSpecial;
+        catalog.releases.push(ova);
 
         let updates = library_catalog_updates(&history, &[catalog]);
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 3);
         assert!(!updates.iter().any(|update| update.anime_id == 1));
         assert_eq!(
             updates
@@ -4051,6 +4078,15 @@ mod tests {
         assert_eq!(
             movie.release.as_ref().map(|release| release.kind),
             Some(LibraryReleaseKind::Movie)
+        );
+        let ova = updates
+            .iter()
+            .find(|update| update.anime_id == 4)
+            .expect("new OVA update");
+        assert_eq!(ova.status, AnimeStatus::Planned);
+        assert_eq!(
+            ova.release.as_ref().map(|release| release.kind),
+            Some(LibraryReleaseKind::Special)
         );
     }
 

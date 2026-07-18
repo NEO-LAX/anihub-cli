@@ -125,11 +125,11 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
 
     let library_title = format!(
         " {} · {} {} ",
-        app.library_filter.label(),
-        app.library_sort.label(),
-        app.library_sort.direction_symbol(app.library_sort_reversed)
+        app.library.filter.label(),
+        app.library.sort.label(),
+        app.library.sort.direction_symbol(app.library.sort_reversed)
     );
-    if app.library_items.is_empty() {
+    if app.library.items.is_empty() {
         let border_style = if app.mode == AppMode::Library {
             Style::default().fg(color_highlight())
         } else {
@@ -143,10 +143,10 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         let inner = block.inner(chunks[0]);
         f.render_widget(block, chunks[0]);
 
-        let message = if app.library_search_query.is_empty() {
-            format!("У категорії «{}» поки порожньо", app.library_filter.label())
+        let message = if app.library.search_query.is_empty() {
+            format!("У категорії «{}» поки порожньо", app.library.filter.label())
         } else {
-            format!("Нічого не знайдено за «{}»", app.library_search_query)
+            format!("Нічого не знайдено за «{}»", app.library.search_query)
         };
         let centered = Layout::default()
             .direction(Direction::Vertical)
@@ -163,7 +163,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         );
     } else {
         let anime_items: Vec<ListItem> = app
-            .library_items
+            .library
+            .items
             .iter()
             .map(|item| {
                 let seasons = item
@@ -194,7 +195,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             })
             .collect();
         let anime_list = create_list(&library_title, anime_items, app.mode == AppMode::Library);
-        f.render_stateful_widget(anime_list, chunks[0], &mut app.library_anime_list_state);
+        f.render_stateful_widget(anime_list, chunks[0], &mut app.library.anime_list_state);
     }
 
     if chunks.len() >= 2 {
@@ -389,7 +390,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
 }
 
 pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
-    let Some(selected) = app.library_sort_popup else {
+    let Some(selected) = app.library.sort_popup else {
         return;
     };
     let actions = [
@@ -412,8 +413,8 @@ pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
     let items = LibrarySort::ALL
         .iter()
         .map(|sort| {
-            let active = *sort == app.library_sort;
-            let reversed = active && app.library_sort_reversed;
+            let active = *sort == app.library.sort;
+            let reversed = active && app.library.sort_reversed;
             let marker = if active { "✓" } else { " " };
             ListItem::new(format!(
                 "{marker} {} · {}",
@@ -435,7 +436,7 @@ pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
 }
 
 pub(super) fn render_watched_confirmation(f: &mut Frame, app: &AppState) {
-    let Some(confirmation) = &app.pending_library_watched_confirmation else {
+    let Some(confirmation) = &app.library.pending_watched_confirmation else {
         return;
     };
     let release_count = confirmation.releases.len();

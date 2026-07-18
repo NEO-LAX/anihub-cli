@@ -6,36 +6,36 @@ impl AppState {
     pub(super) fn open_library_sort_popup(&mut self) {
         let selected = LibrarySort::ALL
             .iter()
-            .position(|sort| *sort == self.library_sort)
+            .position(|sort| *sort == self.library.sort)
             .unwrap_or(0);
-        self.library_sort_popup = Some(selected);
+        self.library.sort_popup = Some(selected);
     }
 
     pub(super) fn handle_library_sort_popup(&mut self, key_code: KeyCode) -> bool {
-        let Some(selected) = self.library_sort_popup else {
+        let Some(selected) = self.library.sort_popup else {
             return false;
         };
         match key_code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.library_sort_popup = Some(selected.saturating_sub(1));
+                self.library.sort_popup = Some(selected.saturating_sub(1));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.library_sort_popup = Some((selected + 1).min(LibrarySort::ALL.len() - 1));
+                self.library.sort_popup = Some((selected + 1).min(LibrarySort::ALL.len() - 1));
             }
             KeyCode::Enter => {
                 let selected_sort = LibrarySort::ALL[selected];
-                if selected_sort == self.library_sort {
-                    self.library_sort_reversed = !self.library_sort_reversed;
+                if selected_sort == self.library.sort {
+                    self.library.sort_reversed = !self.library.sort_reversed;
                 } else {
-                    self.library_sort = selected_sort;
-                    self.library_sort_reversed = false;
+                    self.library.sort = selected_sort;
+                    self.library.sort_reversed = false;
                 }
-                self.settings.library_sort = library_sort_to_setting(self.library_sort);
-                self.settings.library_sort_reversed = self.library_sort_reversed;
-                self.library_sort_popup = None;
+                self.settings.library_sort = library_sort_to_setting(self.library.sort);
+                self.settings.library_sort_reversed = self.library.sort_reversed;
+                self.library.sort_popup = None;
                 self.apply_library_filter();
             }
-            KeyCode::Esc | KeyCode::Char('s') => self.library_sort_popup = None,
+            KeyCode::Esc | KeyCode::Char('s') => self.library.sort_popup = None,
             _ => {}
         }
         true
@@ -140,7 +140,7 @@ impl AppState {
                         .contains(&(release.anime_id, release.season, *episode))
                 })
         });
-        self.pending_library_watched_confirmation = Some(LibraryWatchedConfirmation {
+        self.library.pending_watched_confirmation = Some(LibraryWatchedConfirmation {
             anime_title: anime.anime_title,
             releases: anime.seasons,
             mark_watched: !all_watched,
@@ -148,12 +148,12 @@ impl AppState {
     }
 
     pub(super) fn handle_library_watched_confirmation(&mut self, key_code: KeyCode) -> bool {
-        let Some(confirmation) = self.pending_library_watched_confirmation.clone() else {
+        let Some(confirmation) = self.library.pending_watched_confirmation.clone() else {
             return false;
         };
         match key_code {
             KeyCode::Enter => {
-                self.pending_library_watched_confirmation = None;
+                self.library.pending_watched_confirmation = None;
                 let status = if confirmation.mark_watched {
                     AnimeStatus::Completed
                 } else {
@@ -204,7 +204,7 @@ impl AppState {
                     }
                 }
             }
-            KeyCode::Esc => self.pending_library_watched_confirmation = None,
+            KeyCode::Esc => self.library.pending_watched_confirmation = None,
             _ => {}
         }
         true

@@ -100,11 +100,11 @@ fn handle_library_key(app: &mut AppState, key: KeyCode) {
         (_, KeyCode::BackTab) => app.cycle_library_filter(true),
         (AppMode::Library, KeyCode::Left) => {}
         (AppMode::Library, KeyCode::Esc) => {
-            if app.library_search_query.is_empty() {
+            if app.library.search_query.is_empty() {
                 app.reset_to_home();
             } else {
-                app.library_search_query.clear();
-                app.library_search_cursor = 0;
+                app.library.search_query.clear();
+                app.library.search_cursor = 0;
                 app.apply_library_filter();
             }
         }

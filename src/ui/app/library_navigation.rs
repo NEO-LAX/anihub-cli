@@ -138,14 +138,14 @@ impl AppState {
         match self.mode {
             AppMode::Library => {
                 let Some(next) = wrapped_index(
-                    self.library_anime_list_state.selected(),
-                    self.library_items.len(),
+                    self.library.anime_list_state.selected(),
+                    self.library.items.len(),
                     direction,
                 ) else {
                     return;
                 };
-                self.library_anime_index = Some(next);
-                self.library_anime_list_state.select(Some(next));
+                self.library.anime_index = Some(next);
+                self.library.anime_list_state.select(Some(next));
                 self.remember_library_selection();
                 self.prepare_library_anime_selection();
             }

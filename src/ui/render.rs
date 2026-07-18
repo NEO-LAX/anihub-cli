@@ -402,11 +402,11 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         render_moonanime_popup(f, &title);
     } else if app.status_editor.is_some() {
         render_status_editor_popup(f, app);
-    } else if app.library_sort_popup.is_some() {
+    } else if app.library.sort_popup.is_some() {
         library::render_sort_popup(f, app);
-    } else if app.pending_library_watched_confirmation.is_some() {
+    } else if app.library.pending_watched_confirmation.is_some() {
         library::render_watched_confirmation(f, app);
-    } else if app.clear_library_confirmation {
+    } else if app.library.clear_confirmation {
         render_clear_library_popup(f);
     } else if app.settings_update_popup {
         settings::render_update_popup(f, app);
@@ -416,7 +416,7 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         settings::render_threshold_popup(f, app);
     } else if app.settings_choice.is_some() {
         settings::render_choice_popup(f, app);
-    } else if let Some((_, anime_title)) = app.pending_delete_confirmation.clone() {
+    } else if let Some((_, anime_title)) = app.library.pending_delete_confirmation.clone() {
         render_delete_popup(f, &anime_title);
     } else if app.show_help {
         render_help_popup(f);
@@ -451,7 +451,7 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
         rows[0],
     );
 
-    let editing = app.mode == AppMode::SearchInput || app.library_search_editing;
+    let editing = app.mode == AppMode::SearchInput || app.library.search_editing;
     let (title, context, alignment) = match app.primary_tab() {
         PrimaryTab::Search => (
             if app.settings.search_mode.is_extended() {
@@ -469,12 +469,12 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
             },
         ),
         PrimaryTab::Library
-            if app.library_search_editing || !app.library_search_query.is_empty() =>
+            if app.library.search_editing || !app.library.search_query.is_empty() =>
         {
             (
                 " Пошук у бібліотеці · / ",
                 library_search_header_context(app),
-                if app.library_search_editing {
+                if app.library.search_editing {
                     Alignment::Left
                 } else {
                     Alignment::Center
@@ -546,8 +546,8 @@ fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
 }
 
 fn active_search_cursor(app: &AppState) -> usize {
-    if app.library_search_editing {
-        app.library_search_cursor
+    if app.library.search_editing {
+        app.library.search_cursor
     } else {
         app.search_cursor
     }
@@ -602,17 +602,17 @@ fn search_header_context(app: &AppState) -> Line<'static> {
 }
 
 fn library_search_header_context(app: &AppState) -> Line<'static> {
-    if app.library_search_query.is_empty() {
+    if app.library.search_query.is_empty() {
         Line::from(Span::styled(
             "введіть назву аніме у бібліотеці…",
             Style::default().fg(color_dim()),
         ))
     } else {
         Line::from(Span::styled(
-            app.library_search_query.clone(),
+            app.library.search_query.clone(),
             Style::default()
                 .fg(color_text())
-                .add_modifier(if app.library_search_editing {
+                .add_modifier(if app.library.search_editing {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
@@ -625,7 +625,7 @@ fn library_filter_context(app: &AppState) -> Line<'static> {
     let spans = LibraryFilter::ALL
         .iter()
         .flat_map(|filter| {
-            let active = *filter == app.library_filter;
+            let active = *filter == app.library.filter;
             let label = filter.label();
             let style = if active {
                 selection_style()
@@ -1287,7 +1287,7 @@ fn context_shortcuts(app: &AppState) -> String {
     if app.mode == AppMode::SearchInput {
         return "Enter Знайти  Esc Скасувати  Alt+2 Бібліотека  Ctrl+C Вихід".to_string();
     }
-    if app.library_search_editing {
+    if app.library.search_editing {
         return "Enter Застосувати  Esc Очистити  Tab Категорія  Ctrl+C Вихід".to_string();
     }
     if app.is_library_mode() {

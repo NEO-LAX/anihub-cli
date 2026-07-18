@@ -526,9 +526,10 @@ impl ResourceCoordinator {
                     }
                 }
                 for item in app
-                    .library_all_items
+                    .library
+                    .all_items
                     .iter_mut()
-                    .chain(app.library_items.iter_mut())
+                    .chain(app.library.items.iter_mut())
                     .filter(|item| item.anime_ids.contains(&anime_id))
                 {
                     if item.anime_title.starts_with("Закладка #") {
@@ -1280,16 +1281,17 @@ pub fn apply_library_continue_context(
     sources: &EpisodeSourcesResponse,
     resolved: &ContinueResolvedEpisode,
 ) {
-    if app.library_items.is_empty() {
+    if app.library.items.is_empty() {
         app.open_library();
     }
 
-    app.library_anime_index = app
-        .library_items
+    app.library.anime_index = app
+        .library
+        .items
         .iter()
         .position(|item| item.anime_ids.contains(&progress.anime_id))
-        .or_else(|| (!app.library_items.is_empty()).then_some(0));
-    app.library_anime_list_state.select(app.library_anime_index);
+        .or_else(|| (!app.library.items.is_empty()).then_some(0));
+    app.library.anime_list_state.select(app.library.anime_index);
 
     app.mode = AppMode::LibraryEpisode;
     app.current_details = Some(details.clone());
