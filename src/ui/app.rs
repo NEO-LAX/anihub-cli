@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 mod input;
+mod library_actions;
 mod settings_ui;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +87,35 @@ pub enum LibraryFilter {
     Completed,
     OnHold,
     Dropped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LibrarySort {
+    Recent,
+    Title,
+    Year,
+    Rating,
+    Progress,
+}
+
+impl LibrarySort {
+    pub const ALL: [Self; 5] = [
+        Self::Recent,
+        Self::Title,
+        Self::Year,
+        Self::Rating,
+        Self::Progress,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "Нещодавні",
+            Self::Title => "Назва А–Я",
+            Self::Year => "Рік",
+            Self::Rating => "Рейтинг",
+            Self::Progress => "Прогрес",
+        }
+    }
 }
 
 impl LibraryFilter {
@@ -286,6 +316,13 @@ pub struct LibrarySeasonEntry {
     pub episodes: Vec<WatchProgress>,
 }
 
+#[derive(Clone)]
+pub struct LibraryWatchedConfirmation {
+    pub anime_title: String,
+    pub releases: Vec<LibrarySeasonEntry>,
+    pub mark_watched: bool,
+}
+
 impl LibrarySeasonEntry {
     fn metadata(&self) -> LibraryReleaseMetadata {
         LibraryReleaseMetadata {
@@ -398,6 +435,9 @@ pub struct AppState {
     pub library_items: Vec<LibraryAnimeEntry>,
     pub library_all_items: Vec<LibraryAnimeEntry>,
     pub library_filter: LibraryFilter,
+    pub library_sort: LibrarySort,
+    /// Selected row while the library sort popup is open.
+    pub library_sort_popup: Option<usize>,
     pub library_search_query: String,
     pub library_search_cursor: usize,
     pub library_search_editing: bool,
@@ -408,6 +448,7 @@ pub struct AppState {
     pub library_season_list_state: ListState,
     pub library_episode_list_state: ListState,
     pub pending_delete_confirmation: Option<(Vec<u32>, String)>,
+    pub pending_library_watched_confirmation: Option<LibraryWatchedConfirmation>,
     pub clear_library_confirmation: bool,
     pub status_editor: Option<AnimeStatusEditor>,
 
@@ -520,6 +561,8 @@ impl AppState {
             library_items: Vec::new(),
             library_all_items: Vec::new(),
             library_filter: default_library_filter,
+            library_sort: LibrarySort::Recent,
+            library_sort_popup: None,
             library_search_query: String::new(),
             library_search_cursor: 0,
             library_search_editing: false,
@@ -530,6 +573,7 @@ impl AppState {
             library_season_list_state: ListState::default(),
             library_episode_list_state: ListState::default(),
             pending_delete_confirmation: None,
+            pending_library_watched_confirmation: None,
             clear_library_confirmation: false,
             status_editor: None,
 
@@ -972,6 +1016,8 @@ impl AppState {
 
     fn switch_primary_tab(&mut self, tab: PrimaryTab) {
         self.status_editor = None;
+        self.library_sort_popup = None;
+        self.pending_library_watched_confirmation = None;
         self.pending_delete_confirmation = None;
         self.clear_library_confirmation = false;
         self.moonanime_browser_prompt = None;
@@ -1076,6 +1122,14 @@ impl AppState {
                     }
 
                     if self.handle_status_editor(shortcut) {
+                        return Ok(());
+                    }
+
+                    if self.handle_library_sort_popup(shortcut) {
+                        return Ok(());
+                    }
+
+                    if self.handle_library_watched_confirmation(shortcut) {
                         return Ok(());
                     }
 
@@ -1336,6 +1390,12 @@ impl AppState {
             })
             .cloned()
             .collect();
+        sort_library_items(
+            &mut self.library_items,
+            self.library_sort,
+            &self.details_cache,
+            &self.watched_index,
+        );
         self.library_anime_index = selected_ids
             .and_then(|ids| {
                 self.library_items
@@ -2274,6 +2334,8 @@ impl AppState {
             self.restore_representative_poster();
         }
         self.library_episode_list_state.select(None);
+        self.library_sort_popup = None;
+        self.pending_library_watched_confirmation = None;
         self.pending_delete_confirmation = None;
         self.status_editor = None;
     }
@@ -2282,6 +2344,8 @@ impl AppState {
         self.open_library();
         self.library_search_editing = true;
         self.library_search_cursor = self.library_search_query.chars().count();
+        self.library_sort_popup = None;
+        self.pending_library_watched_confirmation = None;
         self.pending_delete_confirmation = None;
         self.status_editor = None;
         self.clear_activity();
@@ -2775,56 +2839,21 @@ impl AppState {
         anime_title: String,
         release: LibraryReleaseMetadata,
     ) {
-        let source_key = EpisodeSourcesKey::new(anime_id, release.season);
-        let sources = self.sources_cache.get(&source_key).or_else(|| {
-            (self.current_sources_key == Some(source_key))
-                .then(|| self.current_sources.clone())
-                .flatten()
-        });
-        let mut target_episodes = BTreeMap::<u32, String>::new();
-        if let Some(sources) = sources {
-            for studio in sources
-                .ashdi
-                .iter()
-                .filter(|studio| studio.season_number == release.season)
-            {
-                for episode in &studio.episodes {
-                    target_episodes
-                        .entry(episode.episode_number)
-                        .or_insert_with(|| studio.studio_name.clone());
-                }
-            }
-            if target_episodes.is_empty() {
-                for studio in sources
-                    .moonanime
-                    .iter()
-                    .filter(|studio| studio.season_number == release.season)
-                {
-                    for episode in &studio.episodes {
-                        target_episodes
-                            .entry(episode.episode_number)
-                            .or_insert_with(|| studio.studio_name.clone());
-                    }
-                }
-            }
-        }
-        if target_episodes.is_empty() {
-            if let Some(count) = release.episodes_count {
-                let first = release.first_episode.unwrap_or(1);
-                for episode in first..first.saturating_add(count) {
-                    target_episodes.insert(episode, "Статус".to_string());
-                }
-            }
-        }
+        let target_episodes = self.episode_targets_for_release(anime_id, &release);
         if target_episodes.is_empty() {
             self.set_info_status("Список серій цього випуску ще не завантажено");
             return;
         }
 
-        let all_watched = target_episodes.keys().all(|episode| {
-            self.watched_index
-                .contains(&(anime_id, release.season, *episode))
-        });
+        let all_watched = self
+            .history
+            .library
+            .get(&anime_id)
+            .is_some_and(|record| record.status == AnimeStatus::Completed)
+            || target_episodes.keys().all(|episode| {
+                self.watched_index
+                    .contains(&(anime_id, release.season, *episode))
+            });
         let mark_watched = !all_watched;
         let episode_updates = target_episodes
             .into_iter()
@@ -3473,6 +3502,113 @@ fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
     items
 }
 
+fn sort_library_items(
+    items: &mut [LibraryAnimeEntry],
+    sort: LibrarySort,
+    details_cache: &moka::sync::Cache<u32, AnimeDetails>,
+    watched_index: &HashSet<(u32, u32, u32)>,
+) {
+    items.sort_by(|a, b| {
+        let ordering = match sort {
+            LibrarySort::Recent => b
+                .latest_progress
+                .updated_at
+                .cmp(&a.latest_progress.updated_at),
+            LibrarySort::Title => a
+                .anime_title
+                .to_lowercase()
+                .cmp(&b.anime_title.to_lowercase()),
+            LibrarySort::Year => match (
+                library_first_year(a, details_cache),
+                library_first_year(b, details_cache),
+            ) {
+                (Some(a), Some(b)) => b.cmp(&a),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+            LibrarySort::Rating => match (
+                library_first_rating(a, details_cache),
+                library_first_rating(b, details_cache),
+            ) {
+                (Some(a), Some(b)) => b.total_cmp(&a),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+            LibrarySort::Progress => match (
+                library_progress_ratio(a, watched_index),
+                library_progress_ratio(b, watched_index),
+            ) {
+                (Some((a_watched, a_total)), Some((b_watched, b_total))) => {
+                    (b_watched * a_total).cmp(&(a_watched * b_total))
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+        };
+        ordering
+            .then_with(|| {
+                b.latest_progress
+                    .updated_at
+                    .cmp(&a.latest_progress.updated_at)
+            })
+            .then_with(|| a.anime_title.cmp(&b.anime_title))
+    });
+}
+
+fn library_first_year(
+    anime: &LibraryAnimeEntry,
+    details_cache: &moka::sync::Cache<u32, AnimeDetails>,
+) -> Option<u32> {
+    anime
+        .seasons
+        .iter()
+        .find_map(|release| details_cache.get(&release.anime_id)?.year)
+}
+
+fn library_first_rating(
+    anime: &LibraryAnimeEntry,
+    details_cache: &moka::sync::Cache<u32, AnimeDetails>,
+) -> Option<f32> {
+    anime
+        .seasons
+        .iter()
+        .find_map(|release| details_cache.get(&release.anime_id)?.rating)
+}
+
+fn library_progress_ratio(
+    anime: &LibraryAnimeEntry,
+    watched_index: &HashSet<(u32, u32, u32)>,
+) -> Option<(u64, u64)> {
+    let mut watched = 0u64;
+    let mut total = 0u64;
+    for release in &anime.seasons {
+        let Some(release_total) = release.episodes_count else {
+            continue;
+        };
+        total += u64::from(release_total);
+        if release.status == AnimeStatus::Completed {
+            watched += u64::from(release_total);
+            continue;
+        }
+        let first = release.first_episode.unwrap_or(1);
+        let end = first.saturating_add(release_total);
+        watched += watched_index
+            .iter()
+            .filter(|(anime_id, season, episode)| {
+                *anime_id == release.anime_id
+                    && *season == release.season
+                    && *episode >= first
+                    && *episode < end
+            })
+            .count()
+            .min(release_total as usize) as u64;
+    }
+    (total > 0).then_some((watched, total))
+}
+
 fn library_item_matches(anime: &LibraryAnimeEntry, filter: LibraryFilter, query: &str) -> bool {
     let status_matches = match filter {
         LibraryFilter::All => true,
@@ -3743,6 +3879,73 @@ mod tests {
             LibraryFilter::Completed,
             "тест"
         ));
+    }
+
+    #[test]
+    fn library_sort_supports_titles_and_completion_ratio() {
+        let mut history = AppHistory::default();
+        for (anime_id, title, watched) in [(1, "Бета", 1), (2, "Альфа", 3)] {
+            history.library.insert(
+                anime_id,
+                crate::storage::history::AnimeLibraryRecord {
+                    title: title.to_string(),
+                    status: AnimeStatus::Watching,
+                    updated_at: i64::from(anime_id),
+                    release: Some(LibraryReleaseMetadata {
+                        title: title.to_string(),
+                        kind: LibraryReleaseKind::Season,
+                        season: 1,
+                        part: Some(1),
+                        episodes_count: Some(4),
+                        first_episode: Some(1),
+                    }),
+                },
+            );
+            for episode in 1..=watched {
+                history.progress.insert(
+                    StorageManager::make_progress_key(anime_id, 1, episode, "Dub"),
+                    WatchProgress {
+                        anime_id,
+                        anime_title: title.to_string(),
+                        season: 1,
+                        episode,
+                        studio_name: "Dub".to_string(),
+                        timestamp: 1200.0,
+                        duration: 1200.0,
+                        watched: true,
+                        updated_at: i64::from(anime_id),
+                    },
+                );
+            }
+        }
+        let watched_index = history
+            .progress
+            .values()
+            .filter(|progress| progress.watched)
+            .map(|progress| (progress.anime_id, progress.season, progress.episode))
+            .collect::<HashSet<_>>();
+        let details_cache = moka::sync::Cache::new(4);
+        let mut items = build_library_items(&history);
+
+        sort_library_items(
+            &mut items,
+            LibrarySort::Title,
+            &details_cache,
+            &watched_index,
+        );
+        assert_eq!(items[0].anime_title, "Альфа");
+
+        sort_library_items(
+            &mut items,
+            LibrarySort::Progress,
+            &details_cache,
+            &watched_index,
+        );
+        assert_eq!(items[0].anime_title, "Альфа");
+        assert_eq!(
+            library_progress_ratio(&items[0], &watched_index),
+            Some((3, 4))
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::api;
 use crate::settings::{ColorMode, SurfaceMode, ThemePreset};
 use crate::storage::{AnimeStatus, LibraryReleaseKind};
 use crate::ui::app::{
-    AppMode, AppState, FocusPanel, LibraryFilter, PrimaryTab, SettingsChoiceKind, SettingsInput,
-    SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
+    AppMode, AppState, FocusPanel, LibraryFilter, LibrarySort, PrimaryTab, SettingsChoiceKind,
+    SettingsInput, SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
 };
 
 mod library;
@@ -402,6 +402,10 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         render_moonanime_popup(f, &title);
     } else if app.status_editor.is_some() {
         render_status_editor_popup(f, app);
+    } else if app.library_sort_popup.is_some() {
+        library::render_sort_popup(f, app);
+    } else if app.pending_library_watched_confirmation.is_some() {
+        library::render_watched_confirmation(f, app);
     } else if app.clear_library_confirmation {
         render_clear_library_popup(f);
     } else if app.settings_update_popup {
@@ -1314,8 +1318,7 @@ fn context_shortcuts(app: &AppState) -> String {
     if app.is_library_mode() {
         return match app.mode {
             AppMode::Library => {
-                "Tab Категорія  Enter Відкрити  e Статус  c Продовжити  / Пошук бібліотеки"
-                    .to_string()
+                "Enter Відкрити  Space Усе переглянуто  s Сортування  e Статус  / Пошук".to_string()
             }
             AppMode::LibrarySeason | AppMode::LibraryDubbing => {
                 "Enter Далі  Space Переглянуто  e Статус  Esc Назад".to_string()
@@ -2418,6 +2421,7 @@ fn render_help_popup(f: &mut Frame) {
         row("Space", "Переглянуто"),
         row("Backsp.", "Очистити таймкод"),
         row("d", "Видалити прогрес"),
+        row("s", "Сортування бібліотеки"),
         row("o", "У браузері"),
         row("Tab", "Категорія"),
     ];

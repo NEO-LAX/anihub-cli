@@ -122,7 +122,11 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         .constraints(constraints)
         .split(area);
 
-    let library_title = format!(" {} ", app.library_filter.label());
+    let library_title = format!(
+        " {} · {} ",
+        app.library_filter.label(),
+        app.library_sort.label()
+    );
     if app.library_items.is_empty() {
         let border_style = if app.mode == AppMode::Library {
             Style::default().fg(color_highlight())
@@ -173,6 +177,9 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 if extras > 0 {
                     metadata.push(format!("{extras} дод."));
                 }
+                if let Some((watched, total)) = anime_progress(item) {
+                    metadata.push(format!("{watched}/{total}"));
+                }
                 ListItem::new(label_with_metadata(&item.anime_title, &metadata))
             })
             .collect();
@@ -187,9 +194,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             .flat_map(|anime| anime.seasons.iter())
             .map(|release| {
                 let count = app.dubbing_choices_for_season(release.season).len();
-                let mut metadata = release
-                    .episodes_count
-                    .map(|count| format!("{count} сер."))
+                let mut metadata = release_progress(release)
+                    .map(|(watched, total)| format!("{watched}/{total}"))
                     .into_iter()
                     .collect::<Vec<_>>();
                 if count > 1 {
@@ -363,6 +369,117 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             f.render_stateful_widget(episode_list, chunks[3], &mut app.episode_list_state);
         }
     }
+}
+
+pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
+    let Some(selected) = app.library_sort_popup else {
+        return;
+    };
+    let actions = [
+        ("Enter", "Застосувати", color_highlight()),
+        ("Esc", "", color_dim()),
+    ];
+    let area = centered_fixed(f.area(), dialog_width_for(42, &actions), 11);
+    let block = dialog_block(
+        " Сортування бібліотеки ",
+        color_highlight(),
+        color_highlight(),
+    );
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let items = LibrarySort::ALL
+        .iter()
+        .map(|sort| ListItem::new(format!("  {}", sort.label())))
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .highlight_symbol(">> ")
+        .highlight_style(selection_style());
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected));
+    f.render_stateful_widget(list, rows[0], &mut state);
+    f.render_widget(
+        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
+        rows[1],
+    );
+}
+
+pub(super) fn render_watched_confirmation(f: &mut Frame, app: &AppState) {
+    let Some(confirmation) = &app.pending_library_watched_confirmation else {
+        return;
+    };
+    let release_count = confirmation.releases.len();
+    let action = if confirmation.mark_watched {
+        "Позначити переглянутими"
+    } else {
+        "Позначити непереглянутими"
+    };
+    let body = vec![
+        Line::from(Span::styled(
+            truncate_middle(&confirmation.anime_title, 44),
+            Style::default()
+                .fg(color_text())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{action} усі випуски ({release_count})?"),
+            Style::default().fg(color_dim()),
+        )),
+    ];
+    render_confirm_dialog(
+        f,
+        " Статус усього аніме ",
+        color_highlight(),
+        &body,
+        &[
+            ("Enter", "Підтвердити", color_highlight()),
+            ("Esc", "", color_dim()),
+        ],
+        50,
+        8,
+    );
+}
+
+fn release_progress(release: &crate::ui::app::LibrarySeasonEntry) -> Option<(u32, u32)> {
+    let total = release.episodes_count?;
+    let watched = if release.status == AnimeStatus::Completed {
+        total
+    } else {
+        let first = release.first_episode.unwrap_or(1);
+        let end = first.saturating_add(total);
+        release
+            .episodes
+            .iter()
+            .filter(|progress| {
+                progress.watched && progress.episode >= first && progress.episode < end
+            })
+            .map(|progress| progress.episode)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            .min(total as usize) as u32
+    };
+    Some((watched, total))
+}
+
+fn anime_progress(anime: &crate::ui::app::LibraryAnimeEntry) -> Option<(u32, u32)> {
+    let progress = anime
+        .seasons
+        .iter()
+        .filter_map(release_progress)
+        .collect::<Vec<_>>();
+    (!progress.is_empty()).then(|| {
+        progress.into_iter().fold(
+            (0, 0),
+            |(watched, total), (release_watched, release_total)| {
+                (watched + release_watched, total + release_total)
+            },
+        )
+    })
 }
 
 fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) {

@@ -84,6 +84,8 @@ fn handle_library_key(app: &mut AppState, key: KeyCode) {
         (_, KeyCode::Char('q')) => app.should_quit = true,
         (AppMode::Library, KeyCode::Char('c')) => app.request_continue(),
         (AppMode::Library, KeyCode::Char('d')) => app.delete_library_selection(),
+        (AppMode::Library, KeyCode::Char('s')) => app.open_library_sort_popup(),
+        (AppMode::Library, KeyCode::Char(' ')) => app.open_library_watched_confirmation(),
         (
             AppMode::LibrarySeason | AppMode::LibraryDubbing | AppMode::LibraryEpisode,
             KeyCode::Char(' '),

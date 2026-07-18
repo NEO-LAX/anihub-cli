@@ -377,26 +377,37 @@ impl StorageManager {
         status_update: &AnimeStatusUpdate,
         episode_updates: &[EpisodeWatchedUpdate],
     ) -> Result<AppHistory> {
+        self.set_releases_watched(std::slice::from_ref(status_update), episode_updates)
+    }
+
+    /// Atomically synchronize several release statuses and their watched flags.
+    pub fn set_releases_watched(
+        &self,
+        status_updates: &[AnimeStatusUpdate],
+        episode_updates: &[EpisodeWatchedUpdate],
+    ) -> Result<AppHistory> {
         let now = Utc::now().timestamp();
         self.update_history_batch(|history| {
             for update in episode_updates {
                 Self::apply_episode_watched(history, update, now);
             }
-            let release = status_update.release.clone().or_else(|| {
-                history
-                    .library
-                    .get(&status_update.anime_id)
-                    .and_then(|record| record.release.clone())
-            });
-            history.library.insert(
-                status_update.anime_id,
-                AnimeLibraryRecord {
-                    title: status_update.title.clone(),
-                    status: status_update.status,
-                    updated_at: now,
-                    release,
-                },
-            );
+            for status_update in status_updates {
+                let release = status_update.release.clone().or_else(|| {
+                    history
+                        .library
+                        .get(&status_update.anime_id)
+                        .and_then(|record| record.release.clone())
+                });
+                history.library.insert(
+                    status_update.anime_id,
+                    AnimeLibraryRecord {
+                        title: status_update.title.clone(),
+                        status: status_update.status,
+                        updated_at: now,
+                        release,
+                    },
+                );
+            }
         })
     }
 
@@ -1552,6 +1563,47 @@ mod tests {
         let backup_bytes = fs::read(directory.backup_path()).expect("read batch backup");
         let backup = parse_history(&backup_bytes).expect("parse batch backup");
         assert_eq!(backup, initial);
+    }
+
+    #[test]
+    fn multiple_releases_and_episodes_share_one_transaction() {
+        let directory = TestDirectory::new();
+        let manager = directory.manager();
+        let statuses = [11, 12].map(|anime_id| AnimeStatusUpdate {
+            anime_id,
+            title: "Франшиза".to_string(),
+            status: AnimeStatus::Completed,
+            release: Some(LibraryReleaseMetadata {
+                title: format!("Сезон {}", anime_id - 10),
+                kind: LibraryReleaseKind::Season,
+                season: anime_id - 10,
+                part: Some(1),
+                episodes_count: Some(1),
+                first_episode: Some(1),
+            }),
+        });
+        let episodes = [11, 12].map(|anime_id| EpisodeWatchedUpdate {
+            anime_id,
+            anime_title: "Франшиза".to_string(),
+            season: anime_id - 10,
+            episode: 1,
+            studio_name: "Статус".to_string(),
+            watched: true,
+        });
+
+        let history = manager
+            .set_releases_watched(&statuses, &episodes)
+            .expect("mark franchise watched");
+
+        assert_eq!(history.library.len(), 2);
+        assert_eq!(history.progress.len(), 2);
+        assert!(
+            history
+                .library
+                .values()
+                .all(|record| record.status == AnimeStatus::Completed)
+        );
+        assert!(history.progress.values().all(|progress| progress.watched));
     }
 
     #[test]
