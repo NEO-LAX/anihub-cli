@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AniHub CLI — термінальний клієнт AniHub (Rust, mpv)</title>
+  <meta
+    name="description"
+    content="AniHub CLI — неофіційний термінальний клієнт для anihub.in.ua. Пошук, бібліотека, mpv, Discord Rich Presence. Написаний на Rust."
+  />
+  <meta name="robots" content="index,follow" />
+  <link rel="canonical" href="https://neo-lax.github.io/anihub-cli/" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --card: #161b22;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #a371f7;
+      --border: #30363d;
+      --ok: #3fb950;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif;
+      background:
+        radial-gradient(900px 500px at 10% -10%, rgba(163, 113, 247, 0.18), transparent 60%),
+        radial-gradient(700px 400px at 100% 0%, rgba(63, 185, 80, 0.08), transparent 50%),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 3rem 1.25rem 4rem;
+    }
+    h1 {
+      font-size: clamp(2rem, 5vw, 2.6rem);
+      letter-spacing: -0.03em;
+      margin: 0 0 0.5rem;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      color: var(--ok);
+      border: 1px solid rgba(63, 185, 80, 0.35);
+      background: rgba(63, 185, 80, 0.08);
+      border-radius: 999px;
+      padding: 0.2rem 0.65rem;
+      margin-bottom: 1rem;
+    }
+    .lead {
+      color: var(--muted);
+      font-size: 1.1rem;
+      margin: 0 0 1.75rem;
+    }
+    .lead strong { color: var(--text); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.1rem 1.2rem;
+      margin: 0 0 1rem;
+    }
+    .card h2 {
+      margin: 0 0 0.65rem;
+      font-size: 0.95rem;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    ul {
+      margin: 0;
+      padding-left: 1.15rem;
+      color: var(--muted);
+    }
+    li { margin: 0.25rem 0; }
+    li strong { color: var(--text); font-weight: 600; }
+    pre {
+      margin: 0;
+      overflow-x: auto;
+      background: #010409;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.9rem 1rem;
+      font-size: 0.85rem;
+      line-height: 1.45;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      margin: 1.5rem 0 2rem;
+    }
+    a.btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      text-decoration: none;
+      border-radius: 10px;
+      padding: 0.7rem 1rem;
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    a.btn-primary {
+      background: var(--accent);
+      color: #0d1117;
+    }
+    a.btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    a.btn-secondary:hover { border-color: var(--muted); }
+    footer {
+      margin-top: 2rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+    footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="badge">Unofficial · MIT · Rust</div>
+    <h1>AniHub CLI</h1>
+    <p class="lead">
+      Неофіційний <strong>термінальний клієнт</strong> для
+      <a href="https://anihub.in.ua" style="color: var(--accent)">anihub.in.ua</a> —
+      пошук, бібліотека й перегляд у <strong>mpv</strong>. Написаний на <strong>Rust</strong> 🦀
+    </p>
+
+    <div class="actions">
+      <a class="btn btn-primary" href="https://github.com/NEO-LAX/anihub-cli">GitHub</a>
+      <a class="btn btn-secondary" href="https://github.com/NEO-LAX/anihub-cli/releases/latest">Releases</a>
+      <a class="btn btn-secondary" href="https://github.com/NEO-LAX/anihub-cli/blob/main/README.uk.md">README (UK)</a>
+    </div>
+
+    <div class="card">
+      <h2>Можливості</h2>
+      <ul>
+        <li><strong>Пошук</strong> AniHub (strict / extended) + франшизи</li>
+        <li><strong>Бібліотека</strong> зі статусами, фільтрами, resume</li>
+        <li><strong>mpv</strong> (Ashdi), MoonAnime у браузері</li>
+        <li><strong>Discord</strong> Rich Presence (opt-in)</li>
+        <li><strong>Теми</strong> RGB / ANSI, кеш постерів і метаданих</li>
+        <li>Шорткати на <strong>EN</strong> і <strong>UA/RU</strong> розкладках</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>Встановлення (Linux / macOS)</h2>
+      <pre><code>curl --fail --location --retry 3 \
+  https://raw.githubusercontent.com/NEO-LAX/anihub-cli/main/install.sh | bash</code></pre>
+    </div>
+
+    <footer>
+      Неофіційний проєкт ·
+      <a href="https://github.com/NEO-LAX/anihub-cli">NEO-LAX/anihub-cli</a> ·
+      <a href="https://github.com/NEO-LAX/anihub-cli/blob/main/LICENSE">MIT</a>
+    </footer>
+  </main>
+</body>
+</html>
