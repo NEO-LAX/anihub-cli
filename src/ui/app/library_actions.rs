@@ -23,7 +23,13 @@ impl AppState {
                 self.library_sort_popup = Some((selected + 1).min(LibrarySort::ALL.len() - 1));
             }
             KeyCode::Enter => {
-                self.library_sort = LibrarySort::ALL[selected];
+                let selected_sort = LibrarySort::ALL[selected];
+                if selected_sort == self.library_sort {
+                    self.library_sort_reversed = !self.library_sort_reversed;
+                } else {
+                    self.library_sort = selected_sort;
+                    self.library_sort_reversed = false;
+                }
                 self.library_sort_popup = None;
                 self.apply_library_filter();
             }

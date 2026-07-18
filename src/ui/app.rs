@@ -110,11 +110,29 @@ impl LibrarySort {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Recent => "Нещодавні",
-            Self::Title => "Назва А–Я",
+            Self::Title => "Назва",
             Self::Year => "Рік",
             Self::Rating => "Рейтинг",
             Self::Progress => "Прогрес",
         }
+    }
+
+    pub const fn order_label(self, reversed: bool) -> &'static str {
+        match (self, reversed) {
+            (Self::Recent | Self::Year, false) => "новіші → старіші",
+            (Self::Recent | Self::Year, true) => "старіші → новіші",
+            (Self::Title, false) => "А → Я",
+            (Self::Title, true) => "Я → А",
+            (Self::Rating, false) => "вищий → нижчий",
+            (Self::Rating, true) => "нижчий → вищий",
+            (Self::Progress, false) => "більший → менший",
+            (Self::Progress, true) => "менший → більший",
+        }
+    }
+
+    pub const fn direction_symbol(self, reversed: bool) -> &'static str {
+        let ascending = matches!(self, Self::Title) != reversed;
+        if ascending { "↑" } else { "↓" }
     }
 }
 
@@ -436,6 +454,7 @@ pub struct AppState {
     pub library_all_items: Vec<LibraryAnimeEntry>,
     pub library_filter: LibraryFilter,
     pub library_sort: LibrarySort,
+    pub library_sort_reversed: bool,
     /// Selected row while the library sort popup is open.
     pub library_sort_popup: Option<usize>,
     pub library_search_query: String,
@@ -562,6 +581,7 @@ impl AppState {
             library_all_items: Vec::new(),
             library_filter: default_library_filter,
             library_sort: LibrarySort::Recent,
+            library_sort_reversed: false,
             library_sort_popup: None,
             library_search_query: String::new(),
             library_search_cursor: 0,
@@ -1393,6 +1413,7 @@ impl AppState {
         sort_library_items(
             &mut self.library_items,
             self.library_sort,
+            self.library_sort_reversed,
             &self.details_cache,
             &self.watched_index,
         );
@@ -3505,6 +3526,7 @@ fn build_library_items(history: &AppHistory) -> Vec<LibraryAnimeEntry> {
 fn sort_library_items(
     items: &mut [LibraryAnimeEntry],
     sort: LibrarySort,
+    reversed: bool,
     details_cache: &moka::sync::Cache<u32, AnimeDetails>,
     watched_index: &HashSet<(u32, u32, u32)>,
 ) {
@@ -3548,13 +3570,18 @@ fn sort_library_items(
                 (None, None) => std::cmp::Ordering::Equal,
             },
         };
-        ordering
+        let ordering = ordering
             .then_with(|| {
                 b.latest_progress
                     .updated_at
                     .cmp(&a.latest_progress.updated_at)
             })
-            .then_with(|| a.anime_title.cmp(&b.anime_title))
+            .then_with(|| a.anime_title.cmp(&b.anime_title));
+        if reversed {
+            ordering.reverse()
+        } else {
+            ordering
+        }
     });
 }
 
@@ -3930,6 +3957,7 @@ mod tests {
         sort_library_items(
             &mut items,
             LibrarySort::Title,
+            false,
             &details_cache,
             &watched_index,
         );
@@ -3938,6 +3966,7 @@ mod tests {
         sort_library_items(
             &mut items,
             LibrarySort::Progress,
+            false,
             &details_cache,
             &watched_index,
         );
@@ -3946,6 +3975,15 @@ mod tests {
             library_progress_ratio(&items[0], &watched_index),
             Some((3, 4))
         );
+
+        sort_library_items(
+            &mut items,
+            LibrarySort::Progress,
+            true,
+            &details_cache,
+            &watched_index,
+        );
+        assert_eq!(items[0].anime_title, "Бета");
     }
 
     #[test]

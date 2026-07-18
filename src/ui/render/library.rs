@@ -123,9 +123,10 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         .split(area);
 
     let library_title = format!(
-        " {} · {} ",
+        " {} · {} {} ",
         app.library_filter.label(),
-        app.library_sort.label()
+        app.library_sort.label(),
+        app.library_sort.direction_symbol(app.library_sort_reversed)
     );
     if app.library_items.is_empty() {
         let border_style = if app.mode == AppMode::Library {
@@ -376,10 +377,10 @@ pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
         return;
     };
     let actions = [
-        ("Enter", "Застосувати", color_highlight()),
+        ("Enter", "Застосувати / ↕", color_highlight()),
         ("Esc", "", color_dim()),
     ];
-    let area = centered_fixed(f.area(), dialog_width_for(42, &actions), 11);
+    let area = centered_fixed(f.area(), dialog_width_for(54, &actions), 11);
     let block = dialog_block(
         " Сортування бібліотеки ",
         color_highlight(),
@@ -394,7 +395,16 @@ pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
         .split(inner);
     let items = LibrarySort::ALL
         .iter()
-        .map(|sort| ListItem::new(format!("  {}", sort.label())))
+        .map(|sort| {
+            let active = *sort == app.library_sort;
+            let reversed = active && app.library_sort_reversed;
+            let marker = if active { "✓" } else { " " };
+            ListItem::new(format!(
+                "{marker} {} · {}",
+                sort.label(),
+                sort.order_label(reversed)
+            ))
+        })
         .collect::<Vec<_>>();
     let list = List::new(items)
         .highlight_symbol(">> ")
