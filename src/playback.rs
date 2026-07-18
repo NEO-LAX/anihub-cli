@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, sleep, timeout};
@@ -31,7 +32,7 @@ pub struct PlayTarget {
 /// A complete, ordered playback timeline with one selected entry.
 ///
 /// The full timeline is logical (progress, autoplay, franchise order). Only a
-/// sliding window (~97 streams: 48 behind + current + 48 ahead) is resolved and
+/// sliding window (~25 streams: 12 behind + current + 12 ahead) is resolved and
 /// handed to mpv so huge seasons do not explode argv / IPC playlist snapshots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackTimeline {
@@ -40,11 +41,17 @@ pub struct PlaybackTimeline {
 }
 
 /// Episodes kept behind / ahead of the current title in the native mpv playlist.
-/// Total window size is at most `behind + 1 + ahead` (97 with ±48).
-const PLAYLIST_WINDOW_BEHIND: usize = 48;
-const PLAYLIST_WINDOW_AHEAD: usize = 48;
+/// Total window size is at most `behind + 1 + ahead` (25 with ±12).
+const PLAYLIST_WINDOW_BEHIND: usize = 12;
+const PLAYLIST_WINDOW_AHEAD: usize = 12;
 /// Re-center the window once the playhead sits this close to either edge.
 const PLAYLIST_REWINDOW_EDGE: usize = 3;
+/// Avoid a tight restart loop when an unavailable neighbor truncates a
+/// resolved window right beside the current episode.
+const PLAYLIST_REWINDOW_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Direct Ashdi URLs can expire. Keep them only long enough to make adjacent
+/// window shifts cheap, then scrape the source page again.
+const STREAM_URL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Inclusive-exclusive timeline range loaded into mpv around `current`.
 fn playlist_window(current: usize, len: usize) -> (usize, usize) {
@@ -77,11 +84,47 @@ fn timeline_in_window(window_start: usize, window_len: usize, timeline_index: us
     timeline_index >= window_start && timeline_index < window_start + window_len
 }
 
+fn live_timeline_index(current_index: usize, pending_index: Option<usize>) -> usize {
+    pending_index.unwrap_or(current_index)
+}
+
+fn contiguous_resolved_range<T>(entries: &[Option<T>], selected: usize) -> Option<(usize, usize)> {
+    entries.get(selected)?.as_ref()?;
+    let mut start = selected;
+    while start > 0 && entries[start - 1].is_some() {
+        start -= 1;
+    }
+    let mut end = selected + 1;
+    while end < entries.len() && entries[end].is_some() {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 fn play_target_cache_key(target: &PlayTarget) -> String {
     format!(
-        "{}:{}:{}:{}",
-        target.anime_id, target.season, target.episode, target.studio_name
+        "{}:{}:{}:{}:{}",
+        target.anime_id, target.season, target.episode, target.studio_name, target.stream_page_url
     )
+}
+
+#[derive(Clone, Debug)]
+struct CachedStreamUrl {
+    url: String,
+    inserted_at: Instant,
+}
+
+fn fresh_cached_url(
+    cache: &mut HashMap<String, CachedStreamUrl>,
+    key: &str,
+    now: Instant,
+) -> Option<String> {
+    let entry = cache.get(key)?;
+    if now.duration_since(entry.inserted_at) < STREAM_URL_CACHE_TTL {
+        return Some(entry.url.clone());
+    }
+    cache.remove(key);
+    None
 }
 
 impl PlaybackTimeline {
@@ -642,6 +685,7 @@ struct ActivePlayback {
     /// Pending **timeline** index after native playlist navigation.
     pending_index: Option<usize>,
     at_eof: bool,
+    paused: bool,
 }
 
 enum ResolutionPurpose {
@@ -653,6 +697,12 @@ enum ResolutionPurpose {
     Replace {
         timeline: PlaybackTimeline,
         autoplay_next: bool,
+        session_id: PlaybackSessionId,
+    },
+    /// Internal window shift for the currently running logical session. The
+    /// resolved snapshot is reconciled with live mpv state before replacement.
+    Rewindow {
+        timeline: PlaybackTimeline,
         session_id: PlaybackSessionId,
     },
 }
@@ -678,7 +728,8 @@ struct PlaybackActor {
     active: Option<ActivePlayback>,
     pending: Option<PendingResolution>,
     /// Cached Ashdi m3u8 URLs so window shifts do not re-scrape every page.
-    url_cache: Arc<Mutex<HashMap<String, String>>>,
+    url_cache: Arc<Mutex<HashMap<String, CachedStreamUrl>>>,
+    last_rewindow_attempt: Option<(PlaybackSessionId, Instant)>,
 }
 
 impl PlaybackActor {
@@ -689,6 +740,7 @@ impl PlaybackActor {
             active: None,
             pending: None,
             url_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_rewindow_attempt: None,
         }
     }
 
@@ -729,6 +781,7 @@ impl PlaybackActor {
                 autoplay_next,
             } => {
                 self.cancel_pending().await;
+                self.last_rewindow_attempt = None;
                 let session_id = PlaybackSessionId::new();
                 let purpose = if self.active.is_some() {
                     ResolutionPurpose::Replace {
@@ -757,7 +810,8 @@ impl PlaybackActor {
     async fn begin_resolution(&mut self, purpose: ResolutionPurpose) {
         let timeline = match &purpose {
             ResolutionPurpose::Start { timeline, .. }
-            | ResolutionPurpose::Replace { timeline, .. } => timeline.clone(),
+            | ResolutionPurpose::Replace { timeline, .. }
+            | ResolutionPurpose::Rewindow { timeline, .. } => timeline.clone(),
         };
         let cancellation = TaskCancellation::new();
         let task_cancellation = cancellation.clone();
@@ -782,6 +836,14 @@ impl PlaybackActor {
         let Some(active) = self.active.as_ref() else {
             return;
         };
+        if self
+            .last_rewindow_attempt
+            .is_some_and(|(session_id, attempted_at)| {
+                session_id == active.id && attempted_at.elapsed() < PLAYLIST_REWINDOW_RETRY_DELAY
+            })
+        {
+            return;
+        }
         if !should_rewindow(
             active.window_start,
             active.window_len,
@@ -791,11 +853,10 @@ impl PlaybackActor {
             return;
         }
         let timeline = active.timeline.clone();
-        let autoplay_next = active.autoplay_next;
         let session_id = active.id;
-        self.begin_resolution(ResolutionPurpose::Replace {
+        self.last_rewindow_attempt = Some((session_id, Instant::now()));
+        self.begin_resolution(ResolutionPurpose::Rewindow {
             timeline,
-            autoplay_next,
             session_id,
         })
         .await;
@@ -867,15 +928,35 @@ impl PlaybackActor {
         let resolved = match result {
             Ok(resolved) => resolved,
             Err(message) => {
-                let session_id = match purpose {
+                let session_id = match &purpose {
                     ResolutionPurpose::Start { session_id, .. }
-                    | ResolutionPurpose::Replace { session_id, .. } => Some(session_id),
+                    | ResolutionPurpose::Replace { session_id, .. }
+                    | ResolutionPurpose::Rewindow { session_id, .. } => Some(*session_id),
                 };
                 self.emit(PlaybackEvent::Error {
                     session_id,
                     message,
                 })
                 .await;
+                match purpose {
+                    ResolutionPurpose::Start { session_id, .. } => {
+                        self.emit(PlaybackEvent::SessionStopped { session_id })
+                            .await;
+                    }
+                    ResolutionPurpose::Replace { .. } => {
+                        // Resolution failed before the old player was touched.
+                        // Re-announce it because the UI may have optimistically
+                        // prepared a newly selected episode.
+                        if let Some(active) = self.active.as_ref() {
+                            self.emit(PlaybackEvent::SessionStarted {
+                                session_id: active.id,
+                                target: active.current.clone(),
+                            })
+                            .await;
+                        }
+                    }
+                    ResolutionPurpose::Rewindow { .. } => {}
+                }
                 return;
             }
         };
@@ -898,6 +979,9 @@ impl PlaybackActor {
             } => {
                 self.replace_active(session_id, timeline, autoplay_next, resolved)
                     .await;
+            }
+            ResolutionPurpose::Rewindow { session_id, .. } => {
+                self.replace_rewindowed_active(session_id, resolved).await;
             }
         }
     }
@@ -925,6 +1009,8 @@ impl PlaybackActor {
                     message: error.to_string(),
                 })
                 .await;
+                self.emit(PlaybackEvent::SessionStopped { session_id })
+                    .await;
                 return;
             }
         };
@@ -942,6 +1028,7 @@ impl PlaybackActor {
             entry_id: None,
             pending_index: None,
             at_eof: false,
+            paused: false,
         });
         self.emit(PlaybackEvent::SessionStarted { session_id, target })
             .await;
@@ -962,6 +1049,8 @@ impl PlaybackActor {
         };
         let old_snapshot = old.mpv.shutdown().await;
         self.emit_partial(&old, old_snapshot.time_pos, old_snapshot.duration)
+            .await;
+        self.emit(PlaybackEvent::SessionStopped { session_id: old.id })
             .await;
         let playlist_start = timeline
             .current_index
@@ -987,6 +1076,7 @@ impl PlaybackActor {
                     entry_id: None,
                     pending_index: None,
                     at_eof: false,
+                    paused: false,
                 });
                 self.emit(PlaybackEvent::SessionStarted { session_id, target })
                     .await;
@@ -997,6 +1087,122 @@ impl PlaybackActor {
                     message: error.to_string(),
                 })
                 .await;
+                if session_id != old.id {
+                    self.emit(PlaybackEvent::SessionStopped { session_id })
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Replace only the native mpv window while keeping the live logical
+    /// session. Resolution may have taken long enough for the user to move to
+    /// another entry, seek, or pause, so never trust the request snapshot here.
+    async fn replace_rewindowed_active(
+        &mut self,
+        session_id: PlaybackSessionId,
+        mut resolved: ResolvedPlaylist,
+    ) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if active.id != session_id {
+            return;
+        }
+        let current_index =
+            live_timeline_index(active.timeline.current_index, active.pending_index);
+        if !timeline_in_window(resolved.window_start, resolved.entries.len(), current_index) {
+            // The playhead outran this request. Discard it and immediately
+            // resolve a window around the latest entry without touching mpv.
+            let mut timeline = active.timeline.clone();
+            timeline.current_index = current_index;
+            self.begin_resolution(ResolutionPurpose::Rewindow {
+                timeline,
+                session_id,
+            })
+            .await;
+            return;
+        }
+
+        let Some(mut old) = self.active.take() else {
+            return;
+        };
+        let current_index = live_timeline_index(old.timeline.current_index, old.pending_index);
+        let episode_changed = current_index != old.timeline.current_index;
+        let snapshot = old.mpv.shutdown().await;
+        let position = if episode_changed {
+            0.0
+        } else if snapshot.time_pos.is_finite() && snapshot.time_pos > 0.0 {
+            snapshot.time_pos
+        } else {
+            old.position
+        };
+        let duration = if episode_changed {
+            0.0
+        } else if snapshot.duration.is_finite() && snapshot.duration > 0.0 {
+            snapshot.duration
+        } else {
+            old.duration
+        };
+        self.emit_partial(&old, position, duration).await;
+
+        old.timeline.current_index = current_index;
+        let resume = (position > 0.0).then_some(position);
+        old.timeline.entries[current_index].start_time = resume;
+        old.current = old.timeline.entries[current_index].clone();
+        let target = old.current.clone();
+        let playlist_start = current_index - resolved.window_start;
+        resolved.entries[playlist_start].start_time = resume;
+        let window_start = resolved.window_start;
+        let window_len = resolved.entries.len();
+        let was_paused = old.paused;
+
+        match MpvSession::spawn(session_id.raw(), &resolved.entries, playlist_start).await {
+            Ok(mpv) => {
+                if was_paused {
+                    let _ = mpv.set_paused(true).await;
+                }
+                self.active = Some(ActivePlayback {
+                    id: session_id,
+                    mpv,
+                    current: old.current,
+                    timeline: old.timeline,
+                    window_start,
+                    window_len,
+                    autoplay_next: old.autoplay_next,
+                    position,
+                    duration,
+                    has_position: position > 0.0,
+                    entry_id: None,
+                    pending_index: None,
+                    at_eof: false,
+                    paused: was_paused,
+                });
+                if episode_changed {
+                    self.emit(PlaybackEvent::SessionStarted {
+                        session_id,
+                        target: target.clone(),
+                    })
+                    .await;
+                    if was_paused {
+                        self.emit(PlaybackEvent::PauseChanged {
+                            session_id,
+                            identity: PlaybackIdentity::from(&target),
+                            paused: true,
+                            position: resume,
+                        })
+                        .await;
+                    }
+                }
+            }
+            Err(error) => {
+                self.emit(PlaybackEvent::Error {
+                    session_id: Some(session_id),
+                    message: error.to_string(),
+                })
+                .await;
+                self.emit(PlaybackEvent::SessionStopped { session_id })
+                    .await;
             }
         }
     }
@@ -1045,6 +1251,7 @@ impl PlaybackActor {
                     } else {
                         active.has_position.then_some(active.position)
                     };
+                    active.paused = paused;
                     Some(PlaybackEvent::PauseChanged {
                         session_id: active.id,
                         identity: PlaybackIdentity::from(&active.current),
@@ -1318,12 +1525,64 @@ impl PlaybackActor {
     }
 }
 
-const PLAYLIST_RESOLUTION_CONCURRENCY: usize = 4;
+const PLAYLIST_RESOLUTION_CONCURRENCY: usize = 6;
+/// Once the selected stream is known to work, do not make startup wait for a
+/// slow or broken unrelated neighbor. Fast neighbors still become native mpv
+/// playlist entries during this short grace period.
+const PLAYLIST_NEIGHBOR_GRACE: Duration = Duration::from_secs(2);
+
+async fn resolve_playlist_entry(
+    target: PlayTarget,
+    parser: Arc<api::AshdiParser>,
+    cancellation: TaskCancellation,
+    url_cache: Arc<Mutex<HashMap<String, CachedStreamUrl>>>,
+) -> Result<MpvPlaylistEntry> {
+    let cache_key = play_target_cache_key(&target);
+    let cached_url = {
+        let mut cache = url_cache.lock().await;
+        fresh_cached_url(&mut cache, &cache_key, Instant::now())
+    };
+    if let Some(url) = cached_url {
+        return Ok(MpvPlaylistEntry {
+            media_url: url,
+            title: format!("{} - {}", target.player_title, target.episode_title),
+            start_time: target.start_time,
+            referrer: target.referrer,
+        });
+    }
+
+    let url = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
+        result = parser.extract_m3u8(&target.stream_page_url) => result
+            .map_err(|error| anyhow!(
+                "не вдалося отримати S{}E{}: {error}",
+                target.season,
+                target.episode
+            ))?,
+    };
+    let now = Instant::now();
+    let mut cache = url_cache.lock().await;
+    cache.retain(|_, entry| now.duration_since(entry.inserted_at) < STREAM_URL_CACHE_TTL);
+    cache.insert(
+        cache_key,
+        CachedStreamUrl {
+            url: url.clone(),
+            inserted_at: now,
+        },
+    );
+    drop(cache);
+    Ok(MpvPlaylistEntry {
+        media_url: url,
+        title: format!("{} - {}", target.player_title, target.episode_title),
+        start_time: target.start_time,
+        referrer: target.referrer,
+    })
+}
 
 async fn resolve_playlist(
     timeline: &PlaybackTimeline,
     cancellation: &TaskCancellation,
-    url_cache: Arc<Mutex<HashMap<String, String>>>,
+    url_cache: Arc<Mutex<HashMap<String, CachedStreamUrl>>>,
 ) -> Result<ResolvedPlaylist> {
     if cancellation.is_cancelled() {
         return Err(anyhow!("playlist resolution cancelled"));
@@ -1340,79 +1599,74 @@ async fn resolve_playlist(
     }
 
     let parser = Arc::new(api::AshdiParser::new()?);
+    let selected_offset = timeline.current_index - window_start;
+    let mut entries = vec![None; window_end - window_start];
+    entries[selected_offset] = Some(
+        resolve_playlist_entry(
+            window_targets[selected_offset].clone(),
+            parser.clone(),
+            cancellation.clone(),
+            url_cache.clone(),
+        )
+        .await?,
+    );
+
     let concurrency = Arc::new(Semaphore::new(PLAYLIST_RESOLUTION_CONCURRENCY));
+    let mut neighbor_targets = window_targets
+        .into_iter()
+        .enumerate()
+        .filter(|(offset, _)| *offset != selected_offset)
+        .collect::<Vec<_>>();
+    neighbor_targets.sort_by_key(|(offset, _)| offset.abs_diff(selected_offset));
     let mut tasks = JoinSet::new();
-    for (offset, target) in window_targets.into_iter().enumerate() {
+    for (offset, target) in neighbor_targets {
         let parser = parser.clone();
         let concurrency = concurrency.clone();
         let cancellation = cancellation.clone();
         let url_cache = url_cache.clone();
         tasks.spawn(async move {
-            let cache_key = play_target_cache_key(&target);
-            if let Some(url) = url_cache.lock().await.get(&cache_key).cloned() {
-                return Ok((
-                    offset,
-                    MpvPlaylistEntry {
-                        media_url: url,
-                        title: format!("{} - {}", target.player_title, target.episode_title),
-                        start_time: target.start_time,
-                        referrer: target.referrer,
-                    },
-                ));
-            }
-
             let permit = tokio::select! {
-                _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
-                permit = concurrency.acquire_owned() => permit
-                    .map_err(|_| anyhow!("playlist resolver was closed"))?,
+                _ = cancellation.cancelled() => return (offset, Err(anyhow!("playlist resolution cancelled"))),
+                permit = concurrency.acquire_owned() => permit,
             };
-            let url = tokio::select! {
-                _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
-                result = parser.extract_m3u8(&target.stream_page_url) => result
-                    .map_err(|error| anyhow!(
-                        "не вдалося отримати S{}E{}: {error}",
-                        target.season,
-                        target.episode
-                    ))?,
+            let result = match permit {
+                Ok(permit) => {
+                    let result =
+                        resolve_playlist_entry(target, parser, cancellation, url_cache).await;
+                    drop(permit);
+                    result
+                }
+                Err(_) => Err(anyhow!("playlist resolver was closed")),
             };
-            drop(permit);
-            url_cache.lock().await.insert(cache_key, url.clone());
-            Ok((
-                offset,
-                MpvPlaylistEntry {
-                    media_url: url,
-                    title: format!("{} - {}", target.player_title, target.episode_title),
-                    start_time: target.start_time,
-                    referrer: target.referrer,
-                },
-            ))
+            (offset, result)
         });
     }
 
-    let mut entries = vec![None; window_end - window_start];
-    while !tasks.is_empty() {
-        let outcome = tokio::select! {
-            _ = cancellation.cancelled() => {
-                tasks.abort_all();
-                return Err(anyhow!("playlist resolution cancelled"));
+    let collect_neighbors = async {
+        while let Some(outcome) = tasks.join_next().await {
+            if let Ok((offset, Ok(entry))) = outcome {
+                entries[offset] = Some(entry);
             }
-            outcome = tasks.join_next() => outcome,
-        };
-        let Some(outcome) = outcome else {
-            break;
-        };
-        let (offset, entry) =
-            outcome.map_err(|error| anyhow!("playlist resolver task failed: {error}"))??;
-        entries[offset] = Some(entry);
+        }
+    };
+    tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
+        _ = timeout(PLAYLIST_NEIGHBOR_GRACE, collect_neighbors) => {}
     }
+    tasks.abort_all();
 
-    let entries = entries
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| anyhow!("playlist resolution finished without every episode"))?;
+    // Neighbor failures must not block an otherwise playable selected episode.
+    // Keep the largest contiguous native playlist containing the selection so
+    // timeline indexes remain exact and mpv prev/next never skip silently.
+    let (contiguous_start, contiguous_end) = contiguous_resolved_range(&entries, selected_offset)
+        .expect("selected playlist entry was checked above");
+    let entries = entries[contiguous_start..contiguous_end]
+        .iter_mut()
+        .map(|entry| entry.take().expect("contiguous entry was resolved"))
+        .collect();
     Ok(ResolvedPlaylist {
         entries,
-        window_start,
+        window_start: window_start + contiguous_start,
     })
 }
 
@@ -1458,28 +1712,74 @@ mod supervisor_tests {
     }
 
     #[test]
-    fn playlist_window_keeps_forty_eight_behind_and_ahead() {
-        // 48 behind + current + 48 ahead = 97 when not clipped.
-        assert_eq!(playlist_window(0, 270), (0, 49));
-        assert_eq!(playlist_window(12, 270), (0, 61));
-        assert_eq!(playlist_window(231, 270), (183, 270));
-        assert_eq!(playlist_window(269, 270), (221, 270));
+    fn playlist_window_keeps_twelve_behind_and_ahead() {
+        // 12 behind + current + 12 ahead = 25 when not clipped.
+        assert_eq!(playlist_window(0, 270), (0, 13));
+        assert_eq!(playlist_window(12, 270), (0, 25));
+        assert_eq!(playlist_window(257, 270), (245, 270));
+        assert_eq!(playlist_window(269, 270), (257, 270));
         assert_eq!(
             playlist_window(100, 270).1 - playlist_window(100, 270).0,
-            97
+            25
         );
     }
 
     #[test]
     fn rewindow_triggers_near_loaded_edges_only() {
-        // Window [52, 149) while sitting on 100 — middle, no rewindow.
-        assert!(!should_rewindow(52, 97, 100, 270));
+        // Window [88, 113) while sitting on 100 — middle, no rewindow.
+        assert!(!should_rewindow(88, 25, 100, 270));
         // Near end of window with more timeline ahead.
-        assert!(should_rewindow(52, 97, 145, 270));
+        assert!(should_rewindow(88, 25, 109, 270));
         // Near start with more timeline behind.
-        assert!(should_rewindow(52, 97, 55, 270));
+        assert!(should_rewindow(88, 25, 91, 270));
         // Whole season fits — never rewindow.
         assert!(!should_rewindow(0, 80, 40, 80));
+    }
+
+    #[test]
+    fn unresolved_neighbors_are_trimmed_without_losing_selected_episode() {
+        let entries = [Some(1), Some(2), None, Some(4), Some(5), None, Some(7)];
+        assert_eq!(contiguous_resolved_range(&entries, 4), Some((3, 5)));
+        assert_eq!(contiguous_resolved_range(&entries, 1), Some((0, 2)));
+        assert_eq!(contiguous_resolved_range(&entries, 2), None);
+    }
+
+    #[test]
+    fn pending_native_navigation_wins_over_stale_rewindow_snapshot() {
+        assert_eq!(live_timeline_index(5, Some(6)), 6);
+        assert_eq!(live_timeline_index(5, None), 5);
+    }
+
+    #[test]
+    fn direct_stream_cache_expires_and_keys_include_source_page() {
+        let now = Instant::now();
+        let mut cache = HashMap::from([
+            (
+                "fresh".to_string(),
+                CachedStreamUrl {
+                    url: "https://cdn.test/fresh.m3u8".to_string(),
+                    inserted_at: now - Duration::from_secs(30),
+                },
+            ),
+            (
+                "stale".to_string(),
+                CachedStreamUrl {
+                    url: "https://cdn.test/stale.m3u8".to_string(),
+                    inserted_at: now - STREAM_URL_CACHE_TTL - Duration::from_secs(1),
+                },
+            ),
+        ]);
+        assert_eq!(
+            fresh_cached_url(&mut cache, "fresh", now).as_deref(),
+            Some("https://cdn.test/fresh.m3u8")
+        );
+        assert_eq!(fresh_cached_url(&mut cache, "stale", now), None);
+        assert!(!cache.contains_key("stale"));
+
+        let mut first = target(1, None);
+        let first_key = play_target_cache_key(&first);
+        first.stream_page_url = "https://media.test/replaced".to_string();
+        assert_ne!(first_key, play_target_cache_key(&first));
     }
 
     #[test]

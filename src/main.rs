@@ -1215,8 +1215,6 @@ fn persist_playback_event(
             app.clear_activity();
         }
         PlaybackEvent::Error { message, .. } => {
-            app.now_playing = None;
-            app.clear_activity();
             app.set_error_status(format!("Помилка відтворення: {message}"));
         }
         PlaybackEvent::EndFile { .. } => {}

@@ -123,6 +123,10 @@ impl PresenceActivity {
     }
 }
 
+fn poster_identity_changed(previous: Option<&PresenceActivity>, next: &PresenceActivity) -> bool {
+    previous.map(|activity| &activity.poster_url) != Some(&next.poster_url)
+}
+
 enum Command {
     Configure(Option<u64>),
     Update(PresenceActivity),
@@ -216,7 +220,10 @@ fn run_worker(receiver: Receiver<Command>) {
                     }
                 }
                 Command::Update(activity) => {
-                    if desired.as_ref() != Some(&activity) {
+                    // Progress changes every few seconds. Do not let those
+                    // updates clear a poster-rejection fallback before the
+                    // rate-limited posterless activity reaches Discord.
+                    if poster_identity_changed(desired.as_ref(), &activity) {
                         fallback_without_poster = false;
                     }
                     desired = Some(activity);
@@ -248,7 +255,7 @@ fn run_worker(receiver: Receiver<Command>) {
                     }
                 }
                 Command::Update(activity) => {
-                    if desired.as_ref() != Some(&activity) {
+                    if poster_identity_changed(desired.as_ref(), &activity) {
                         fallback_without_poster = false;
                     }
                     desired = Some(activity);
@@ -592,5 +599,45 @@ mod tests {
         assert_eq!(fallback.media, activity.media);
         assert_eq!(fallback.poster_url, None);
         assert!(should_queue(Some(&activity), &fallback, true, 1, 1));
+    }
+
+    #[test]
+    fn progress_updates_do_not_reset_rejected_poster_fallback() {
+        let first = PresenceActivity::watching(WatchingPresence {
+            title: "Фрірен",
+            season: 1,
+            episode: 1,
+            studio: "Amanogawa",
+            poster_url: Some("https://example.com/poster.jpg".to_string()),
+            position: 12.0,
+            duration: 1400.0,
+            paused: false,
+        });
+        let advanced = PresenceActivity::watching(WatchingPresence {
+            title: "Фрірен",
+            season: 1,
+            episode: 1,
+            studio: "Amanogawa",
+            poster_url: Some("https://example.com/poster.jpg".to_string()),
+            position: 42.0,
+            duration: 1400.0,
+            paused: false,
+        });
+        assert!(!poster_identity_changed(Some(&first), &advanced));
+
+        let next_poster = PresenceActivity::watching(WatchingPresence {
+            poster_url: Some("https://example.com/next.jpg".to_string()),
+            ..WatchingPresence {
+                title: "Фрірен",
+                season: 2,
+                episode: 1,
+                studio: "Amanogawa",
+                poster_url: None,
+                position: 0.0,
+                duration: 0.0,
+                paused: false,
+            }
+        });
+        assert!(poster_identity_changed(Some(&advanced), &next_poster));
     }
 }
