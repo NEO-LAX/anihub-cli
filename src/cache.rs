@@ -89,7 +89,7 @@ impl MetadataCache {
             CacheEnvelope::default()
         };
         prune(&mut data);
-        let writer = CacheWriter::spawn(path.clone(), data.clone());
+        let writer = CacheWriter::spawn(path.clone(), data.clone())?;
         Ok(Self { path, data, writer })
     }
 
@@ -160,16 +160,16 @@ impl MetadataCache {
 }
 
 impl CacheWriter {
-    fn spawn(path: PathBuf, data: CacheEnvelope) -> Self {
+    fn spawn(path: PathBuf, data: CacheEnvelope) -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("metadata-cache-writer".to_string())
             .spawn(move || writer_loop(&path, data, &receiver))
-            .expect("failed to start metadata cache writer");
-        Self {
+            .context("не вдалося запустити фоновий запис кешу")?;
+        Ok(Self {
             sender,
             thread: Some(thread),
-        }
+        })
     }
 
     fn send(&self, command: WriterCommand) -> Result<()> {

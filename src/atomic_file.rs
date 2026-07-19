@@ -1,7 +1,9 @@
 #[cfg(windows)]
 use anyhow::anyhow;
 use anyhow::{Context, Result};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 #[cfg(windows)]
 use std::io::ErrorKind;
 use std::io::Write;
