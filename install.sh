@@ -185,17 +185,20 @@ path_guidance() {
     esac
 }
 
-verify_and_migrate_data() {
-    local candidate_binary="$1"
+migrate_installed_data() {
+    local installed_binary="$1"
     local migrate_log
     migrate_log="$(mktemp "${TMPDIR:-/tmp}/anihub-migrate.XXXXXX")"
     info "Validating and migrating local history and settings..."
-    if ! "${candidate_binary}" --migrate-data >"${migrate_log}" 2>&1; then
+    if ! "${installed_binary}" --migrate-data >"${migrate_log}" 2>&1; then
         cat "${migrate_log}" >&2 || true
         if grep -Eqi "unsupported history schema version|unknown argument|невідомі аргументи|--migrate-data" "${migrate_log}" 2>/dev/null; then
-            fail "data migration failed: the downloaded release is too old for your local data (need anihub-cli >= 0.6.0 with schema v2). Either publish/tag a new GitHub release and re-run, or install from this repo: cargo build --release && install -Dm755 target/release/anihub-cli \"${INSTALL_PATH}\". Your data was not replaced."
+            warning "Data migration failed: the downloaded release is too old for the local data."
+        else
+            warning "Data migration failed."
         fi
-        fail "data migration failed. The installed binary was not replaced and existing data was preserved"
+        rm -f "${migrate_log}"
+        return 1
     fi
     # Surface migrate success details (paths / counts).
     cat "${migrate_log}" || true
@@ -203,8 +206,33 @@ verify_and_migrate_data() {
     success "Local data is ready for the new version."
 }
 
+restore_install_transaction() {
+    local had_binary="$1"
+    local previous_binary="$2"
+    local directory="$3"
+    local data_existed="$4"
+    local data_backup="$5"
+
+    warning "Rolling back the binary and user data..."
+    if [[ "${had_binary}" == 'true' ]]; then
+        cp -p "${previous_binary}" "${INSTALL_PATH}"
+        chmod 0755 "${INSTALL_PATH}"
+    else
+        rm -f "${INSTALL_PATH}"
+    fi
+
+    if [[ -e "${directory}" || -L "${directory}" ]]; then
+        rm -rf -- "${directory}"
+    fi
+    if [[ "${data_existed}" == 'true' ]]; then
+        mkdir -p "$(dirname "${directory}")"
+        cp -a "${data_backup}" "${directory}"
+    fi
+}
+
 install_app() {
     local asset_name binary_url checksums_url downloaded_binary downloaded_checksums action
+    local migration_directory previous_binary data_backup had_binary data_existed
 
     if is_installed; then
         action="Updating"
@@ -217,6 +245,7 @@ install_app() {
     require_command awk
     require_command install
     require_command mv
+    require_command cp
 
     info "${action} ${BINARY_NAME} (${asset_name})..."
     check_dependencies
@@ -234,14 +263,37 @@ install_app() {
     verify_checksum "${downloaded_checksums}" "${downloaded_binary}" "${asset_name}"
     chmod 0755 "${downloaded_binary}"
 
-    # The new binary owns schema migration. It validates and migrates data
-    # before the currently installed executable is replaced.
-    verify_and_migrate_data "${downloaded_binary}"
-
     REPLACEMENT_PATH="$(mktemp "${INSTALL_DIR}/.${BINARY_NAME}.tmp.XXXXXX")"
     install -m 0755 "${downloaded_binary}" "${REPLACEMENT_PATH}"
+
+    # Binary replacement and schema migration form one transaction. Keep both
+    # sides so a migration failure cannot leave a new schema with an old app,
+    # or a new app with partially migrated user data.
+    migration_directory="$(validated_data_dir)"
+    previous_binary="${TMP_DIR}/previous-binary"
+    data_backup="${TMP_DIR}/previous-data"
+    had_binary='false'
+    data_existed='false'
+    if is_installed; then
+        cp -p "${INSTALL_PATH}" "${previous_binary}"
+        had_binary='true'
+    fi
+    if [[ -e "${migration_directory}" || -L "${migration_directory}" ]]; then
+        cp -a "${migration_directory}" "${data_backup}"
+        data_existed='true'
+    fi
+
     mv -f "${REPLACEMENT_PATH}" "${INSTALL_PATH}"
     REPLACEMENT_PATH=""
+    if ! migrate_installed_data "${INSTALL_PATH}"; then
+        restore_install_transaction \
+            "${had_binary}" \
+            "${previous_binary}" \
+            "${migration_directory}" \
+            "${data_existed}" \
+            "${data_backup}"
+        fail "data migration failed; the previous binary and user data were restored"
+    fi
 
     success "Done: ${INSTALL_PATH}"
     path_guidance

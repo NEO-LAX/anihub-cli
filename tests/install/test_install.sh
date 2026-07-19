@@ -40,6 +40,8 @@ set -euo pipefail
 case "${1:-}" in
     --migrate-data)
         printf 'migrated\n' >> "${TEST_MIGRATION_LOG}"
+        mkdir -p "${TEST_USER_DATA_DIR}"
+        printf 'migrated data\n' > "${TEST_USER_DATA_DIR}/migration-state"
         if [[ "${TEST_MIGRATION_FAIL:-0}" == '1' ]]; then
             exit 1
         fi
@@ -124,6 +126,7 @@ export TEST_ASSET_NAME="${ASSET_NAME}"
 export TEST_CURL_LOG="${CURL_LOG}"
 export TEST_FIXTURE_DIR="${FIXTURE_DIR}"
 export TEST_MIGRATION_LOG="${MIGRATION_LOG}"
+export TEST_USER_DATA_DIR="${USER_DATA_DIR}"
 export ANIHUB_INSTALL_DIR="${INSTALL_DIR}"
 export ANIHUB_DATA_DIR="${USER_DATA_DIR}"
 export ANIHUB_RELEASE_BASE_URL="https://example.invalid/releases/latest/download"
@@ -163,12 +166,15 @@ fi
 unset TEST_UNAME_MACHINE
 
 cp "${INSTALL_DIR}/anihub-cli" "${TEST_ROOT}/installed-before-failed-update"
+printf 'data before failed migration\n' > "${USER_DATA_DIR}/migration-state"
+cp "${USER_DATA_DIR}/migration-state" "${TEST_ROOT}/data-before-failed-update"
 export TEST_MIGRATION_FAIL=1
 if bash "${INSTALLER}" update > "${TEST_ROOT}/migration-failure.log" 2>&1; then
     fail_test 'update unexpectedly succeeded when data migration failed'
 fi
 unset TEST_MIGRATION_FAIL
 assert_file_equal "${TEST_ROOT}/installed-before-failed-update" "${INSTALL_DIR}/anihub-cli"
+assert_file_equal "${TEST_ROOT}/data-before-failed-update" "${USER_DATA_DIR}/migration-state"
 
 bash "${INSTALLER}" update > "${TEST_ROOT}/update.log" 2>&1
 assert_file_equal "${FIXTURE_DIR}/${ASSET_NAME}" "${INSTALL_DIR}/anihub-cli"
