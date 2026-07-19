@@ -188,8 +188,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     .iter()
                     .map(|release| new_episode_count(&app.settings.seen_episode_counts, release))
                     .sum::<u32>();
-                if new_episodes > 0 {
-                    metadata.push(format!("+{new_episodes} нових"));
+                if let Some(label) = new_episode_label(new_episodes) {
+                    metadata.push(label);
                 }
                 ListItem::new(label_with_metadata(&item.anime_title, &metadata))
             })
@@ -213,8 +213,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     metadata.push(format!("{count} озвучок"));
                 }
                 let new_episodes = new_episode_count(&app.settings.seen_episode_counts, release);
-                if new_episodes > 0 {
-                    metadata.push(format!("+{new_episodes} нових"));
+                if let Some(label) = new_episode_label(new_episodes) {
+                    metadata.push(label);
                 }
                 if let Some(next_airing) = next_airing_label(release) {
                     metadata.push(next_airing);
@@ -584,6 +584,17 @@ fn new_episode_count(
         .map_or(0, |seen| current.saturating_sub(*seen))
 }
 
+fn new_episode_label(count: u32) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("нова серія".to_string()),
+        count if (2..=4).contains(&(count % 10)) && !(12..=14).contains(&(count % 100)) => {
+            Some(format!("{count} нові серії"))
+        }
+        count => Some(format!("{count} нових серій")),
+    }
+}
+
 fn next_airing_label(release: &crate::ui::app::LibrarySeasonEntry) -> Option<String> {
     next_airing_label_at(release, chrono::Utc::now().timestamp())
 }
@@ -799,6 +810,16 @@ mod tests {
         let seen = std::collections::BTreeMap::from([(42, 6)]);
         assert_eq!(new_episode_count(&seen, &release), 2);
         assert_eq!(new_episode_count(&Default::default(), &release), 0);
+    }
+
+    #[test]
+    fn new_episode_badge_uses_ukrainian_plural_forms() {
+        assert_eq!(new_episode_label(0), None);
+        assert_eq!(new_episode_label(1).as_deref(), Some("нова серія"));
+        assert_eq!(new_episode_label(2).as_deref(), Some("2 нові серії"));
+        assert_eq!(new_episode_label(5).as_deref(), Some("5 нових серій"));
+        assert_eq!(new_episode_label(12).as_deref(), Some("12 нових серій"));
+        assert_eq!(new_episode_label(22).as_deref(), Some("22 нові серії"));
     }
 
     #[test]
