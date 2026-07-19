@@ -52,15 +52,7 @@ impl AppState {
     fn collapse_search_drilldown(&mut self) {
         self.focus = FocusPanel::SearchList;
         self.search.selected_release_index = None;
-        self.content.selected_season_index = None;
-        self.content.selected_dubbing_index = None;
-        self.content.selected_episode_index = None;
-        self.content.season_list_state.select(None);
-        self.content.dubbing_list_state.select(None);
-        self.content.episode_list_state.select(None);
-        self.content.current_sources = None;
-        self.content.current_sources_key = None;
-        self.content.studio_anime_ids.clear();
+        self.content.clear_drilldown();
         if let Some(index) = self.search.selected_group_index {
             self.search.result_list_state.select(Some(index));
         }
@@ -180,23 +172,14 @@ impl AppState {
     }
 
     pub(super) fn move_focus_left(&mut self) {
-        match self.focus {
-            FocusPanel::EpisodeList => self.focus = FocusPanel::DubbingList,
-            FocusPanel::DubbingList => {
-                if self.has_release_catalog() {
-                    self.focus = FocusPanel::ReleaseList;
-                } else if self.unique_seasons().len() <= 1 {
-                    self.focus = FocusPanel::SearchList;
-                    self.restore_representative_poster();
-                } else {
-                    self.focus = FocusPanel::ReleaseList;
-                }
-            }
-            FocusPanel::ReleaseList => {
-                self.focus = FocusPanel::SearchList;
-                self.restore_representative_poster();
-            }
-            FocusPanel::SearchList => {}
+        let previous = self.focus;
+        self.focus = focus_after_left(
+            previous,
+            self.has_release_catalog(),
+            self.unique_seasons().len(),
+        );
+        if self.focus == FocusPanel::SearchList && previous != FocusPanel::SearchList {
+            self.restore_representative_poster();
         }
     }
 
@@ -278,20 +261,9 @@ impl AppState {
     fn reset_downstream(&mut self) {
         self.loading = true;
         self.activity_message = Some("Завантаження вибраного аніме…".to_string());
-        self.content.current_sources = None;
-        self.content.current_sources_key = None;
-        self.content.current_details = None;
         self.current_poster = None;
-        self.content.studio_anime_ids.clear();
-        self.content.sidebar_anime_idx = None;
-        self.content.sidebar_subject_id = None;
         self.search.selected_release_index = None;
-        self.content.selected_season_index = None;
-        self.content.season_list_state.select(None);
-        self.content.selected_dubbing_index = None;
-        self.content.dubbing_list_state.select(None);
-        self.content.selected_episode_index = None;
-        self.content.episode_list_state.select(None);
+        self.content.clear_for_new_root();
 
         // Moving the search cursor changes the poster owner immediately.
         // Leaving the subject unset would keep the previous pending request,
@@ -304,6 +276,21 @@ impl AppState {
                 .map(|item| item.id)
         });
         self.select_sidebar_subject(subject);
+    }
+}
+
+fn focus_after_left(
+    focus: FocusPanel,
+    has_release_catalog: bool,
+    season_count: usize,
+) -> FocusPanel {
+    match focus {
+        FocusPanel::EpisodeList => FocusPanel::DubbingList,
+        FocusPanel::DubbingList if has_release_catalog || season_count > 1 => {
+            FocusPanel::ReleaseList
+        }
+        FocusPanel::DubbingList | FocusPanel::ReleaseList => FocusPanel::SearchList,
+        FocusPanel::SearchList => FocusPanel::SearchList,
     }
 }
 
@@ -334,5 +321,20 @@ mod tests {
         assert_eq!(wrapped_index(None, 3, false), Some(0));
         assert_eq!(wrapped_index(Some(2), 3, true), Some(0));
         assert_eq!(wrapped_index(Some(0), 3, false), Some(2));
+    }
+
+    #[test]
+    fn left_navigation_unwinds_episode_dubbing_release_to_search() {
+        let dubbing = focus_after_left(FocusPanel::EpisodeList, true, 2);
+        let release = focus_after_left(dubbing, true, 2);
+        let search = focus_after_left(release, true, 2);
+
+        assert_eq!(dubbing, FocusPanel::DubbingList);
+        assert_eq!(release, FocusPanel::ReleaseList);
+        assert_eq!(search, FocusPanel::SearchList);
+        assert_eq!(
+            focus_after_left(FocusPanel::DubbingList, false, 1),
+            FocusPanel::SearchList
+        );
     }
 }
