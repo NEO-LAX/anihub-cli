@@ -137,9 +137,7 @@ impl LibraryRefreshCoordinator {
             (ResourceKey::Details(anime_id), Ok(ResourceValue::Details(details))) => {
                 let _ = app.metadata_cache.put_details(details.clone());
                 app.details_cache.insert(anime_id, details.clone());
-                active
-                    .items
-                    .insert(anime_id, crate::anime_item_from_details(&details));
+                active.items.insert(anime_id, AnimeItem::from(&details));
             }
             (_, Err(_)) => active.failed = true,
             _ => active.failed = true,

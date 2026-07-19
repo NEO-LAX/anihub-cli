@@ -129,6 +129,52 @@ pub struct AnimeDetails {
     pub dubbing_studios: Option<Vec<DubbingStudio>>,
 }
 
+impl From<&AnimeDetails> for AnimeItem {
+    fn from(details: &AnimeDetails) -> Self {
+        Self {
+            id: details.id,
+            anilist_id: details.anilist_id,
+            slug: details.slug.clone(),
+            title_ukrainian: details.title_ukrainian.clone(),
+            title_original: details.title_original.clone(),
+            title_english: details.title_english.clone(),
+            status: details.status.clone(),
+            anime_type: details.anime_type.clone(),
+            year: details.year,
+            has_ukrainian_dub: details.has_ukrainian_dub,
+            poster_url: details.poster_url.clone(),
+            episodes_count: details.episodes_count,
+            description: details.description.clone(),
+            rating: details.rating,
+            genres: details.genres.clone(),
+            dubbing_studios: details.dubbing_studios.clone(),
+        }
+    }
+}
+
+impl From<&AnimeItem> for AnimeDetails {
+    fn from(item: &AnimeItem) -> Self {
+        Self {
+            id: item.id,
+            anilist_id: item.anilist_id,
+            slug: item.slug.clone(),
+            title_ukrainian: item.title_ukrainian.clone(),
+            title_original: item.title_original.clone(),
+            title_english: item.title_english.clone(),
+            status: item.status.clone(),
+            anime_type: item.anime_type.clone(),
+            year: item.year,
+            has_ukrainian_dub: item.has_ukrainian_dub,
+            poster_url: item.poster_url.clone(),
+            episodes_count: item.episodes_count,
+            description: item.description.clone(),
+            rating: item.rating,
+            genres: item.genres.clone(),
+            dubbing_studios: item.dubbing_studios.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct DubbingStudio {
     pub id: u32,

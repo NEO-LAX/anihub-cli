@@ -1,9 +1,139 @@
 //! Search-result ordering and its small modal state.
 
 use super::*;
+use crate::api::build_franchise_catalogs;
 use std::cmp::Ordering;
 
 impl AppState {
+    pub(crate) fn apply_search_results(
+        &mut self,
+        results: Vec<AnimeItem>,
+        anilist_media: Vec<AniListMedia>,
+        finish_search: bool,
+    ) {
+        self.search.results = results;
+        self.search.anilist_media = anilist_media;
+        for item in &self.search.results {
+            self.details_cache.insert(item.id, AnimeDetails::from(item));
+        }
+        self.rebuild_search_projection();
+        if finish_search {
+            self.search.query.clear();
+            self.search.cursor = 0;
+        }
+
+        self.focus = FocusPanel::SearchList;
+        self.current_sources = None;
+        self.current_sources_key = None;
+        self.current_details = None;
+        self.current_poster = None;
+        self.studio_anime_ids.clear();
+        self.sidebar_anime_idx = None;
+        self.sidebar_subject_id = None;
+        self.search.selected_release_index = None;
+        self.selected_season_index = None;
+        self.season_list_state.select(None);
+        self.selected_dubbing_index = None;
+        self.dubbing_list_state.select(None);
+        self.selected_episode_index = None;
+        self.episode_list_state.select(None);
+
+        if !self.search.franchise_groups.is_empty() {
+            self.search.result_list_state.select(Some(0));
+            self.search.selected_group_index = Some(0);
+            let representative = self.search.franchise_groups[0][0];
+            self.search.selected_result_index = Some(representative);
+            let canonical_id = self.search.results[representative].id;
+            self.select_sidebar_subject(self.canonical_sidebar_subject().or(Some(canonical_id)));
+            self.set_activity("Завантаження вибраного аніме…");
+        } else {
+            self.clear_activity();
+            self.search.result_list_state.select(None);
+            self.search.selected_group_index = None;
+            self.search.selected_result_index = None;
+            self.set_info_status("Нічого не знайдено");
+        }
+    }
+
+    pub(crate) fn should_add_details_to_search(&self, details: &AnimeDetails) -> bool {
+        details_belong_in_search(
+            self.mode,
+            self.search.results.iter().any(|item| item.id == details.id),
+            details.anilist_id.is_some(),
+        )
+    }
+
+    pub(crate) fn rebuild_search_projection(&mut self) {
+        let selected_anchor = self
+            .selected_franchise_catalog()
+            .and_then(|catalog| catalog.anchor_anilist_id);
+        let selected_title = self
+            .selected_franchise_catalog()
+            .map(|catalog| catalog.canonical_title.clone());
+        let selected_release_anilist = self
+            .selected_release()
+            .and_then(|release| release.anilist_id);
+
+        let catalogs = build_franchise_catalogs(&self.search.results, &self.search.anilist_media);
+        let groups = catalogs
+            .iter()
+            .map(|catalog| {
+                catalog
+                    .releases
+                    .iter()
+                    .filter_map(|release| release.anihub_id)
+                    .filter_map(|anime_id| {
+                        self.search
+                            .results
+                            .iter()
+                            .position(|item| item.id == anime_id)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        self.search.franchise_catalogs = catalogs;
+        self.search.franchise_groups = groups;
+        self.sort_search_projection();
+
+        if let Some(anchor) = selected_anchor {
+            self.search.selected_group_index = self
+                .search
+                .franchise_catalogs
+                .iter()
+                .position(|catalog| catalog.anchor_anilist_id == Some(anchor));
+        } else if let Some(title) = selected_title {
+            self.search.selected_group_index = self
+                .search
+                .franchise_catalogs
+                .iter()
+                .position(|catalog| catalog.canonical_title == title);
+        }
+        if self.search.selected_group_index.is_none() && !self.search.franchise_catalogs.is_empty()
+        {
+            self.search.selected_group_index = Some(0);
+        }
+        if let Some(group_index) = self.search.selected_group_index {
+            self.search.selected_result_index = self
+                .search
+                .franchise_groups
+                .get(group_index)
+                .and_then(|group| group.first())
+                .copied();
+            if let Some(anilist_id) = selected_release_anilist {
+                self.search.selected_release_index = self.search.franchise_catalogs[group_index]
+                    .releases
+                    .iter()
+                    .position(|release| release.anilist_id == Some(anilist_id));
+                self.season_list_state
+                    .select(self.search.selected_release_index);
+            }
+        }
+        if self.focus != FocusPanel::SearchList {
+            self.refresh_selected_release();
+        }
+    }
+
     pub(super) fn open_search_sort_popup(&mut self) {
         if self.focus != FocusPanel::SearchList || self.search.franchise_groups.is_empty() {
             return;
@@ -91,6 +221,10 @@ impl AppState {
             .and_then(|group| group.first())
             .copied();
     }
+}
+
+fn details_belong_in_search(mode: AppMode, already_present: bool, has_anilist_id: bool) -> bool {
+    mode == AppMode::Normal && !already_present && has_anilist_id
 }
 
 fn compare_search_entries(
@@ -240,5 +374,13 @@ mod tests {
             compare_search_entries(SearchSort::Rating, &alpha, &[5], &beta, &[1], &no_results,),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn details_merge_requires_search_mode_new_id_and_anilist_identity() {
+        assert!(details_belong_in_search(AppMode::Normal, false, true));
+        assert!(!details_belong_in_search(AppMode::Library, false, true));
+        assert!(!details_belong_in_search(AppMode::Normal, true, true));
+        assert!(!details_belong_in_search(AppMode::Normal, false, false));
     }
 }

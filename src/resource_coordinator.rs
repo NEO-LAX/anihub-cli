@@ -15,9 +15,7 @@ use crate::poster_cache;
 use crate::storage;
 use crate::ui::{AppMode, AppState, FocusPanel};
 use crate::{
-    anime_item_from_details, api, apply_continue_context, apply_library_continue_context,
-    apply_search_results, build_active_playback_timeline, rebuild_franchise_projection,
-    should_add_details_to_search, ui,
+    api, apply_continue_context, apply_library_continue_context, build_active_playback_timeline, ui,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -296,7 +294,7 @@ impl ResourceCoordinator {
             ResourceContext::Search { query, extended } => {
                 app.set_activity("Пошук аніме…");
                 if let Some(cached) = app.metadata_cache.search(&query, extended) {
-                    apply_search_results(app, cached.items, cached.anilist_media, false);
+                    app.apply_search_results(cached.items, cached.anilist_media, false);
                     self.cached_search_used = Some((query.clone(), extended));
                     app.set_activity("Кешовані результати · перевіряємо мережу…");
                 }
@@ -509,8 +507,7 @@ impl ResourceCoordinator {
                     results.anilist_media.clone(),
                 );
                 self.cached_search_used = None;
-                apply_search_results(
-                    app,
+                app.apply_search_results(
                     api::deduplicate_anime(results.items),
                     results.anilist_media,
                     true,
@@ -532,13 +529,9 @@ impl ResourceCoordinator {
             (ResourceKey::Details(anime_id), Ok(ResourceValue::Details(details))) => {
                 let _ = app.metadata_cache.put_details(details.clone());
                 app.details_cache.insert(anime_id, details.clone());
-                if should_add_details_to_search(
-                    app.mode,
-                    app.search.results.iter().any(|item| item.id == anime_id),
-                    details.anilist_id.is_some(),
-                ) {
-                    app.search.results.push(anime_item_from_details(&details));
-                    rebuild_franchise_projection(app);
+                if app.should_add_details_to_search(&details) {
+                    app.search.results.push(api::AnimeItem::from(&details));
+                    app.rebuild_search_projection();
                     if !app.search.last_query.is_empty() {
                         let _ = app.metadata_cache.put_search(
                             &app.search.last_query,

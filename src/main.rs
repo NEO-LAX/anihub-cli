@@ -466,7 +466,7 @@ pub fn apply_continue_context(
     sources: &EpisodeSourcesResponse,
     resolved: &ContinueResolvedEpisode,
 ) {
-    let anime_item = anime_item_from_details(details);
+    let anime_item = api::AnimeItem::from(details);
     app.search.results = vec![anime_item];
     app.search.anilist_media.clear();
     app.search.franchise_catalogs = api::build_franchise_catalogs(&app.search.results, &[]);
@@ -526,177 +526,6 @@ pub fn apply_library_continue_context(
     app.dubbing_list_state.select(Some(resolved.dubbing_index));
     app.selected_episode_index = Some(resolved.episode_index);
     app.episode_list_state.select(Some(resolved.episode_index));
-}
-
-fn anime_item_from_details(details: &api::AnimeDetails) -> api::AnimeItem {
-    api::AnimeItem {
-        id: details.id,
-        anilist_id: details.anilist_id,
-        slug: details.slug.clone(),
-        title_ukrainian: details.title_ukrainian.clone(),
-        title_original: details.title_original.clone(),
-        title_english: details.title_english.clone(),
-        status: details.status.clone(),
-        anime_type: details.anime_type.clone(),
-        year: details.year,
-        has_ukrainian_dub: details.has_ukrainian_dub,
-        poster_url: details.poster_url.clone(),
-        episodes_count: details.episodes_count,
-        description: details.description.clone(),
-        rating: details.rating,
-        genres: details.genres.clone(),
-        dubbing_studios: details.dubbing_studios.clone(),
-    }
-}
-
-fn should_add_details_to_search(
-    mode: AppMode,
-    already_present: bool,
-    has_anilist_id: bool,
-) -> bool {
-    mode == AppMode::Normal && !already_present && has_anilist_id
-}
-
-fn apply_search_results(
-    app: &mut AppState,
-    results: Vec<api::AnimeItem>,
-    anilist_media: Vec<api::AniListMedia>,
-    finish_search: bool,
-) {
-    app.search.results = results;
-    app.search.anilist_media = anilist_media;
-    for item in &app.search.results {
-        app.details_cache
-            .insert(item.id, anime_details_from_item(item));
-    }
-    rebuild_franchise_projection(app);
-    if finish_search {
-        app.search.query.clear();
-        app.search.cursor = 0;
-    }
-
-    app.focus = FocusPanel::SearchList;
-    app.current_sources = None;
-    app.current_sources_key = None;
-    app.current_details = None;
-    app.current_poster = None;
-    app.studio_anime_ids.clear();
-    app.sidebar_anime_idx = None;
-    app.sidebar_subject_id = None;
-    app.search.selected_release_index = None;
-    app.selected_season_index = None;
-    app.season_list_state.select(None);
-    app.selected_dubbing_index = None;
-    app.dubbing_list_state.select(None);
-    app.selected_episode_index = None;
-    app.episode_list_state.select(None);
-
-    if !app.search.franchise_groups.is_empty() {
-        app.search.result_list_state.select(Some(0));
-        app.search.selected_group_index = Some(0);
-        let rep = app.search.franchise_groups[0][0];
-        app.search.selected_result_index = Some(rep);
-        let canonical_id = app.search.results[rep].id;
-        app.select_sidebar_subject(app.canonical_sidebar_subject().or(Some(canonical_id)));
-        app.set_activity("Завантаження вибраного аніме…");
-    } else {
-        app.clear_activity();
-        app.search.result_list_state.select(None);
-        app.search.selected_group_index = None;
-        app.search.selected_result_index = None;
-        app.set_info_status("Нічого не знайдено");
-    }
-}
-
-fn rebuild_franchise_projection(app: &mut AppState) {
-    let selected_anchor = app
-        .selected_franchise_catalog()
-        .and_then(|catalog| catalog.anchor_anilist_id);
-    let selected_title = app
-        .selected_franchise_catalog()
-        .map(|catalog| catalog.canonical_title.clone());
-    let selected_release_anilist = app
-        .selected_release()
-        .and_then(|release| release.anilist_id);
-
-    let catalogs = api::build_franchise_catalogs(&app.search.results, &app.search.anilist_media);
-    let groups = catalogs
-        .iter()
-        .map(|catalog| {
-            catalog
-                .releases
-                .iter()
-                .filter_map(|release| release.anihub_id)
-                .filter_map(|anime_id| {
-                    app.search
-                        .results
-                        .iter()
-                        .position(|item| item.id == anime_id)
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
-    app.search.franchise_catalogs = catalogs;
-    app.search.franchise_groups = groups;
-    app.sort_search_projection();
-
-    if let Some(anchor) = selected_anchor {
-        app.search.selected_group_index = app
-            .search
-            .franchise_catalogs
-            .iter()
-            .position(|catalog| catalog.anchor_anilist_id == Some(anchor));
-    } else if let Some(title) = selected_title {
-        app.search.selected_group_index = app
-            .search
-            .franchise_catalogs
-            .iter()
-            .position(|catalog| catalog.canonical_title == title);
-    }
-    if app.search.selected_group_index.is_none() && !app.search.franchise_catalogs.is_empty() {
-        app.search.selected_group_index = Some(0);
-    }
-    if let Some(group_index) = app.search.selected_group_index {
-        app.search.selected_result_index = app
-            .search
-            .franchise_groups
-            .get(group_index)
-            .and_then(|group| group.first())
-            .copied();
-        if let Some(anilist_id) = selected_release_anilist {
-            app.search.selected_release_index = app.search.franchise_catalogs[group_index]
-                .releases
-                .iter()
-                .position(|release| release.anilist_id == Some(anilist_id));
-            app.season_list_state
-                .select(app.search.selected_release_index);
-        }
-    }
-    if app.focus != FocusPanel::SearchList {
-        app.refresh_selected_release();
-    }
-}
-
-fn anime_details_from_item(item: &api::AnimeItem) -> api::AnimeDetails {
-    api::AnimeDetails {
-        id: item.id,
-        anilist_id: item.anilist_id,
-        slug: item.slug.clone(),
-        title_ukrainian: item.title_ukrainian.clone(),
-        title_original: item.title_original.clone(),
-        title_english: item.title_english.clone(),
-        status: item.status.clone(),
-        anime_type: item.anime_type.clone(),
-        year: item.year,
-        has_ukrainian_dub: item.has_ukrainian_dub,
-        poster_url: item.poster_url.clone(),
-        episodes_count: item.episodes_count,
-        description: item.description.clone(),
-        rating: item.rating,
-        genres: item.genres.clone(),
-        dubbing_studios: item.dubbing_studios.clone(),
-    }
 }
 
 #[cfg(test)]
@@ -797,22 +626,6 @@ mod staged_source_loading_tests {
             12
         );
         assert_eq!(sources.ashdi[0].episodes.last().unwrap().episode_number, 24);
-    }
-
-    #[test]
-    fn library_metadata_never_extends_search_results() {
-        assert!(should_add_details_to_search(AppMode::Normal, false, true));
-        assert!(!should_add_details_to_search(AppMode::Library, false, true));
-        assert!(!should_add_details_to_search(
-            AppMode::LibrarySeason,
-            false,
-            true
-        ));
-        assert!(!should_add_details_to_search(
-            AppMode::LibraryEpisode,
-            false,
-            true
-        ));
     }
 
     #[test]
