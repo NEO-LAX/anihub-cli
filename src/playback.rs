@@ -268,8 +268,9 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         .and_then(|i| app.studio_anime_ids.get(i).copied())
         .or_else(|| app.current_details.as_ref().map(|details| details.id))
         .or_else(|| {
-            app.selected_result_index
-                .and_then(|idx| app.search_results.get(idx).map(|a| a.id))
+            app.search
+                .selected_result_index
+                .and_then(|idx| app.search.results.get(idx).map(|a| a.id))
         })
         .unwrap_or(0);
     let progress_title = app
@@ -278,7 +279,8 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         .filter(|details| details.id == progress_anime_id)
         .map(|details| details.title_ukrainian.clone())
         .or_else(|| {
-            app.search_results
+            app.search
+                .results
                 .iter()
                 .find(|a| a.id == progress_anime_id)
                 .map(|a| a.title_ukrainian.clone())
@@ -289,24 +291,24 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         })
         .unwrap_or_default();
 
-    let player_title = app
-        .current_details
-        .as_ref()
-        .map(|details| {
-            format!(
-                "{} ({})",
-                details.title_ukrainian,
-                details.year.unwrap_or(0)
-            )
-        })
-        .or_else(|| {
-            app.selected_result_index.and_then(|result_idx| {
-                app.search_results
-                    .get(result_idx)
-                    .map(|anime| format!("{} ({})", anime.title_ukrainian, anime.year.unwrap_or(0)))
+    let player_title =
+        app.current_details
+            .as_ref()
+            .map(|details| {
+                format!(
+                    "{} ({})",
+                    details.title_ukrainian,
+                    details.year.unwrap_or(0)
+                )
             })
-        })
-        .unwrap_or_else(|| progress_title.clone());
+            .or_else(|| {
+                app.search.selected_result_index.and_then(|result_idx| {
+                    app.search.results.get(result_idx).map(|anime| {
+                        format!("{} ({})", anime.title_ukrainian, anime.year.unwrap_or(0))
+                    })
+                })
+            })
+            .unwrap_or_else(|| progress_title.clone());
 
     let episode_title = format!("Серія {}", episode_num);
     Some(PlayTarget {

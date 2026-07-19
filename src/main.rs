@@ -412,7 +412,8 @@ impl ResourceCoordinator {
             .get(&anime_id)
             .and_then(|details| details.poster_url.clone())
             .or_else(|| {
-                app.search_results
+                app.search
+                    .results
                     .iter()
                     .find(|item| item.id == anime_id)
                     .and_then(|item| item.poster_url.clone())
@@ -496,7 +497,7 @@ impl ResourceCoordinator {
             (ResourceKey::Search { query, extended }, Err(error)) => {
                 if self.cached_search_used.as_ref() == Some(&(query, extended)) {
                     self.cached_search_used = None;
-                    app.search_query.clear();
+                    app.search.query.clear();
                     app.clear_activity();
                     app.set_info_status(
                         "Показано кешовані результати · мережеве оновлення не вдалося",
@@ -511,17 +512,17 @@ impl ResourceCoordinator {
                 app.details_cache.insert(anime_id, details.clone());
                 if should_add_details_to_search(
                     app.mode,
-                    app.search_results.iter().any(|item| item.id == anime_id),
+                    app.search.results.iter().any(|item| item.id == anime_id),
                     details.anilist_id.is_some(),
                 ) {
-                    app.search_results.push(anime_item_from_details(&details));
+                    app.search.results.push(anime_item_from_details(&details));
                     rebuild_franchise_projection(app);
-                    if !app.last_search_query.is_empty() {
+                    if !app.search.last_query.is_empty() {
                         let _ = app.metadata_cache.put_search(
-                            &app.last_search_query,
+                            &app.search.last_query,
                             app.settings.search_mode.is_extended(),
-                            app.search_results.clone(),
-                            app.anilist_media.clone(),
+                            app.search.results.clone(),
+                            app.search.anilist_media.clone(),
                         );
                     }
                 }
@@ -597,7 +598,7 @@ impl ResourceCoordinator {
                 }
             }
             (ResourceKey::AniHubByAniList(_), Ok(ResourceValue::AniHubId(Some(anime_id))))
-                if !app.search_results.iter().any(|item| item.id == anime_id) =>
+                if !app.search.results.iter().any(|item| item.id == anime_id) =>
             {
                 let _ = self
                     .runtime
@@ -667,7 +668,8 @@ fn set_resource_error(app: &mut AppState, context: &str, error: &LoadError) {
 }
 
 fn available_episode_limit(app: &AppState, anime_id: u32) -> Option<u32> {
-    app.franchise_catalogs
+    app.search
+        .franchise_catalogs
         .iter()
         .flat_map(|catalog| catalog.releases.iter())
         .find(|release| release.anihub_id == Some(anime_id))
@@ -699,9 +701,9 @@ fn cap_sources_to_available_episodes(
 }
 
 fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
-    if app.mode == AppMode::Normal && !app.search_query.trim().is_empty() {
+    if app.mode == AppMode::Normal && !app.search.query.trim().is_empty() {
         return Some(ResourceContext::Search {
-            query: app.search_query.trim().to_string(),
+            query: app.search.query.trim().to_string(),
             extended: app.settings.search_mode.is_extended(),
         });
     }
@@ -774,8 +776,9 @@ fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
                     })
                 })
                 .or_else(|| {
-                    app.selected_result_index
-                        .and_then(|index| app.search_results.get(index))
+                    app.search
+                        .selected_result_index
+                        .and_then(|index| app.search.results.get(index))
                         .map(|item| EpisodeSourcesKey::new(item.id, 1))
                 })?;
             let details_key = if app.focus == FocusPanel::SearchList {
@@ -795,8 +798,8 @@ fn desired_resource_context(app: &AppState) -> Option<ResourceContext> {
             });
         }
 
-        let selected = app.selected_result_index?;
-        let item = app.search_results.get(selected)?;
+        let selected = app.search.selected_result_index?;
+        let item = app.search.results.get(selected)?;
         let details_key = EpisodeSourcesKey::new(item.id, 1);
         let source_keys = source_keys_for_scope(vec![details_key], &source_scope);
         return Some(ResourceContext::Content {
@@ -1105,7 +1108,7 @@ fn build_active_playback_timeline(app: &AppState, target: &PlayTarget) -> Playba
             let source_key =
                 EpisodeSourcesKey::new(anime_id, release.conceptual_season.unwrap_or(1));
             let sources = app.sources_cache.get(&source_key)?;
-            let item = app.search_results.iter().find(|item| item.id == anime_id);
+            let item = app.search.results.iter().find(|item| item.id == anime_id);
             let title = item
                 .map(|item| item.title_ukrainian.clone())
                 .unwrap_or_else(|| release.title.clone());
@@ -1248,14 +1251,14 @@ pub fn apply_continue_context(
     resolved: &ContinueResolvedEpisode,
 ) {
     let anime_item = anime_item_from_details(details);
-    app.search_results = vec![anime_item];
-    app.anilist_media.clear();
-    app.franchise_catalogs = api::build_franchise_catalogs(&app.search_results, &[]);
-    app.franchise_groups = vec![vec![0]];
-    app.selected_group_index = Some(0);
-    app.selected_result_index = Some(0);
-    app.selected_release_index = Some(0);
-    app.result_list_state.select(Some(0));
+    app.search.results = vec![anime_item];
+    app.search.anilist_media.clear();
+    app.search.franchise_catalogs = api::build_franchise_catalogs(&app.search.results, &[]);
+    app.search.franchise_groups = vec![vec![0]];
+    app.search.selected_group_index = Some(0);
+    app.search.selected_result_index = Some(0);
+    app.search.selected_release_index = Some(0);
+    app.search.result_list_state.select(Some(0));
     app.mode = AppMode::Normal;
     app.focus = FocusPanel::EpisodeList;
     app.current_details = Some(details.clone());
@@ -1344,16 +1347,16 @@ fn apply_search_results(
     anilist_media: Vec<api::AniListMedia>,
     finish_search: bool,
 ) {
-    app.search_results = results;
-    app.anilist_media = anilist_media;
-    for item in &app.search_results {
+    app.search.results = results;
+    app.search.anilist_media = anilist_media;
+    for item in &app.search.results {
         app.details_cache
             .insert(item.id, anime_details_from_item(item));
     }
     rebuild_franchise_projection(app);
     if finish_search {
-        app.search_query.clear();
-        app.search_cursor = 0;
+        app.search.query.clear();
+        app.search.cursor = 0;
     }
 
     app.focus = FocusPanel::SearchList;
@@ -1364,7 +1367,7 @@ fn apply_search_results(
     app.studio_anime_ids.clear();
     app.sidebar_anime_idx = None;
     app.sidebar_subject_id = None;
-    app.selected_release_index = None;
+    app.search.selected_release_index = None;
     app.selected_season_index = None;
     app.season_list_state.select(None);
     app.selected_dubbing_index = None;
@@ -1372,19 +1375,19 @@ fn apply_search_results(
     app.selected_episode_index = None;
     app.episode_list_state.select(None);
 
-    if !app.franchise_groups.is_empty() {
-        app.result_list_state.select(Some(0));
-        app.selected_group_index = Some(0);
-        let rep = app.franchise_groups[0][0];
-        app.selected_result_index = Some(rep);
-        let canonical_id = app.search_results[rep].id;
+    if !app.search.franchise_groups.is_empty() {
+        app.search.result_list_state.select(Some(0));
+        app.search.selected_group_index = Some(0);
+        let rep = app.search.franchise_groups[0][0];
+        app.search.selected_result_index = Some(rep);
+        let canonical_id = app.search.results[rep].id;
         app.select_sidebar_subject(app.canonical_sidebar_subject().or(Some(canonical_id)));
         app.set_activity("Завантаження вибраного аніме…");
     } else {
         app.clear_activity();
-        app.result_list_state.select(None);
-        app.selected_group_index = None;
-        app.selected_result_index = None;
+        app.search.result_list_state.select(None);
+        app.search.selected_group_index = None;
+        app.search.selected_result_index = None;
         app.set_info_status("Нічого не знайдено");
     }
 }
@@ -1400,7 +1403,7 @@ fn rebuild_franchise_projection(app: &mut AppState) {
         .selected_release()
         .and_then(|release| release.anilist_id);
 
-    let catalogs = api::build_franchise_catalogs(&app.search_results, &app.anilist_media);
+    let catalogs = api::build_franchise_catalogs(&app.search.results, &app.search.anilist_media);
     let groups = catalogs
         .iter()
         .map(|catalog| {
@@ -1409,7 +1412,8 @@ fn rebuild_franchise_projection(app: &mut AppState) {
                 .iter()
                 .filter_map(|release| release.anihub_id)
                 .filter_map(|anime_id| {
-                    app.search_results
+                    app.search
+                        .results
                         .iter()
                         .position(|item| item.id == anime_id)
                 })
@@ -1417,36 +1421,40 @@ fn rebuild_franchise_projection(app: &mut AppState) {
         })
         .collect::<Vec<_>>();
 
-    app.franchise_catalogs = catalogs;
-    app.franchise_groups = groups;
+    app.search.franchise_catalogs = catalogs;
+    app.search.franchise_groups = groups;
     app.sort_search_projection();
 
     if let Some(anchor) = selected_anchor {
-        app.selected_group_index = app
+        app.search.selected_group_index = app
+            .search
             .franchise_catalogs
             .iter()
             .position(|catalog| catalog.anchor_anilist_id == Some(anchor));
     } else if let Some(title) = selected_title {
-        app.selected_group_index = app
+        app.search.selected_group_index = app
+            .search
             .franchise_catalogs
             .iter()
             .position(|catalog| catalog.canonical_title == title);
     }
-    if app.selected_group_index.is_none() && !app.franchise_catalogs.is_empty() {
-        app.selected_group_index = Some(0);
+    if app.search.selected_group_index.is_none() && !app.search.franchise_catalogs.is_empty() {
+        app.search.selected_group_index = Some(0);
     }
-    if let Some(group_index) = app.selected_group_index {
-        app.selected_result_index = app
+    if let Some(group_index) = app.search.selected_group_index {
+        app.search.selected_result_index = app
+            .search
             .franchise_groups
             .get(group_index)
             .and_then(|group| group.first())
             .copied();
         if let Some(anilist_id) = selected_release_anilist {
-            app.selected_release_index = app.franchise_catalogs[group_index]
+            app.search.selected_release_index = app.search.franchise_catalogs[group_index]
                 .releases
                 .iter()
                 .position(|release| release.anilist_id == Some(anilist_id));
-            app.season_list_state.select(app.selected_release_index);
+            app.season_list_state
+                .select(app.search.selected_release_index);
         }
     }
     if app.focus != FocusPanel::SearchList {

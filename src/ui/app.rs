@@ -526,16 +526,15 @@ impl DubbingChoice<'_> {
     }
 }
 
-pub struct AppState {
-    pub mode: AppMode,
-    pub focus: FocusPanel,
-    pub search_query: String,
-    pub last_search_query: String,
+/// Search-tab state kept together so result projection, selection ownership,
+/// and text editing do not keep growing the application-wide state bag.
+pub struct SearchState {
+    pub query: String,
+    pub last_query: String,
     /// Cursor position in Unicode scalar values, not bytes.
-    pub search_cursor: usize,
-
-    pub search_results: Vec<AnimeItem>,
-    pub search_ordering: SearchOrderingState,
+    pub cursor: usize,
+    pub results: Vec<AnimeItem>,
+    pub ordering: SearchOrderingState,
     pub franchise_groups: Vec<Vec<usize>>,
     /// Release catalogs aligned with `franchise_groups` by index.
     pub franchise_catalogs: Vec<FranchiseCatalog>,
@@ -544,9 +543,33 @@ pub struct AppState {
     pub anilist_media: Vec<AniListMedia>,
     pub selected_group_index: Option<usize>,
     pub selected_result_index: Option<usize>,
-    /// Selected release in the active search catalog. Library navigation keeps
-    /// using `selected_season_index` for its persisted raw season numbers.
     pub selected_release_index: Option<usize>,
+    pub result_list_state: ListState,
+}
+
+impl SearchState {
+    fn new(ordering: SearchOrderingState, franchise_catalogs: Vec<FranchiseCatalog>) -> Self {
+        Self {
+            query: String::new(),
+            last_query: String::new(),
+            cursor: 0,
+            results: Vec::new(),
+            ordering,
+            franchise_groups: Vec::new(),
+            franchise_catalogs,
+            anilist_media: Vec::new(),
+            selected_group_index: None,
+            selected_result_index: None,
+            selected_release_index: None,
+            result_list_state: ListState::default(),
+        }
+    }
+}
+
+pub struct AppState {
+    pub mode: AppMode,
+    pub focus: FocusPanel,
+    pub search: SearchState,
     pub selected_season_index: Option<usize>,
     pub selected_dubbing_index: Option<usize>,
     pub selected_episode_index: Option<usize>,
@@ -567,7 +590,6 @@ pub struct AppState {
     /// present in the current search response and provides an ownership guard
     /// for asynchronously completed poster requests.
     pub sidebar_subject_id: Option<u32>,
-    pub result_list_state: ListState,
     pub season_list_state: ListState,
     pub dubbing_list_state: ListState,
     pub episode_list_state: ListState,
@@ -670,21 +692,13 @@ impl AppState {
         let mut app = Self {
             mode: AppMode::Normal,
             focus: FocusPanel::SearchList,
-            search_query: String::new(),
-            last_search_query: String::new(),
-            search_cursor: 0,
-
-            search_results: Vec::new(),
-            search_ordering: SearchOrderingState::new(search_sort, settings.search_sort_reversed),
-            franchise_groups: Vec::new(),
             // Cached searches retain AniList relation graphs. Keeping the
             // catalogs that intersect history lets the first Library open
             // restore sibling seasons before another network search.
-            franchise_catalogs: cached_library_catalogs,
-            anilist_media: Vec::new(),
-            selected_group_index: None,
-            selected_result_index: None,
-            selected_release_index: None,
+            search: SearchState::new(
+                SearchOrderingState::new(search_sort, settings.search_sort_reversed),
+                cached_library_catalogs,
+            ),
             selected_season_index: None,
             selected_dubbing_index: None,
             selected_episode_index: None,
@@ -695,7 +709,6 @@ impl AppState {
             studio_anime_ids: Vec::new(),
             sidebar_anime_idx: None,
             sidebar_subject_id: None,
-            result_list_state: ListState::default(),
             season_list_state: ListState::default(),
             dubbing_list_state: ListState::default(),
             episode_list_state: ListState::default(),
@@ -796,12 +809,13 @@ impl AppState {
         self.sidebar_subject_id
             .or_else(|| {
                 self.sidebar_anime_idx
-                    .and_then(|index| self.search_results.get(index))
+                    .and_then(|index| self.search.results.get(index))
                     .map(|anime| anime.id)
             })
             .or_else(|| {
-                self.selected_result_index
-                    .and_then(|index| self.search_results.get(index))
+                self.search
+                    .selected_result_index
+                    .and_then(|index| self.search.results.get(index))
                     .map(|anime| anime.id)
             })
     }
@@ -812,7 +826,7 @@ impl AppState {
         let subject_changed = self.sidebar_subject_id != anime_id;
         self.sidebar_subject_id = anime_id;
         self.sidebar_anime_idx =
-            anime_id.and_then(|id| self.search_results.iter().position(|anime| anime.id == id));
+            anime_id.and_then(|id| self.search.results.iter().position(|anime| anime.id == id));
         self.current_details = anime_id.and_then(|id| self.details_cache.get(&id));
 
         if !self.settings.show_posters {
@@ -859,8 +873,9 @@ impl AppState {
         if self.is_library_mode() {
             return None;
         }
-        self.selected_group_index
-            .and_then(|index| self.franchise_catalogs.get(index))
+        self.search
+            .selected_group_index
+            .and_then(|index| self.search.franchise_catalogs.get(index))
     }
 
     pub fn has_release_catalog(&self) -> bool {
@@ -869,7 +884,7 @@ impl AppState {
     }
 
     pub fn selected_release(&self) -> Option<&ReleaseEntry> {
-        let index = self.selected_release_index?;
+        let index = self.search.selected_release_index?;
         self.selected_franchise_catalog()?.releases.get(index)
     }
 
@@ -908,6 +923,7 @@ impl AppState {
 
     pub fn source_key_for_anime_id(&self, anime_id: u32) -> EpisodeSourcesKey {
         let season = self
+            .search
             .franchise_catalogs
             .iter()
             .flat_map(|catalog| catalog.releases.iter())
@@ -949,7 +965,7 @@ impl AppState {
     }
 
     pub fn select_release(&mut self, index: Option<usize>) {
-        self.selected_release_index = index;
+        self.search.selected_release_index = index;
         self.season_list_state.select(index);
         self.selected_dubbing_index = None;
         self.dubbing_list_state.select(None);
@@ -981,7 +997,7 @@ impl AppState {
     }
 
     pub fn refresh_selected_release(&mut self) {
-        self.select_release(self.selected_release_index);
+        self.select_release(self.search.selected_release_index);
     }
 
     // --- Хелпери для 4-панельної навігації ---
@@ -1148,7 +1164,7 @@ impl AppState {
 
     fn switch_primary_tab(&mut self, tab: PrimaryTab) {
         self.status_editor = None;
-        self.search_ordering.popup = None;
+        self.search.ordering.popup = None;
         self.library.sort_popup = None;
         self.library.pending_watched_confirmation = None;
         self.library.pending_delete_confirmation = None;
@@ -1164,8 +1180,8 @@ impl AppState {
         // Leaving search-edit must not require Esc first when the user
         // deliberately picks another primary tab (including via Alt/Ctrl).
         if self.mode == AppMode::SearchInput {
-            self.search_query.clear();
-            self.search_cursor = 0;
+            self.search.query.clear();
+            self.search.cursor = 0;
         }
         match tab {
             // Always land on Search in Normal mode (never auto-open the editor).
@@ -1326,29 +1342,29 @@ impl AppState {
     }
 
     fn insert_search_char(&mut self, character: char) {
-        let byte_index = byte_index_for_char(&self.search_query, self.search_cursor);
-        self.search_query.insert(byte_index, character);
-        self.search_cursor += 1;
+        let byte_index = byte_index_for_char(&self.search.query, self.search.cursor);
+        self.search.query.insert(byte_index, character);
+        self.search.cursor += 1;
     }
 
     fn backspace_search_char(&mut self) {
-        if self.search_cursor == 0 {
+        if self.search.cursor == 0 {
             return;
         }
-        let start = byte_index_for_char(&self.search_query, self.search_cursor - 1);
-        let end = byte_index_for_char(&self.search_query, self.search_cursor);
-        self.search_query.replace_range(start..end, "");
-        self.search_cursor -= 1;
+        let start = byte_index_for_char(&self.search.query, self.search.cursor - 1);
+        let end = byte_index_for_char(&self.search.query, self.search.cursor);
+        self.search.query.replace_range(start..end, "");
+        self.search.cursor -= 1;
     }
 
     fn delete_search_char(&mut self) {
-        let char_count = self.search_query.chars().count();
-        if self.search_cursor >= char_count {
+        let char_count = self.search.query.chars().count();
+        if self.search.cursor >= char_count {
             return;
         }
-        let start = byte_index_for_char(&self.search_query, self.search_cursor);
-        let end = byte_index_for_char(&self.search_query, self.search_cursor + 1);
-        self.search_query.replace_range(start..end, "");
+        let start = byte_index_for_char(&self.search.query, self.search.cursor);
+        let end = byte_index_for_char(&self.search.query, self.search.cursor + 1);
+        self.search.query.replace_range(start..end, "");
     }
 
     fn handle_library_search_key(&mut self, code: KeyCode) {
@@ -1480,8 +1496,8 @@ impl AppState {
 
         match self.focus {
             FocusPanel::SearchList => (
-                self.result_list_state.selected().unwrap_or(0),
-                self.franchise_groups.len(),
+                self.search.result_list_state.selected().unwrap_or(0),
+                self.search.franchise_groups.len(),
             ),
             FocusPanel::ReleaseList => (
                 self.season_list_state.selected().unwrap_or(0),
@@ -1607,14 +1623,16 @@ impl AppState {
             };
 
             if let Some(id) = anime_id {
-                if let Some(item) = self.search_results.iter().find(|i| i.id == id) {
+                if let Some(item) = self.search.results.iter().find(|i| i.id == id) {
                     return Some((id, item.title_ukrainian.clone(), item.slug.clone()));
                 }
             }
 
             // Priority 2: Sidebar/Selected result index
-            let idx = self.sidebar_anime_idx.or(self.selected_result_index)?;
-            let item = self.search_results.get(idx)?;
+            let idx = self
+                .sidebar_anime_idx
+                .or(self.search.selected_result_index)?;
+            let item = self.search.results.get(idx)?;
             Some((item.id, item.title_ukrainian.clone(), item.slug.clone()))
         }
     }
@@ -1658,8 +1676,8 @@ impl AppState {
                 anime.anime_title.clone(),
             )
         } else {
-            let group_index = self.selected_group_index?;
-            if let Some(catalog) = self.franchise_catalogs.get(group_index) {
+            let group_index = self.search.selected_group_index?;
+            if let Some(catalog) = self.search.franchise_catalogs.get(group_index) {
                 if self.focus != FocusPanel::SearchList {
                     let release = self.selected_release()?;
                     let anime_id = self.selected_release_anihub_id()?;
@@ -1691,15 +1709,16 @@ impl AppState {
                     )
                 }
             } else {
-                let group = self.franchise_groups.get(group_index)?;
+                let group = self.search.franchise_groups.get(group_index)?;
                 let representative = group
                     .first()
-                    .and_then(|index| self.search_results.get(*index))?;
+                    .and_then(|index| self.search.results.get(*index))?;
                 (
                     group
                         .iter()
                         .filter_map(|index| {
-                            self.search_results
+                            self.search
+                                .results
                                 .get(*index)
                                 .map(|anime| (anime.id, None))
                         })
@@ -1758,6 +1777,7 @@ impl AppState {
         anime_title: &str,
     ) -> Vec<EpisodeWatchedUpdate> {
         let mut source_keys = self
+            .search
             .franchise_catalogs
             .iter()
             .flat_map(|catalog| catalog.releases.iter())
@@ -1820,7 +1840,7 @@ impl AppState {
                 continue;
             }
 
-            let fallback = self.franchise_catalogs.iter().find_map(|catalog| {
+            let fallback = self.search.franchise_catalogs.iter().find_map(|catalog| {
                 let release = catalog.releases.iter().find(|release| {
                     release.anihub_id == Some(source_key.anime_id)
                         && release.conceptual_season.unwrap_or(1) == source_key.season
@@ -2089,7 +2109,7 @@ impl AppState {
             }
             FocusPanel::SearchList => {
                 // Residual drill-down left open → collapse first, keep results.
-                if self.selected_release_index.is_some()
+                if self.search.selected_release_index.is_some()
                     || self.selected_season_index.is_some()
                     || self.selected_dubbing_index.is_some()
                     || self.current_sources.is_some()
@@ -2098,7 +2118,7 @@ impl AppState {
                     return;
                 }
                 // Already fully out of seasons/episodes: Esc clears the list.
-                if !self.search_results.is_empty() || !self.last_search_query.is_empty() {
+                if !self.search.results.is_empty() || !self.search.last_query.is_empty() {
                     self.clear_search_session();
                 }
             }
@@ -2108,7 +2128,7 @@ impl AppState {
     /// Leave season/dubbing/episode columns and keep the franchise list + query.
     fn collapse_search_drilldown(&mut self) {
         self.focus = FocusPanel::SearchList;
-        self.selected_release_index = None;
+        self.search.selected_release_index = None;
         self.selected_season_index = None;
         self.selected_dubbing_index = None;
         self.selected_episode_index = None;
@@ -2118,8 +2138,8 @@ impl AppState {
         self.current_sources = None;
         self.current_sources_key = None;
         self.studio_anime_ids.clear();
-        if let Some(index) = self.selected_group_index {
-            self.result_list_state.select(Some(index));
+        if let Some(index) = self.search.selected_group_index {
+            self.search.result_list_state.select(Some(index));
         }
         self.restore_representative_poster();
     }
@@ -2128,17 +2148,17 @@ impl AppState {
     fn clear_search_session(&mut self) {
         self.mode = AppMode::Normal;
         self.focus = FocusPanel::SearchList;
-        self.search_query.clear();
-        self.last_search_query.clear();
-        self.search_cursor = 0;
-        self.search_results.clear();
-        self.franchise_groups.clear();
-        self.franchise_catalogs.clear();
-        self.anilist_media.clear();
-        self.selected_group_index = None;
-        self.selected_result_index = None;
-        self.result_list_state.select(None);
-        self.selected_release_index = None;
+        self.search.query.clear();
+        self.search.last_query.clear();
+        self.search.cursor = 0;
+        self.search.results.clear();
+        self.search.franchise_groups.clear();
+        self.search.franchise_catalogs.clear();
+        self.search.anilist_media.clear();
+        self.search.selected_group_index = None;
+        self.search.selected_result_index = None;
+        self.search.result_list_state.select(None);
+        self.search.selected_release_index = None;
         self.selected_season_index = None;
         self.selected_dubbing_index = None;
         self.selected_episode_index = None;
@@ -2169,7 +2189,7 @@ impl AppState {
     fn move_focus_right(&mut self) {
         self.focus = match self.focus {
             FocusPanel::SearchList => {
-                if self.selected_result_index.is_some() {
+                if self.search.selected_result_index.is_some() {
                     if self.has_release_catalog() {
                         let index = self.initial_release_index();
                         self.select_release(index);
@@ -2288,11 +2308,11 @@ impl AppState {
     fn move_selection_down(&mut self) {
         match self.focus {
             FocusPanel::SearchList => {
-                let total = self.franchise_groups.len();
+                let total = self.search.franchise_groups.len();
                 if total == 0 {
                     return;
                 }
-                let i = match self.result_list_state.selected() {
+                let i = match self.search.result_list_state.selected() {
                     Some(i) => {
                         if i >= total.saturating_sub(1) {
                             0
@@ -2302,10 +2322,10 @@ impl AppState {
                     }
                     None => 0,
                 };
-                self.result_list_state.select(Some(i));
-                self.selected_group_index = Some(i);
-                if let Some(group) = self.franchise_groups.get(i) {
-                    self.selected_result_index = group.first().copied();
+                self.search.result_list_state.select(Some(i));
+                self.search.selected_group_index = Some(i);
+                if let Some(group) = self.search.franchise_groups.get(i) {
+                    self.search.selected_result_index = group.first().copied();
                 }
                 self.reset_downstream();
             }
@@ -2354,11 +2374,11 @@ impl AppState {
     fn move_selection_up(&mut self) {
         match self.focus {
             FocusPanel::SearchList => {
-                let total = self.franchise_groups.len();
+                let total = self.search.franchise_groups.len();
                 if total == 0 {
                     return;
                 }
-                let i = match self.result_list_state.selected() {
+                let i = match self.search.result_list_state.selected() {
                     Some(i) => {
                         if i == 0 {
                             total.saturating_sub(1)
@@ -2368,10 +2388,10 @@ impl AppState {
                     }
                     None => 0,
                 };
-                self.result_list_state.select(Some(i));
-                self.selected_group_index = Some(i);
-                if let Some(group) = self.franchise_groups.get(i) {
-                    self.selected_result_index = group.first().copied();
+                self.search.result_list_state.select(Some(i));
+                self.search.selected_group_index = Some(i);
+                if let Some(group) = self.search.franchise_groups.get(i) {
+                    self.search.selected_result_index = group.first().copied();
                 }
                 self.reset_downstream();
             }
@@ -2427,7 +2447,7 @@ impl AppState {
         self.studio_anime_ids.clear();
         self.sidebar_anime_idx = None;
         self.sidebar_subject_id = None;
-        self.selected_release_index = None;
+        self.search.selected_release_index = None;
         self.selected_season_index = None;
         self.season_list_state.select(None);
         self.selected_dubbing_index = None;
@@ -2440,8 +2460,9 @@ impl AppState {
         // whose completion is correctly rejected as stale, but no request for
         // the newly highlighted card would ever be scheduled until Enter.
         let subject = self.canonical_sidebar_subject().or_else(|| {
-            self.selected_result_index
-                .and_then(|index| self.search_results.get(index))
+            self.search
+                .selected_result_index
+                .and_then(|index| self.search.results.get(index))
                 .map(|item| item.id)
         });
         self.select_sidebar_subject(subject);
@@ -2452,23 +2473,25 @@ impl AppState {
         // Empty results show an empty-state hint instead of trapping the user.
         self.mode = AppMode::Normal;
         self.focus = FocusPanel::SearchList;
-        self.search_query.clear();
-        self.search_cursor = 0;
+        self.search.query.clear();
+        self.search.cursor = 0;
         self.current_sources = None;
         self.current_sources_key = None;
         self.current_details = None;
         self.studio_anime_ids.clear();
         self.sidebar_anime_idx = None;
         self.sidebar_subject_id = None;
-        self.result_list_state.select(self.selected_group_index);
-        self.selected_release_index = None;
+        self.search
+            .result_list_state
+            .select(self.search.selected_group_index);
+        self.search.selected_release_index = None;
         self.selected_season_index = None;
         self.season_list_state.select(None);
         self.selected_dubbing_index = None;
         self.dubbing_list_state.select(None);
         self.selected_episode_index = None;
         self.episode_list_state.select(None);
-        self.loading = self.selected_result_index.is_some();
+        self.loading = self.search.selected_result_index.is_some();
         self.activity_message = self
             .loading
             .then(|| "Завантаження вибраного аніме…".to_string());
@@ -2482,11 +2505,11 @@ impl AppState {
         self.library.episode_index = None;
         self.library.anime_list_state.select(None);
         self.library.season_list_state.select(None);
-        if self.mode == AppMode::Normal && self.selected_result_index.is_some() {
+        if self.mode == AppMode::Normal && self.search.selected_result_index.is_some() {
             self.restore_representative_poster();
         }
         self.library.episode_list_state.select(None);
-        self.search_ordering.popup = None;
+        self.search.ordering.popup = None;
         self.library.sort_popup = None;
         self.library.pending_watched_confirmation = None;
         self.library.pending_delete_confirmation = None;
@@ -2581,7 +2604,7 @@ impl AppState {
     /// already belongs to the library or has playback progress. This both
     /// upgrades old records and keeps future restarts independent of search.
     pub(crate) fn hydrate_library_catalog_metadata(&mut self) {
-        let updates = library_catalog_updates(&self.history, &self.franchise_catalogs);
+        let updates = library_catalog_updates(&self.history, &self.search.franchise_catalogs);
         if updates.is_empty() {
             return;
         }
@@ -2699,6 +2722,7 @@ impl AppState {
                     })
             }
             _ => self
+                .search
                 .selected_group_index
                 .and_then(|g_idx| {
                     if !self.studio_anime_ids.is_empty() {
@@ -2710,17 +2734,17 @@ impl AppState {
                             in_library: false,
                         })
                     } else {
-                        self.franchise_groups
-                            .get(g_idx)
-                            .map(|group| ContinueRequest::Group {
+                        self.search.franchise_groups.get(g_idx).map(|group| {
+                            ContinueRequest::Group {
                                 anime_ids: group
                                     .iter()
                                     .filter_map(|&idx| {
-                                        self.search_results.get(idx).map(|anime| anime.id)
+                                        self.search.results.get(idx).map(|anime| anime.id)
                                     })
                                     .collect(),
                                 in_library: false,
-                            })
+                            }
+                        })
                     }
                 })
                 .or(Some(ContinueRequest::Latest)),
@@ -2971,7 +2995,8 @@ impl AppState {
             .selected_franchise_catalog()
             .map(|catalog| catalog.canonical_title.clone())
             .or_else(|| {
-                self.search_results
+                self.search
+                    .results
                     .iter()
                     .find(|anime| anime.id == anime_id)
                     .map(|anime| anime.title_ukrainian.clone())
@@ -3134,8 +3159,9 @@ impl AppState {
             .canonical_sidebar_subject()
             .or_else(|| self.studio_anime_ids.first().copied())
             .or_else(|| {
-                self.selected_result_index
-                    .and_then(|i| self.search_results.get(i))
+                self.search
+                    .selected_result_index
+                    .and_then(|i| self.search.results.get(i))
                     .map(|item| item.id)
             });
 

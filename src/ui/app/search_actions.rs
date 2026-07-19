@@ -5,41 +5,41 @@ use std::cmp::Ordering;
 
 impl AppState {
     pub(super) fn open_search_sort_popup(&mut self) {
-        if self.focus != FocusPanel::SearchList || self.franchise_groups.is_empty() {
+        if self.focus != FocusPanel::SearchList || self.search.franchise_groups.is_empty() {
             return;
         }
         let selected = SearchSort::ALL
             .iter()
-            .position(|sort| *sort == self.search_ordering.sort)
+            .position(|sort| *sort == self.search.ordering.sort)
             .unwrap_or(0);
-        self.search_ordering.popup = Some(selected);
+        self.search.ordering.popup = Some(selected);
     }
 
     pub(super) fn handle_search_sort_popup(&mut self, key_code: KeyCode) -> bool {
-        let Some(selected) = self.search_ordering.popup else {
+        let Some(selected) = self.search.ordering.popup else {
             return false;
         };
         match key_code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.search_ordering.popup = Some(selected.saturating_sub(1));
+                self.search.ordering.popup = Some(selected.saturating_sub(1));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.search_ordering.popup = Some((selected + 1).min(SearchSort::ALL.len() - 1));
+                self.search.ordering.popup = Some((selected + 1).min(SearchSort::ALL.len() - 1));
             }
             KeyCode::Enter => {
                 let selected_sort = SearchSort::ALL[selected];
-                if selected_sort == self.search_ordering.sort {
-                    self.search_ordering.reversed = !self.search_ordering.reversed;
+                if selected_sort == self.search.ordering.sort {
+                    self.search.ordering.reversed = !self.search.ordering.reversed;
                 } else {
-                    self.search_ordering.sort = selected_sort;
-                    self.search_ordering.reversed = false;
+                    self.search.ordering.sort = selected_sort;
+                    self.search.ordering.reversed = false;
                 }
-                self.settings.search_sort = search_sort_to_setting(self.search_ordering.sort);
-                self.settings.search_sort_reversed = self.search_ordering.reversed;
-                self.search_ordering.popup = None;
+                self.settings.search_sort = search_sort_to_setting(self.search.ordering.sort);
+                self.settings.search_sort_reversed = self.search.ordering.reversed;
+                self.search.ordering.popup = None;
                 self.sort_search_projection();
             }
-            KeyCode::Esc | KeyCode::Char('s') => self.search_ordering.popup = None,
+            KeyCode::Esc | KeyCode::Char('s') => self.search.ordering.popup = None,
             _ => {}
         }
         true
@@ -48,18 +48,19 @@ impl AppState {
     /// Reorder aligned franchise catalogs/groups without touching raw API
     /// results. Keeping the raw order makes the Relevance option reversible.
     pub fn sort_search_projection(&mut self) {
-        let selected_identity = self.selected_group_index.and_then(|index| {
-            self.franchise_catalogs
+        let selected_identity = self.search.selected_group_index.and_then(|index| {
+            self.search
+                .franchise_catalogs
                 .get(index)
                 .map(|catalog| (catalog.anchor_anilist_id, catalog.canonical_title.clone()))
         });
-        let mut projection = std::mem::take(&mut self.franchise_catalogs)
+        let mut projection = std::mem::take(&mut self.search.franchise_catalogs)
             .into_iter()
-            .zip(std::mem::take(&mut self.franchise_groups))
+            .zip(std::mem::take(&mut self.search.franchise_groups))
             .collect::<Vec<_>>();
-        let sort = self.search_ordering.sort;
-        let reversed = self.search_ordering.reversed;
-        let results = &self.search_results;
+        let sort = self.search.ordering.sort;
+        let reversed = self.search.ordering.reversed;
+        let results = &self.search.results;
         projection.sort_by(|(a_catalog, a_group), (b_catalog, b_group)| {
             let ordering =
                 compare_search_entries(sort, a_catalog, a_group, b_catalog, b_group, results);
@@ -69,20 +70,24 @@ impl AppState {
                 ordering
             }
         });
-        (self.franchise_catalogs, self.franchise_groups) = projection.into_iter().unzip();
+        (self.search.franchise_catalogs, self.search.franchise_groups) =
+            projection.into_iter().unzip();
 
-        self.selected_group_index = selected_identity
+        self.search.selected_group_index = selected_identity
             .and_then(|(anchor, title)| {
-                self.franchise_catalogs.iter().position(|catalog| {
+                self.search.franchise_catalogs.iter().position(|catalog| {
                     (anchor.is_some() && catalog.anchor_anilist_id == anchor)
                         || catalog.canonical_title == title
                 })
             })
-            .or_else(|| (!self.franchise_groups.is_empty()).then_some(0));
-        self.result_list_state.select(self.selected_group_index);
-        self.selected_result_index = self
+            .or_else(|| (!self.search.franchise_groups.is_empty()).then_some(0));
+        self.search
+            .result_list_state
+            .select(self.search.selected_group_index);
+        self.search.selected_result_index = self
+            .search
             .selected_group_index
-            .and_then(|index| self.franchise_groups.get(index))
+            .and_then(|index| self.search.franchise_groups.get(index))
             .and_then(|group| group.first())
             .copied();
     }

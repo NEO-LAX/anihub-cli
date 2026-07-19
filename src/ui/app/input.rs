@@ -31,8 +31,8 @@ fn handle_search_results_key(app: &mut AppState, key: KeyCode) {
         KeyCode::Esc => app.handle_esc(),
         KeyCode::Char('/') => {
             app.mode = AppMode::SearchInput;
-            app.search_query.clone_from(&app.last_search_query);
-            app.search_cursor = app.search_query.chars().count();
+            app.search.query.clone_from(&app.search.last_query);
+            app.search.cursor = app.search.query.chars().count();
             app.clear_activity();
         }
         KeyCode::Right => app.move_focus_right(),
@@ -48,11 +48,11 @@ fn handle_search_input_key(app: &mut AppState, key: KeyCode) {
     match key {
         KeyCode::Enter => {
             app.mode = AppMode::Normal;
-            let query = app.search_query.trim().to_string();
+            let query = app.search.query.trim().to_string();
             if !query.is_empty() {
-                app.last_search_query.clone_from(&query);
-                app.search_query = query;
-                app.search_cursor = app.search_query.chars().count();
+                app.search.last_query.clone_from(&query);
+                app.search.query = query;
+                app.search.cursor = app.search.query.chars().count();
                 app.loading = true;
                 app.activity_message = Some("Пошук аніме…".to_string());
             }
@@ -60,20 +60,20 @@ fn handle_search_input_key(app: &mut AppState, key: KeyCode) {
         KeyCode::Char(character) => app.insert_search_char(character),
         KeyCode::Backspace => app.backspace_search_char(),
         KeyCode::Delete => app.delete_search_char(),
-        KeyCode::Left => app.search_cursor = app.search_cursor.saturating_sub(1),
+        KeyCode::Left => app.search.cursor = app.search.cursor.saturating_sub(1),
         KeyCode::Right => {
-            app.search_cursor = (app.search_cursor + 1).min(app.search_query.chars().count());
+            app.search.cursor = (app.search.cursor + 1).min(app.search.query.chars().count());
         }
-        KeyCode::Home => app.search_cursor = 0,
-        KeyCode::End => app.search_cursor = app.search_query.chars().count(),
+        KeyCode::Home => app.search.cursor = 0,
+        KeyCode::End => app.search.cursor = app.search.query.chars().count(),
         KeyCode::Esc => {
             // Cancel edit only — keep last results and last query display.
             app.mode = AppMode::Normal;
-            app.search_query.clear();
-            app.search_cursor = 0;
+            app.search.query.clear();
+            app.search.cursor = 0;
             app.clear_activity();
-            if let Some(index) = app.selected_group_index {
-                app.result_list_state.select(Some(index));
+            if let Some(index) = app.search.selected_group_index {
+                app.search.result_list_state.select(Some(index));
             }
         }
         _ => {}

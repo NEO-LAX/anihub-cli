@@ -403,7 +403,7 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         render_moonanime_popup(f, &title);
     } else if app.status_editor.is_some() {
         render_status_editor_popup(f, app);
-    } else if app.search_ordering.popup.is_some() {
+    } else if app.search.ordering.popup.is_some() {
         search::render_sort_popup(f, app);
     } else if app.library.sort_popup.is_some() {
         library::render_sort_popup(f, app);
@@ -552,7 +552,7 @@ fn active_search_cursor(app: &AppState) -> usize {
     if app.library.search_editing {
         app.library.search_cursor
     } else {
-        app.search_cursor
+        app.search.cursor
     }
 }
 
@@ -577,9 +577,9 @@ fn settings_tabs_context(app: &AppState) -> Line<'static> {
 
 fn search_header_context(app: &AppState) -> Line<'static> {
     let query = if app.mode == AppMode::SearchInput {
-        app.search_query.as_str()
+        app.search.query.as_str()
     } else {
-        app.last_search_query.as_str()
+        app.search.last_query.as_str()
     };
     if query.is_empty() {
         Line::from(Span::styled(
@@ -646,15 +646,17 @@ fn library_filter_context(app: &AppState) -> Line<'static> {
 
 fn search_sidebar_tracking_context(app: &AppState) -> (Vec<u32>, Option<u32>) {
     if app.focus == FocusPanel::SearchList {
-        if let Some(group_index) = app.selected_group_index {
+        if let Some(group_index) = app.search.selected_group_index {
             let mut anime_ids = app
+                .search
                 .franchise_groups
                 .get(group_index)
                 .into_iter()
                 .flatten()
-                .filter_map(|index| app.search_results.get(*index).map(|anime| anime.id))
+                .filter_map(|index| app.search.results.get(*index).map(|anime| anime.id))
                 .collect::<Vec<_>>();
             let mainline_ids = app
+                .search
                 .franchise_catalogs
                 .get(group_index)
                 .into_iter()
@@ -671,6 +673,7 @@ fn search_sidebar_tracking_context(app: &AppState) -> (Vec<u32>, Option<u32>) {
             anime_ids.sort_unstable();
             anime_ids.dedup();
             let totals = app
+                .search
                 .franchise_catalogs
                 .get(group_index)
                 .into_iter()
@@ -694,8 +697,9 @@ fn search_sidebar_tracking_context(app: &AppState) -> (Vec<u32>, Option<u32>) {
     let anime_ids = app
         .sidebar_subject()
         .or_else(|| {
-            app.selected_result_index
-                .and_then(|index| app.search_results.get(index).map(|anime| anime.id))
+            app.search
+                .selected_result_index
+                .and_then(|index| app.search.results.get(index).map(|anime| anime.id))
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -704,7 +708,8 @@ fn search_sidebar_tracking_context(app: &AppState) -> (Vec<u32>, Option<u32>) {
             .get(id)
             .and_then(|details| details.episodes_count)
             .or_else(|| {
-                app.search_results
+                app.search
+                    .results
                     .iter()
                     .find(|anime| anime.id == *id)
                     .and_then(|anime| anime.episodes_count)
@@ -734,11 +739,12 @@ fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     let display_idx = app
         .sidebar_subject()
         .and_then(|anime_id| {
-            app.search_results
+            app.search
+                .results
                 .iter()
                 .position(|anime| anime.id == anime_id)
         })
-        .or(app.selected_result_index);
+        .or(app.search.selected_result_index);
     if display_idx.is_none()
         && selected_release_for_sidebar(app).is_none()
         && sidebar_details_override(app).is_none()
@@ -760,7 +766,7 @@ fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
         d.title_english.is_some()
     } else {
         display_idx
-            .and_then(|i| app.search_results.get(i))
+            .and_then(|i| app.search.results.get(i))
             .and_then(|it| it.title_english.as_ref())
             .is_some()
     };
@@ -854,7 +860,7 @@ fn render_sidebar_title_area(
             );
         }
     } else if let Some(idx) = display_idx {
-        if let Some(item) = app.search_results.get(idx) {
+        if let Some(item) = app.search.results.get(idx) {
             lines.push(
                 Line::from(Span::styled(
                     truncate_with_ellipsis(&item.title_ukrainian, area.width as usize),
@@ -1023,7 +1029,7 @@ fn render_sidebar_details_area(
             }
         }
     } else if let Some(idx) = display_idx {
-        if let Some(item) = app.search_results.get(idx) {
+        if let Some(item) = app.search.results.get(idx) {
             if include_title {
                 text.push(
                     Line::from(Span::styled(
@@ -1421,22 +1427,23 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         let list_width = list_chunks[0].width.saturating_sub(6) as usize;
         let search_title = format!(
             " Результати · {} {} ",
-            app.search_ordering.sort.label(),
-            app.search_ordering
+            app.search.ordering.sort.label(),
+            app.search
+                .ordering
                 .sort
-                .direction_symbol(app.search_ordering.reversed)
+                .direction_symbol(app.search.ordering.reversed)
         );
         let mut items: Vec<ListItem> = Vec::new();
-        for (group_index, group) in app.franchise_groups.iter().enumerate() {
+        for (group_index, group) in app.search.franchise_groups.iter().enumerate() {
             let Some(&representative_index) = group.first() else {
                 continue;
             };
-            let name = app.franchise_catalogs.get(group_index).map_or_else(
-                || api::franchise_display_name(&app.search_results, group),
+            let name = app.search.franchise_catalogs.get(group_index).map_or_else(
+                || api::franchise_display_name(&app.search.results, group),
                 |catalog| catalog.canonical_title.as_str(),
             );
-            let rep = &app.search_results[representative_index];
-            let (tv, other) = count_seasons(&app.search_results, group);
+            let rep = &app.search.results[representative_index];
+            let (tv, other) = count_seasons(&app.search.results, group);
             let mut metadata = Vec::new();
             if tv > 0 {
                 metadata.push(season_count_label(tv));
@@ -1460,7 +1467,7 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
         if items.is_empty() {
             let (message, loading) = if let Some(activity) = &app.activity_message {
                 (activity.as_str(), true)
-            } else if app.last_search_query.is_empty() {
+            } else if app.search.last_query.is_empty() {
                 ("Натисніть / щоб шукати", false)
             } else {
                 ("Нічого не знайдено", false)
@@ -1475,7 +1482,7 @@ fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             );
         } else {
             let list = create_list(&search_title, items, app.focus == FocusPanel::SearchList);
-            f.render_stateful_widget(list, list_chunks[0], &mut app.result_list_state);
+            f.render_stateful_widget(list, list_chunks[0], &mut app.search.result_list_state);
         }
     }
 
@@ -2086,7 +2093,8 @@ fn season_year(app: &AppState, season_num: u32) -> Option<u32> {
         .get(&anime_id)
         .and_then(|d| d.year)
         .or_else(|| {
-            app.search_results
+            app.search
+                .results
                 .iter()
                 .find(|a| a.id == anime_id)
                 .and_then(|a| a.year)
@@ -2750,8 +2758,9 @@ fn selected_release_for_sidebar(app: &AppState) -> Option<&api::ReleaseEntry> {
 fn sidebar_details_override(app: &AppState) -> Option<api::AnimeDetails> {
     let subject_id = app.sidebar_subject()?;
     let rep_id = app
+        .search
         .selected_result_index
-        .and_then(|i| app.search_results.get(i))
+        .and_then(|i| app.search.results.get(i))
         .map(|a| a.id);
     if rep_id == Some(subject_id) {
         return None;
@@ -2769,8 +2778,9 @@ fn sidebar_is_representative(app: &AppState) -> bool {
         return true;
     }
     let representative_id = app
+        .search
         .selected_result_index
-        .and_then(|index| app.search_results.get(index))
+        .and_then(|index| app.search.results.get(index))
         .map(|anime| anime.id);
     app.sidebar_subject() == representative_id
 }

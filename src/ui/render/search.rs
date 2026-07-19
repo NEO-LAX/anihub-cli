@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
-    let Some(selected) = app.search_ordering.popup else {
+    let Some(selected) = app.search.ordering.popup else {
         return;
     };
     let actions = [
@@ -22,8 +22,8 @@ pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
     let items = SearchSort::ALL
         .iter()
         .map(|sort| {
-            let active = *sort == app.search_ordering.sort;
-            let reversed = active && app.search_ordering.reversed;
+            let active = *sort == app.search.ordering.sort;
+            let reversed = active && app.search.ordering.reversed;
             let marker = if active { "✓" } else { " " };
             ListItem::new(format!(
                 "{marker} {} · {}",
