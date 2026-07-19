@@ -42,6 +42,27 @@ enum ResourceContext {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventOwner {
+    LibraryRefresh,
+    Foreground,
+    Stale,
+}
+
+fn event_owner(
+    generation: ViewGeneration,
+    foreground: ViewGeneration,
+    library_refresh: Option<ViewGeneration>,
+) -> EventOwner {
+    if library_refresh == Some(generation) {
+        EventOwner::LibraryRefresh
+    } else if generation == foreground {
+        EventOwner::Foreground
+    } else {
+        EventOwner::Stale
+    }
+}
+
 struct PendingContinue {
     progress: storage::WatchProgress,
     in_library: bool,
@@ -464,14 +485,19 @@ impl ResourceCoordinator {
                 error,
             } => (request_id, generation, key, Err(error)),
         };
-        if self.library_refresh.generation() == Some(generation) {
-            self.library_refresh
-                .apply_event(app, &self.runtime.handle, request_id, key, result)
-                .await;
-            return;
-        }
-        if generation != self.generation {
-            return;
+        match event_owner(
+            generation,
+            self.generation,
+            self.library_refresh.generation(),
+        ) {
+            EventOwner::LibraryRefresh => {
+                self.library_refresh
+                    .apply_event(app, &self.runtime.handle, request_id, key, result)
+                    .await;
+                return;
+            }
+            EventOwner::Stale => return,
+            EventOwner::Foreground => {}
         }
 
         match (key, result) {
@@ -817,4 +843,46 @@ pub(super) fn source_keys_for_scope(
         SourceLoadScope::Full => {}
     }
     source_keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_routing_keeps_background_refresh_independent() {
+        let foreground = ViewGeneration::new(7);
+        let library = ViewGeneration::new(1 << 63);
+
+        assert_eq!(
+            event_owner(library, foreground, Some(library)),
+            EventOwner::LibraryRefresh
+        );
+        assert_eq!(
+            event_owner(foreground, foreground, Some(library)),
+            EventOwner::Foreground
+        );
+        assert_eq!(
+            event_owner(ViewGeneration::new(6), foreground, Some(library)),
+            EventOwner::Stale
+        );
+    }
+
+    #[test]
+    fn resource_scope_locks_navigation_contract() {
+        let keys = vec![
+            EpisodeSourcesKey::new(10, 1),
+            EpisodeSourcesKey::new(20, 2),
+            EpisodeSourcesKey::new(30, 3),
+        ];
+        assert!(source_keys_for_scope(keys.clone(), &SourceLoadScope::DetailsOnly).is_empty());
+        assert_eq!(
+            source_keys_for_scope(keys.clone(), &SourceLoadScope::Preview),
+            vec![keys[0]]
+        );
+        assert_eq!(
+            source_keys_for_scope(keys.clone(), &SourceLoadScope::Full),
+            keys
+        );
+    }
 }

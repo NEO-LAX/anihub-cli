@@ -50,6 +50,28 @@ impl ActiveRefresh {
             &self.media.values().cloned().collect::<Vec<_>>(),
         )
     }
+
+    fn accepts_event(&mut self, request_id: RequestId) -> bool {
+        self.pending.remove(&request_id)
+    }
+
+    fn can_start_search(&self) -> bool {
+        self.searching && self.pending.len() < MAX_BACKGROUND_SEARCHES
+    }
+
+    fn merge_search_result(&mut self, result: &SearchResultBundle) -> bool {
+        if result.anilist_enrichment_failed {
+            self.failed = true;
+            return false;
+        }
+        for item in &result.items {
+            self.items.insert(item.id, item.clone());
+        }
+        for node in &result.anilist_media {
+            self.media.insert(node.id, node.clone());
+        }
+        true
+    }
 }
 
 impl LibraryRefreshCoordinator {
@@ -87,38 +109,23 @@ impl LibraryRefreshCoordinator {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if !active.pending.remove(&request_id) {
+        if !active.accepts_event(request_id) {
             return;
         }
 
         let mut details_follow_up = None;
         match (key, result) {
-            (
-                ResourceKey::Search { query, extended },
-                Ok(ResourceValue::Search(SearchResultBundle {
-                    items,
-                    anilist_media,
-                    anilist_enrichment_failed,
-                })),
-            ) => {
-                if anilist_enrichment_failed {
-                    // A local-only projection can split a known franchise and
-                    // overwrite its canonical title. Keep the existing cache
-                    // instead of applying a degraded relation graph.
-                    active.failed = true;
-                } else {
+            (ResourceKey::Search { query, extended }, Ok(ResourceValue::Search(result))) => {
+                // A local-only projection can split a known franchise and
+                // overwrite its canonical title. Keep the existing cache
+                // instead of applying a degraded relation graph.
+                if active.merge_search_result(&result) {
                     let _ = app.metadata_cache.put_search(
                         &query,
                         extended,
-                        items.clone(),
-                        anilist_media.clone(),
+                        result.items,
+                        result.anilist_media,
                     );
-                    for item in items {
-                        active.items.insert(item.id, item);
-                    }
-                    for node in anilist_media {
-                        active.media.insert(node.id, node);
-                    }
                 }
             }
             (ResourceKey::AniHubByAniList(_), Ok(ResourceValue::AniHubId(Some(anime_id)))) => {
@@ -158,7 +165,7 @@ impl LibraryRefreshCoordinator {
         }
 
         if active.searching {
-            while active.pending.len() < MAX_BACKGROUND_SEARCHES {
+            while active.can_start_search() {
                 let Some(query) = active.queued_queries.pop_front() else {
                     break;
                 };
@@ -206,5 +213,80 @@ impl LibraryRefreshCoordinator {
         } else if active.failed {
             app.set_info_status("Не вдалося оновити бібліотеку · показано кеш");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: u32) -> AnimeItem {
+        AnimeItem {
+            id,
+            anilist_id: Some(id + 1000),
+            slug: format!("anime-{id}"),
+            title_ukrainian: format!("Аніме {id}"),
+            title_original: None,
+            title_english: None,
+            status: "ongoing".to_string(),
+            anime_type: "tv".to_string(),
+            year: Some(2026),
+            has_ukrainian_dub: true,
+            poster_url: None,
+            episodes_count: Some(12),
+            description: None,
+            rating: None,
+            genres: None,
+            dubbing_studios: None,
+        }
+    }
+
+    #[test]
+    fn refresh_accepts_only_owned_requests() {
+        let mut refresh = ActiveRefresh::new(
+            ViewGeneration::new(FIRST_LIBRARY_GENERATION),
+            vec!["one".to_string()],
+        );
+        refresh.pending.insert(RequestId::from(10));
+
+        assert!(!refresh.accepts_event(RequestId::from(9)));
+        assert!(refresh.pending.contains(&RequestId::from(10)));
+        assert!(refresh.accepts_event(RequestId::from(10)));
+        assert!(refresh.pending.is_empty());
+    }
+
+    #[test]
+    fn refresh_caps_concurrent_searches_at_two() {
+        let mut refresh = ActiveRefresh::new(
+            ViewGeneration::new(FIRST_LIBRARY_GENERATION),
+            vec!["one".to_string(), "two".to_string(), "three".to_string()],
+        );
+        assert!(refresh.can_start_search());
+        refresh.pending.insert(RequestId::from(1));
+        assert!(refresh.can_start_search());
+        refresh.pending.insert(RequestId::from(2));
+        assert!(!refresh.can_start_search());
+    }
+
+    #[test]
+    fn degraded_partial_refresh_keeps_previous_good_results() {
+        let mut refresh =
+            ActiveRefresh::new(ViewGeneration::new(FIRST_LIBRARY_GENERATION), Vec::new());
+        let good = SearchResultBundle {
+            items: vec![item(7)],
+            anilist_media: Vec::new(),
+            anilist_enrichment_failed: false,
+        };
+        assert!(refresh.merge_search_result(&good));
+
+        let degraded = SearchResultBundle {
+            items: vec![item(8)],
+            anilist_media: Vec::new(),
+            anilist_enrichment_failed: true,
+        };
+        assert!(!refresh.merge_search_result(&degraded));
+        assert!(refresh.failed);
+        assert!(refresh.items.contains_key(&7));
+        assert!(!refresh.items.contains_key(&8));
     }
 }
