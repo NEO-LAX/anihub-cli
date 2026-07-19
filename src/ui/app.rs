@@ -24,10 +24,15 @@ use std::time::{Duration, Instant};
 mod input;
 mod library_actions;
 mod library_navigation;
+mod library_state;
 mod playback_ui;
 mod search_actions;
 mod settings_ui;
 
+pub use library_state::{
+    LibraryAnimeEntry, LibraryFilter, LibrarySeasonEntry, LibrarySort, LibraryState,
+    LibraryWatchedConfirmation,
+};
 use playback_ui::PlaybackUiState;
 use settings_ui::SettingsUiState;
 
@@ -83,25 +88,6 @@ pub enum ContinueRequest {
         anime_ids: Vec<u32>,
         in_library: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LibraryFilter {
-    All,
-    Watching,
-    Planned,
-    Completed,
-    OnHold,
-    Dropped,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LibrarySort {
-    Recent,
-    Title,
-    Year,
-    Rating,
-    Progress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,88 +151,6 @@ impl SearchOrderingState {
             sort,
             reversed,
             popup: None,
-        }
-    }
-}
-
-impl LibrarySort {
-    pub const ALL: [Self; 5] = [
-        Self::Recent,
-        Self::Title,
-        Self::Year,
-        Self::Rating,
-        Self::Progress,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Recent => "Нещодавні",
-            Self::Title => "Назва",
-            Self::Year => "Рік",
-            Self::Rating => "Рейтинг",
-            Self::Progress => "Прогрес",
-        }
-    }
-
-    pub const fn order_label(self, reversed: bool) -> &'static str {
-        match (self, reversed) {
-            (Self::Recent | Self::Year, false) => "новіші → старіші",
-            (Self::Recent | Self::Year, true) => "старіші → новіші",
-            (Self::Title, false) => "А → Я",
-            (Self::Title, true) => "Я → А",
-            (Self::Rating, false) => "вищий → нижчий",
-            (Self::Rating, true) => "нижчий → вищий",
-            (Self::Progress, false) => "більший → менший",
-            (Self::Progress, true) => "менший → більший",
-        }
-    }
-
-    pub const fn direction_symbol(self, reversed: bool) -> &'static str {
-        let ascending = matches!(self, Self::Title) != reversed;
-        if ascending { "↑" } else { "↓" }
-    }
-}
-
-impl LibraryFilter {
-    pub const ALL: [Self; 6] = [
-        Self::All,
-        Self::Watching,
-        Self::Planned,
-        Self::Completed,
-        Self::OnHold,
-        Self::Dropped,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::All => "Усі",
-            Self::Watching => "Дивлюся",
-            Self::Planned => "У планах",
-            Self::Completed => "Переглянуто",
-            Self::OnHold => "Відкладено",
-            Self::Dropped => "Кинуто",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::All => Self::Watching,
-            Self::Watching => Self::Planned,
-            Self::Planned => Self::Completed,
-            Self::Completed => Self::OnHold,
-            Self::OnHold => Self::Dropped,
-            Self::Dropped => Self::All,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::All => Self::Dropped,
-            Self::Watching => Self::All,
-            Self::Planned => Self::Watching,
-            Self::Completed => Self::Planned,
-            Self::OnHold => Self::Completed,
-            Self::Dropped => Self::OnHold,
         }
     }
 }
@@ -380,103 +284,6 @@ pub struct NowPlaying {
     pub position: f64,
     pub duration: f64,
     pub paused: bool,
-}
-
-#[derive(Clone)]
-pub struct LibraryAnimeEntry {
-    pub anime_ids: Vec<u32>,
-    pub anime_title: String,
-    pub latest_progress: WatchProgress,
-    pub seasons: Vec<LibrarySeasonEntry>,
-    pub status: AnimeStatus,
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct LibrarySeasonEntry {
-    pub anime_id: u32,
-    pub season: u32,
-    pub part: Option<u32>,
-    pub title: String,
-    pub kind: LibraryReleaseKind,
-    pub episodes_count: Option<u32>,
-    pub first_episode: Option<u32>,
-    pub airing_status: Option<String>,
-    pub next_airing_episode: Option<u32>,
-    pub next_airing_at: Option<i64>,
-    pub status: AnimeStatus,
-    pub episodes: Vec<WatchProgress>,
-}
-
-#[derive(Clone)]
-pub struct LibraryWatchedConfirmation {
-    pub anime_title: String,
-    pub releases: Vec<LibrarySeasonEntry>,
-    pub mark_watched: bool,
-}
-
-pub struct LibraryState {
-    pub items: Vec<LibraryAnimeEntry>,
-    pub all_items: Vec<LibraryAnimeEntry>,
-    pub filter: LibraryFilter,
-    pub sort: LibrarySort,
-    pub sort_reversed: bool,
-    pub sort_popup: Option<usize>,
-    pub search_query: String,
-    pub search_cursor: usize,
-    pub search_editing: bool,
-    pub anime_index: Option<usize>,
-    pub season_index: Option<usize>,
-    pub episode_index: Option<usize>,
-    pub anime_list_state: ListState,
-    pub season_list_state: ListState,
-    pub episode_list_state: ListState,
-    pub pending_delete_confirmation: Option<(Vec<u32>, String)>,
-    pub pending_watched_confirmation: Option<LibraryWatchedConfirmation>,
-    pub clear_confirmation: bool,
-    pub refresh_requested: bool,
-}
-
-impl LibraryState {
-    fn new(filter: LibraryFilter, sort: LibrarySort, sort_reversed: bool) -> Self {
-        Self {
-            items: Vec::new(),
-            all_items: Vec::new(),
-            filter,
-            sort,
-            sort_reversed,
-            sort_popup: None,
-            search_query: String::new(),
-            search_cursor: 0,
-            search_editing: false,
-            anime_index: None,
-            season_index: None,
-            episode_index: None,
-            anime_list_state: ListState::default(),
-            season_list_state: ListState::default(),
-            episode_list_state: ListState::default(),
-            pending_delete_confirmation: None,
-            pending_watched_confirmation: None,
-            clear_confirmation: false,
-            refresh_requested: false,
-        }
-    }
-}
-
-impl LibrarySeasonEntry {
-    fn metadata(&self) -> LibraryReleaseMetadata {
-        LibraryReleaseMetadata {
-            title: self.title.clone(),
-            kind: self.kind,
-            season: self.season,
-            part: self.part,
-            episodes_count: self.episodes_count,
-            first_episode: self.first_episode,
-            airing_status: self.airing_status.clone(),
-            next_airing_episode: self.next_airing_episode,
-            next_airing_at: self.next_airing_at,
-        }
-    }
 }
 
 pub type HistoryIndexes = (HashSet<(u32, u32, u32)>, HashMap<(u32, u32, u32), f64>);
@@ -1101,19 +908,10 @@ impl AppState {
         anime.seasons.iter().map(|release| release.season).collect()
     }
 
-    #[allow(dead_code)]
     pub fn library_selected_season(&self) -> Option<&LibrarySeasonEntry> {
         let anime = self.library_selected_anime()?;
         self.selected_season_index
             .and_then(|idx| anime.seasons.get(idx))
-    }
-
-    #[allow(dead_code)]
-    pub fn library_selected_episode(&self) -> Option<&WatchProgress> {
-        let season = self.library_selected_season()?;
-        self.library
-            .episode_index
-            .and_then(|idx| season.episodes.get(idx))
     }
 
     pub fn is_library_mode(&self) -> bool {
@@ -1543,8 +1341,6 @@ impl AppState {
         self.library
             .anime_list_state
             .select(self.library.anime_index);
-        self.library.season_index = None;
-        self.library.episode_index = None;
         self.season_list_state.select(None);
         self.dubbing_list_state.select(None);
         self.episode_list_state.select(None);
@@ -2471,14 +2267,10 @@ impl AppState {
         self.library.items.clear();
         self.library.all_items.clear();
         self.library.anime_index = None;
-        self.library.season_index = None;
-        self.library.episode_index = None;
         self.library.anime_list_state.select(None);
-        self.library.season_list_state.select(None);
         if self.mode == AppMode::Normal && self.search.selected_result_index.is_some() {
             self.restore_representative_poster();
         }
-        self.library.episode_list_state.select(None);
         self.search.ordering.popup = None;
         self.library.sort_popup = None;
         self.library.pending_watched_confirmation = None;
@@ -2503,13 +2295,9 @@ impl AppState {
             // Re-pressing 2 while already in the library jumps to the root list.
             if self.mode != AppMode::Library {
                 self.mode = AppMode::Library;
-                self.library.season_index = None;
-                self.library.episode_index = None;
                 self.selected_season_index = None;
                 self.selected_dubbing_index = None;
                 self.selected_episode_index = None;
-                self.library.season_list_state.select(None);
-                self.library.episode_list_state.select(None);
                 self.season_list_state.select(None);
                 self.dubbing_list_state.select(None);
                 self.episode_list_state.select(None);
