@@ -2979,29 +2979,27 @@ fn dubbing_choices_for_sources(
     sources: &EpisodeSourcesResponse,
     season_num: u32,
 ) -> Vec<DubbingChoice<'_>> {
-    let ashdi = sources
+    let mut seen_names = HashSet::new();
+    let mut choices = Vec::new();
+    for studio in sources
         .ashdi
         .iter()
         .filter(|studio| studio.season_number == season_num)
-        .collect::<Vec<_>>();
-    let ashdi_names = ashdi
+    {
+        if seen_names.insert(normalize_studio_name(&studio.studio_name)) {
+            choices.push(DubbingChoice::Ashdi(studio));
+        }
+    }
+    for studio in sources
+        .moonanime
         .iter()
-        .map(|studio| normalize_studio_name(&studio.studio_name))
-        .collect::<HashSet<_>>();
-    ashdi
-        .into_iter()
-        .map(DubbingChoice::Ashdi)
-        .chain(
-            sources
-                .moonanime
-                .iter()
-                .filter(move |studio| studio.season_number == season_num)
-                .filter(move |studio| {
-                    !ashdi_names.contains(&normalize_studio_name(&studio.studio_name))
-                })
-                .map(DubbingChoice::MoonAnime),
-        )
-        .collect()
+        .filter(|studio| studio.season_number == season_num)
+    {
+        if seen_names.insert(normalize_studio_name(&studio.studio_name)) {
+            choices.push(DubbingChoice::MoonAnime(studio));
+        }
+    }
+    choices
 }
 
 fn sidebar_subject_for_release(release: &ReleaseEntry) -> Option<u32> {
@@ -3060,7 +3058,7 @@ mod tests {
     }
 
     #[test]
-    fn ashdi_dubbings_precede_only_additional_moonanime_dubbings() {
+    fn dubbings_are_unique_with_ashdi_before_additional_moonanime() {
         let sources = EpisodeSourcesResponse {
             ashdi: vec![
                 AshdiStudio {
@@ -3073,6 +3071,13 @@ mod tests {
                 AshdiStudio {
                     id: 2,
                     studio_name: "Glass Moon".to_string(),
+                    season_number: 1,
+                    episodes: Vec::new(),
+                    episodes_count: 12,
+                },
+                AshdiStudio {
+                    id: 3,
+                    studio_name: "amano gawa".to_string(),
                     season_number: 1,
                     episodes: Vec::new(),
                     episodes_count: 12,
