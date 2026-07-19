@@ -216,12 +216,12 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     );
                 }
                 release_rows.push(season_items.len());
-                let count = app.dubbing_choices_for_season(release.season).len();
+                let dubbing_count = app.library_release_dubbing_count(release);
                 let mut metadata = release_progress(release)
                     .map(|(watched, total)| format!("{watched}/{total}"))
                     .into_iter()
                     .collect::<Vec<_>>();
-                if count > 1 {
+                if let Some(count) = dubbing_count.filter(|count| *count > 1) {
                     metadata.push(format!("{count} озвучок"));
                 }
                 if let Some(label) = new_content_label(&app.settings, release) {

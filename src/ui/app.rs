@@ -29,6 +29,7 @@ mod library_actions;
 mod library_catalog;
 mod library_navigation;
 mod library_projection;
+mod library_sources;
 mod library_state;
 mod library_sync;
 mod playback_ui;
