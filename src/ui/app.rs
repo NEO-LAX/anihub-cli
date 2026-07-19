@@ -659,17 +659,19 @@ impl AppState {
         let (watched_index, progress_index) = Self::build_history_indexes(&history);
         let settings_store = SettingsStore::new()?;
         let mut settings = settings_store.load()?;
-        for (&anime_id, record) in &history.library {
-            if let Some(episodes) = record
-                .release
-                .as_ref()
-                .and_then(|release| release.episodes_count)
-            {
-                settings
-                    .seen_episode_counts
-                    .entry(anime_id)
-                    .or_insert(episodes);
-            }
+        let initialized_new_content = settings.initialize_new_content_tracking(
+            history.library.iter().map(|(&anime_id, record)| {
+                (
+                    anime_id,
+                    record
+                        .release
+                        .as_ref()
+                        .and_then(|release| release.episodes_count),
+                )
+            }),
+        );
+        if initialized_new_content {
+            settings_store.save(&settings)?;
         }
         let metadata_cache = MetadataCache::new(settings_store.data_dir())?;
         let cached_library_catalogs =

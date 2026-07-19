@@ -52,11 +52,7 @@ impl AppState {
             return;
         };
         let (anime_id, episodes_count) = (release.anime_id, release.episodes_count);
-        if let Some(episodes_count) = episodes_count {
-            self.settings
-                .seen_episode_counts
-                .insert(anime_id, episodes_count);
-        }
+        self.settings.acknowledge_release(anime_id, episodes_count);
     }
 
     pub fn persist_library_session(&mut self) -> anyhow::Result<()> {

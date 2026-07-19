@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -238,6 +238,12 @@ pub struct Settings {
     pub last_library_anime_id: Option<u32>,
     /// Highest episode count acknowledged by opening each release.
     pub seen_episode_counts: BTreeMap<u32, u32>,
+    /// Whether the one-time baseline for new-content tracking was created.
+    /// Once initialized, newly discovered release IDs must remain visible
+    /// until the user actually opens that release.
+    pub new_content_initialized: bool,
+    /// Release IDs acknowledged by opening an available release.
+    pub acknowledged_release_ids: BTreeSet<u32>,
     pub show_posters: bool,
     pub ansi_themes: bool,
     pub ansi_256_colors: bool,
@@ -275,6 +281,8 @@ impl Default for Settings {
             search_sort_reversed: false,
             last_library_anime_id: None,
             seen_episode_counts: BTreeMap::new(),
+            new_content_initialized: false,
+            acknowledged_release_ids: BTreeSet::new(),
             show_posters: true,
             ansi_themes: false,
             ansi_256_colors: false,
@@ -291,6 +299,36 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Creates the initial new-content baseline exactly once. This is kept
+    /// separate from ordinary startup so refreshes discovered in a previous
+    /// session are not silently marked as seen on the next launch.
+    pub fn initialize_new_content_tracking(
+        &mut self,
+        releases: impl IntoIterator<Item = (u32, Option<u32>)>,
+    ) -> bool {
+        if self.new_content_initialized {
+            return false;
+        }
+
+        for (anime_id, episodes_count) in releases {
+            self.acknowledged_release_ids.insert(anime_id);
+            if let Some(episodes_count) = episodes_count {
+                self.seen_episode_counts
+                    .entry(anime_id)
+                    .or_insert(episodes_count);
+            }
+        }
+        self.new_content_initialized = true;
+        true
+    }
+
+    pub fn acknowledge_release(&mut self, anime_id: u32, episodes_count: Option<u32>) {
+        self.acknowledged_release_ids.insert(anime_id);
+        if let Some(episodes_count) = episodes_count {
+            self.seen_episode_counts.insert(anime_id, episodes_count);
+        }
+    }
+
     pub const fn color_mode(&self) -> ColorMode {
         if !self.ansi_themes {
             ColorMode::AniHubRgb
@@ -534,6 +572,8 @@ mod tests {
         object.remove("search_sort_reversed");
         object.remove("last_library_anime_id");
         object.remove("seen_episode_counts");
+        object.remove("new_content_initialized");
+        object.remove("acknowledged_release_ids");
 
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert!(!settings.ansi_themes);
@@ -550,6 +590,8 @@ mod tests {
         assert!(!settings.search_sort_reversed);
         assert_eq!(settings.last_library_anime_id, None);
         assert!(settings.seen_episode_counts.is_empty());
+        assert!(!settings.new_content_initialized);
+        assert!(settings.acknowledged_release_ids.is_empty());
     }
 
     #[test]
@@ -628,6 +670,8 @@ mod tests {
         settings.search_sort_reversed = true;
         settings.last_library_anime_id = Some(42);
         settings.seen_episode_counts.insert(42, 8);
+        settings.new_content_initialized = true;
+        settings.acknowledged_release_ids.insert(42);
         settings.unknown_fields.insert(
             "future_option".to_string(),
             serde_json::json!({ "enabled": true }),
@@ -655,6 +699,20 @@ mod tests {
             serde_json::to_value(settings).unwrap().get("future_option"),
             Some(&serde_json::json!([1, 2, 3]))
         );
+    }
+
+    #[test]
+    fn new_content_baseline_is_initialized_only_once() {
+        let mut settings = Settings::default();
+
+        assert!(settings.initialize_new_content_tracking([(10, Some(12)), (20, None)]));
+        assert_eq!(settings.seen_episode_counts.get(&10), Some(&12));
+        assert!(settings.acknowledged_release_ids.contains(&10));
+        assert!(settings.acknowledged_release_ids.contains(&20));
+
+        assert!(!settings.initialize_new_content_tracking([(10, Some(13)), (30, Some(1))]));
+        assert_eq!(settings.seen_episode_counts.get(&10), Some(&12));
+        assert!(!settings.acknowledged_release_ids.contains(&30));
     }
 
     #[test]

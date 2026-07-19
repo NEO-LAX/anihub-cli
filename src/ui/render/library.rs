@@ -183,12 +183,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 if let Some((watched, total)) = anime_progress(item) {
                     metadata.push(format!("{watched}/{total}"));
                 }
-                let new_episodes = item
-                    .seasons
-                    .iter()
-                    .map(|release| new_episode_count(&app.settings.seen_episode_counts, release))
-                    .sum::<u32>();
-                if let Some(label) = new_episode_label(new_episodes) {
+                if let Some(label) = new_content_summary(&app.settings, &item.seasons) {
                     metadata.push(label);
                 }
                 ListItem::new(label_with_metadata(&item.anime_title, &metadata))
@@ -212,8 +207,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 if count > 1 {
                     metadata.push(format!("{count} озвучок"));
                 }
-                let new_episodes = new_episode_count(&app.settings.seen_episode_counts, release);
-                if let Some(label) = new_episode_label(new_episodes) {
+                if let Some(label) = new_content_label(&app.settings, release) {
                     metadata.push(label);
                 }
                 if let Some(next_airing) = next_airing_label(release) {
@@ -573,15 +567,76 @@ fn library_tracking_lines(app: &AppState) -> Vec<Line<'static>> {
 }
 
 fn new_episode_count(
-    seen_episode_counts: &std::collections::BTreeMap<u32, u32>,
+    settings: &crate::settings::Settings,
     release: &crate::ui::app::LibrarySeasonEntry,
 ) -> u32 {
+    if !settings.new_content_initialized
+        || !settings
+            .acknowledged_release_ids
+            .contains(&release.anime_id)
+    {
+        return 0;
+    }
     let Some(current) = release.episodes_count else {
         return 0;
     };
-    seen_episode_counts
+    settings
+        .seen_episode_counts
         .get(&release.anime_id)
         .map_or(0, |seen| current.saturating_sub(*seen))
+}
+
+fn new_content_label(
+    settings: &crate::settings::Settings,
+    release: &crate::ui::app::LibrarySeasonEntry,
+) -> Option<String> {
+    if !settings.new_content_initialized {
+        return None;
+    }
+    if !settings
+        .acknowledged_release_ids
+        .contains(&release.anime_id)
+    {
+        return Some(
+            match release.kind {
+                LibraryReleaseKind::Season => "новий сезон",
+                LibraryReleaseKind::Movie => "новий фільм",
+                LibraryReleaseKind::Special => "новий спецвипуск",
+                LibraryReleaseKind::Extra => "новий випуск",
+            }
+            .to_string(),
+        );
+    }
+    new_episode_label(new_episode_count(settings, release))
+}
+
+fn new_content_summary(
+    settings: &crate::settings::Settings,
+    releases: &[crate::ui::app::LibrarySeasonEntry],
+) -> Option<String> {
+    if !settings.new_content_initialized {
+        return None;
+    }
+    let new_releases = releases
+        .iter()
+        .filter(|release| {
+            !settings
+                .acknowledged_release_ids
+                .contains(&release.anime_id)
+        })
+        .count();
+    match new_releases {
+        1 => return Some("новий випуск".to_string()),
+        count if count > 1 => return Some(format!("{count} нових випусків")),
+        _ => {}
+    }
+
+    new_episode_label(
+        releases
+            .iter()
+            .map(|release| new_episode_count(settings, release))
+            .sum(),
+    )
 }
 
 fn new_episode_label(count: u32) -> Option<String> {
@@ -808,8 +863,21 @@ mod tests {
     fn episode_badge_uses_the_acknowledged_count() {
         let release = ongoing_release();
         let seen = std::collections::BTreeMap::from([(42, 6)]);
-        assert_eq!(new_episode_count(&seen, &release), 2);
-        assert_eq!(new_episode_count(&Default::default(), &release), 0);
+        let mut settings = crate::settings::Settings {
+            new_content_initialized: true,
+            ..Default::default()
+        };
+        settings.acknowledged_release_ids.insert(release.anime_id);
+        settings.seen_episode_counts = seen;
+        assert_eq!(new_episode_count(&settings, &release), 2);
+
+        let mut unknown_release = settings.clone();
+        unknown_release.acknowledged_release_ids.clear();
+        assert_eq!(new_episode_count(&unknown_release, &release), 0);
+        assert_eq!(
+            new_content_label(&unknown_release, &release).as_deref(),
+            Some("новий сезон")
+        );
     }
 
     #[test]

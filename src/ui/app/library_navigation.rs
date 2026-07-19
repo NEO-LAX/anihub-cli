@@ -105,10 +105,10 @@ impl AppState {
         let Some(season_num) = self.selected_season_num() else {
             return;
         };
-        self.acknowledge_selected_library_release();
         if self.dubbing_choices_for_season(season_num).is_empty() {
             return;
         }
+        self.acknowledge_selected_library_release();
 
         self.mode = AppMode::LibraryDubbing;
         self.selected_dubbing_index = Some(0);
