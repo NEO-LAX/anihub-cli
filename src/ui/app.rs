@@ -17,7 +17,6 @@ use crate::storage::{
 use crate::storage::{LibraryReleaseKind, WatchProgress};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
-use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -34,6 +33,7 @@ mod library_state;
 mod library_sync;
 mod playback_ui;
 mod search_actions;
+mod search_state;
 mod settings_ui;
 
 use content_ui::ContentUiState;
@@ -44,6 +44,7 @@ pub use library_state::{
     LibraryWatchedConfirmation,
 };
 use playback_ui::PlaybackUiState;
+pub use search_state::{SearchOrderingState, SearchSort, SearchState};
 use settings_ui::SettingsUiState;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,71 +99,6 @@ pub enum ContinueRequest {
         anime_ids: Vec<u32>,
         in_library: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SearchSort {
-    Relevance,
-    Title,
-    Year,
-    Rating,
-}
-
-impl SearchSort {
-    pub const ALL: [Self; 4] = [Self::Relevance, Self::Title, Self::Year, Self::Rating];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Relevance => "Збіг",
-            Self::Title => "Назва",
-            Self::Year => "Рік",
-            Self::Rating => "Рейтинг",
-        }
-    }
-
-    pub const fn order_label(self, reversed: bool) -> &'static str {
-        match (self, reversed) {
-            (Self::Relevance, false) => "кращі → слабші",
-            (Self::Relevance, true) => "слабші → кращі",
-            (Self::Title, false) => "А → Я",
-            (Self::Title, true) => "Я → А",
-            (Self::Year, false) => "новіші → старіші",
-            (Self::Year, true) => "старіші → новіші",
-            (Self::Rating, false) => "вищий → нижчий",
-            (Self::Rating, true) => "нижчий → вищий",
-        }
-    }
-
-    pub const fn direction_symbol(self, reversed: bool) -> &'static str {
-        let ascending = matches!(self, Self::Title) != reversed;
-        if ascending { "↑" } else { "↓" }
-    }
-}
-
-pub struct SearchOrderingState {
-    pub sort: SearchSort,
-    pub reversed: bool,
-    pub popup: Option<usize>,
-}
-
-impl Default for SearchOrderingState {
-    fn default() -> Self {
-        Self {
-            sort: SearchSort::Relevance,
-            reversed: false,
-            popup: None,
-        }
-    }
-}
-
-impl SearchOrderingState {
-    fn new(sort: SearchSort, reversed: bool) -> Self {
-        Self {
-            sort,
-            reversed,
-            popup: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -344,46 +280,6 @@ impl DubbingChoice<'_> {
 
     pub fn is_moonanime(&self) -> bool {
         matches!(self, Self::MoonAnime(_))
-    }
-}
-
-/// Search-tab state kept together so result projection, selection ownership,
-/// and text editing do not keep growing the application-wide state bag.
-pub struct SearchState {
-    pub query: String,
-    pub last_query: String,
-    /// Cursor position in Unicode scalar values, not bytes.
-    pub cursor: usize,
-    pub results: Vec<AnimeItem>,
-    pub ordering: SearchOrderingState,
-    pub franchise_groups: Vec<Vec<usize>>,
-    /// Release catalogs aligned with `franchise_groups` by index.
-    pub franchise_catalogs: Vec<FranchiseCatalog>,
-    /// Relation metadata retained so catalogs can be rebuilt after an AniHub
-    /// availability lookup completes.
-    pub anilist_media: Vec<AniListMedia>,
-    pub selected_group_index: Option<usize>,
-    pub selected_result_index: Option<usize>,
-    pub selected_release_index: Option<usize>,
-    pub result_list_state: ListState,
-}
-
-impl SearchState {
-    fn new(ordering: SearchOrderingState, franchise_catalogs: Vec<FranchiseCatalog>) -> Self {
-        Self {
-            query: String::new(),
-            last_query: String::new(),
-            cursor: 0,
-            results: Vec::new(),
-            ordering,
-            franchise_groups: Vec::new(),
-            franchise_catalogs,
-            anilist_media: Vec::new(),
-            selected_group_index: None,
-            selected_result_index: None,
-            selected_release_index: None,
-            result_list_state: ListState::default(),
-        }
     }
 }
 
@@ -1088,32 +984,6 @@ impl AppState {
             }
         }
         Ok(())
-    }
-
-    fn insert_search_char(&mut self, character: char) {
-        let byte_index = byte_index_for_char(&self.search.query, self.search.cursor);
-        self.search.query.insert(byte_index, character);
-        self.search.cursor += 1;
-    }
-
-    fn backspace_search_char(&mut self) {
-        if self.search.cursor == 0 {
-            return;
-        }
-        let start = byte_index_for_char(&self.search.query, self.search.cursor - 1);
-        let end = byte_index_for_char(&self.search.query, self.search.cursor);
-        self.search.query.replace_range(start..end, "");
-        self.search.cursor -= 1;
-    }
-
-    fn delete_search_char(&mut self) {
-        let char_count = self.search.query.chars().count();
-        if self.search.cursor >= char_count {
-            return;
-        }
-        let start = byte_index_for_char(&self.search.query, self.search.cursor);
-        let end = byte_index_for_char(&self.search.query, self.search.cursor + 1);
-        self.search.query.replace_range(start..end, "");
     }
 
     fn handle_library_search_key(&mut self, code: KeyCode) {

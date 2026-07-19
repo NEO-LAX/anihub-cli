@@ -57,9 +57,9 @@ fn handle_search_input_key(app: &mut AppState, key: KeyCode) {
                 app.activity_message = Some("Пошук аніме…".to_string());
             }
         }
-        KeyCode::Char(character) => app.insert_search_char(character),
-        KeyCode::Backspace => app.backspace_search_char(),
-        KeyCode::Delete => app.delete_search_char(),
+        KeyCode::Char(character) => app.search.insert_char(character),
+        KeyCode::Backspace => app.search.backspace_char(),
+        KeyCode::Delete => app.search.delete_char(),
         KeyCode::Left => app.search.cursor = app.search.cursor.saturating_sub(1),
         KeyCode::Right => {
             app.search.cursor = (app.search.cursor + 1).min(app.search.query.chars().count());
