@@ -2948,10 +2948,16 @@ fn byte_index_for_char(text: &str, char_index: usize) -> usize {
 }
 
 fn normalize_studio_name(name: &str) -> String {
-    name.chars()
+    let normalized = name
+        .chars()
         .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect()
+        .collect::<String>();
+
+    match normalized.as_str() {
+        "fanwoxua" => "fanvoxua".to_string(),
+        _ => normalized,
+    }
 }
 
 fn push_completed_episode(
@@ -3115,6 +3121,30 @@ mod tests {
         );
         assert!(!choices[0].is_moonanime());
         assert!(choices[2].is_moonanime());
+    }
+
+    #[test]
+    fn known_fanwox_typo_is_deduplicated_as_fanvox() {
+        let sources = EpisodeSourcesResponse {
+            ashdi: vec![AshdiStudio {
+                id: 1,
+                studio_name: "FanVoxUA".to_string(),
+                season_number: 1,
+                episodes: Vec::new(),
+                episodes_count: 12,
+            }],
+            moonanime: vec![MoonAnimeSourceMarker {
+                studio_name: "FanWoxUa".to_string(),
+                season_number: 1,
+                episodes_count: 12,
+                episodes: Vec::new(),
+            }],
+        };
+
+        let choices = dubbing_choices_for_sources(&sources, 1);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].studio_name(), "FanVoxUA");
+        assert!(!choices[0].is_moonanime());
     }
 
     #[test]
