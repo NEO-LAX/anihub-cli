@@ -391,24 +391,21 @@ fn render_sidebar_details_area(
         text.push(mk_sep());
         text.extend(tracking_lines(app, &anime_ids, None, total));
 
-        let has_extra = d.genres.as_ref().is_some_and(|g| !g.is_empty())
-            || d.dubbing_studios.as_ref().is_some_and(|s| !s.is_empty());
+        let studio_names = sidebar_studio_names(app, &d);
+        let has_extra =
+            d.genres.as_ref().is_some_and(|g| !g.is_empty()) || !studio_names.is_empty();
         if has_extra {
             text.push(mk_sep());
         }
 
-        if let Some(studios) = &d.dubbing_studios {
-            if !studios.is_empty() {
-                let s = studios
-                    .iter()
-                    .map(|s| canonical_studio_name(&s.name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                text.push(Line::from(vec![
-                    Span::styled("Озвучка: ", Style::default().fg(color_dim())),
-                    Span::styled(s, Style::default().fg(color_success())),
-                ]));
-            }
+        if !studio_names.is_empty() {
+            text.push(Line::from(vec![
+                Span::styled("Озвучка: ", Style::default().fg(color_dim())),
+                Span::styled(
+                    studio_names.join(", "),
+                    Style::default().fg(color_success()),
+                ),
+            ]));
         }
 
         if let Some(genres) = &d.genres {
@@ -469,24 +466,21 @@ fn render_sidebar_details_area(
             text.extend(tracking_lines(app, &anime_ids, None, total));
 
             if let Some(d) = details {
-                let has_extra = d.genres.as_ref().is_some_and(|g| !g.is_empty())
-                    || d.dubbing_studios.as_ref().is_some_and(|s| !s.is_empty());
+                let studio_names = sidebar_studio_names(app, &d);
+                let has_extra =
+                    d.genres.as_ref().is_some_and(|g| !g.is_empty()) || !studio_names.is_empty();
                 if has_extra {
                     text.push(mk_sep());
                 }
 
-                if let Some(studios) = &d.dubbing_studios {
-                    if !studios.is_empty() {
-                        let s = studios
-                            .iter()
-                            .map(|s| canonical_studio_name(&s.name))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        text.push(Line::from(vec![
-                            Span::styled("Озвучка: ", Style::default().fg(color_dim())),
-                            Span::styled(s, Style::default().fg(color_success())),
-                        ]));
-                    }
+                if !studio_names.is_empty() {
+                    text.push(Line::from(vec![
+                        Span::styled("Озвучка: ", Style::default().fg(color_dim())),
+                        Span::styled(
+                            studio_names.join(", "),
+                            Style::default().fg(color_success()),
+                        ),
+                    ]));
                 }
 
                 if let Some(genres) = &d.genres {

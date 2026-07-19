@@ -934,6 +934,26 @@ fn dubbing_count_label(count: usize) -> String {
     format!("{count} {suffix}")
 }
 
+fn sidebar_studio_names(app: &AppState, details: &api::AnimeDetails) -> Vec<String> {
+    if let Some(season) = app.selected_season_num() {
+        let live_names = app
+            .dubbing_choices_for_season(season)
+            .into_iter()
+            .map(|choice| choice.studio_name().to_string())
+            .collect::<Vec<_>>();
+        if !live_names.is_empty() {
+            return live_names;
+        }
+    }
+
+    details
+        .dubbing_studios
+        .iter()
+        .flatten()
+        .map(|studio| canonical_studio_name(&studio.name).to_string())
+        .collect()
+}
+
 fn truncate_with_ellipsis(text: &str, width: usize) -> String {
     let length = text.chars().count();
     if length <= width {

@@ -786,27 +786,21 @@ fn render_library_sidebar_details_area(
         text.push(mk_sep());
         text.extend(library_tracking_lines(app));
 
-        let has_extra = details.genres.as_ref().is_some_and(|g| !g.is_empty())
-            || details
-                .dubbing_studios
-                .as_ref()
-                .is_some_and(|s| !s.is_empty());
+        let studio_names = sidebar_studio_names(app, details);
+        let has_extra =
+            details.genres.as_ref().is_some_and(|g| !g.is_empty()) || !studio_names.is_empty();
         if has_extra {
             text.push(mk_sep());
         }
 
-        if let Some(studios) = &details.dubbing_studios {
-            if !studios.is_empty() {
-                let s = studios
-                    .iter()
-                    .map(|s| canonical_studio_name(&s.name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                text.push(Line::from(vec![
-                    Span::styled("Озвучка: ", Style::default().fg(color_dim())),
-                    Span::styled(s, Style::default().fg(color_success())),
-                ]));
-            }
+        if !studio_names.is_empty() {
+            text.push(Line::from(vec![
+                Span::styled("Озвучка: ", Style::default().fg(color_dim())),
+                Span::styled(
+                    studio_names.join(", "),
+                    Style::default().fg(color_success()),
+                ),
+            ]));
         }
 
         if let Some(genres) = &details.genres {

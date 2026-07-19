@@ -301,7 +301,7 @@ const ANILIST_POSTER_SUBJECT_BIT: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy)]
 pub enum DubbingChoice<'a> {
-    Ashdi(&'a AshdiStudio),
+    Ashdi(&'a AshdiStudio, Option<&'a str>),
     MoonAnime(&'a MoonAnimeSourceMarker),
 }
 
@@ -330,14 +330,14 @@ impl EpisodeChoice<'_> {
 impl DubbingChoice<'_> {
     pub fn studio_name(&self) -> &str {
         canonical_studio_name(match self {
-            Self::Ashdi(studio) => &studio.studio_name,
+            Self::Ashdi(studio, display_alias) => display_alias.unwrap_or(&studio.studio_name),
             Self::MoonAnime(studio) => &studio.studio_name,
         })
     }
 
     pub fn episodes_count(&self) -> u32 {
         match self {
-            Self::Ashdi(studio) => studio.episodes_count,
+            Self::Ashdi(studio, _) => studio.episodes_count,
             Self::MoonAnime(studio) => studio.episodes_count,
         }
     }
@@ -829,7 +829,7 @@ impl AppState {
     /// Обрана студія (для відтворення та списку епізодів).
     pub fn selected_studio(&self) -> Option<&AshdiStudio> {
         match self.selected_dubbing_choice()? {
-            DubbingChoice::Ashdi(studio) => Some(studio),
+            DubbingChoice::Ashdi(studio, _) => Some(studio),
             DubbingChoice::MoonAnime(_) => None,
         }
     }
@@ -844,7 +844,7 @@ impl AppState {
 
     pub fn selected_episode_choices(&self) -> Vec<EpisodeChoice<'_>> {
         match self.selected_dubbing_choice() {
-            Some(DubbingChoice::Ashdi(studio)) => {
+            Some(DubbingChoice::Ashdi(studio, _)) => {
                 studio.episodes.iter().map(EpisodeChoice::Ashdi).collect()
             }
             Some(DubbingChoice::MoonAnime(studio)) => studio
@@ -2947,34 +2947,57 @@ fn byte_index_for_char(text: &str, char_index: usize) -> usize {
         .map_or(text.len(), |(byte_index, _)| byte_index)
 }
 
-fn normalize_studio_name(name: &str) -> String {
-    let normalized = name
-        .chars()
+fn compact_studio_name(name: &str) -> String {
+    name.chars()
         .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect::<String>();
+        .collect()
+}
+
+fn normalize_studio_name(name: &str) -> String {
+    let normalized = compact_studio_name(name);
 
     match normalized.as_str() {
         "fanwoxua" | "fanvoxua" => "fanvoxua".to_string(),
         "clankaizoku" | "кланкайзоку" => "clankaizoku".to_string(),
-        name if name == "субтитри"
-            || name.starts_with("субтитри")
-            || name == "subtitles"
-            || name.starts_with("subtitles") =>
-        {
-            "subtitles".to_string()
+        "субтитри" | "subtitles" => "subtitles".to_string(),
+        "субтитриclankaizoku" | "субтитрикланкайзоку" | "subtitlesclankaizoku" => {
+            "subtitlesclankaizoku".to_string()
         }
         _ => normalized,
     }
 }
 
 pub fn canonical_studio_name(name: &str) -> &str {
-    match normalize_studio_name(name).as_str() {
-        "fanvoxua" => "FanVoxUA",
-        "clankaizoku" => "Клан Кайзоку",
-        "subtitles" => "Субтитри",
+    match compact_studio_name(name).as_str() {
+        "fanwoxua" | "fanvoxua" => "FanVoxUA",
+        "clankaizoku" | "кланкайзоку" => "Клан Кайзоку",
+        "субтитриclankaizoku" | "субтитрикланкайзоку" => {
+            "Субтитри · Клан Кайзоку"
+        }
+        "субтитри" | "subtitles" => "Субтитри",
         _ => name,
     }
+}
+
+fn richer_duplicate_label<'a>(
+    sources: &'a EpisodeSourcesResponse,
+    season_num: u32,
+    normalized_name: &str,
+) -> Option<&'a str> {
+    if normalized_name != "subtitles" {
+        return None;
+    }
+    sources
+        .moonanime
+        .iter()
+        .filter(|studio| studio.season_number == season_num)
+        .map(|studio| studio.studio_name.as_str())
+        .find(|name| {
+            let compact = compact_studio_name(name);
+            (compact.starts_with("субтитри") || compact.starts_with("subtitles"))
+                && normalize_studio_name(name) != normalized_name
+        })
 }
 
 fn push_completed_episode(
@@ -3009,8 +3032,11 @@ fn dubbing_choices_for_sources(
         .iter()
         .filter(|studio| studio.season_number == season_num)
     {
-        if seen_names.insert(normalize_studio_name(&studio.studio_name)) {
-            choices.push(DubbingChoice::Ashdi(studio));
+        let source_name = normalize_studio_name(&studio.studio_name);
+        let display_alias = richer_duplicate_label(sources, season_num, &source_name);
+        let normalized_name = normalize_studio_name(display_alias.unwrap_or(&studio.studio_name));
+        if seen_names.insert(normalized_name) {
+            choices.push(DubbingChoice::Ashdi(studio, display_alias));
         }
     }
     for studio in sources
@@ -3204,8 +3230,42 @@ mod tests {
         let choices = dubbing_choices_for_sources(&sources, 2);
         assert_eq!(choices.len(), 2);
         assert_eq!(choices[0].studio_name(), "Клан Кайзоку");
-        assert_eq!(choices[1].studio_name(), "Субтитри");
+        assert_eq!(choices[1].studio_name(), "Субтитри · Клан Кайзоку");
         assert!(choices.iter().all(|choice| !choice.is_moonanime()));
+    }
+
+    #[test]
+    fn subtitle_credits_remain_distinct() {
+        let sources = EpisodeSourcesResponse {
+            ashdi: vec![AshdiStudio {
+                id: 1,
+                studio_name: "Субтитри".to_string(),
+                season_number: 1,
+                episodes: Vec::new(),
+                episodes_count: 12,
+            }],
+            moonanime: vec![
+                MoonAnimeSourceMarker {
+                    studio_name: "Субтитри Team A".to_string(),
+                    season_number: 1,
+                    episodes_count: 12,
+                    episodes: Vec::new(),
+                },
+                MoonAnimeSourceMarker {
+                    studio_name: "Субтитри Team B".to_string(),
+                    season_number: 1,
+                    episodes_count: 12,
+                    episodes: Vec::new(),
+                },
+            ],
+        };
+
+        let choices = dubbing_choices_for_sources(&sources, 1);
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].studio_name(), "Субтитри Team A");
+        assert_eq!(choices[1].studio_name(), "Субтитри Team B");
+        assert!(!choices[0].is_moonanime());
+        assert!(choices[1].is_moonanime());
     }
 
     #[test]
