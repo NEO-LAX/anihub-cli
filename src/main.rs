@@ -1,4 +1,5 @@
 mod api;
+mod atomic_file;
 mod cache;
 mod discord;
 mod library_refresh;

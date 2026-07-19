@@ -397,8 +397,24 @@ impl SettingsStore {
     fn read_settings(path: &Path) -> Result<Settings> {
         let bytes =
             fs::read(path).with_context(|| format!("не вдалося прочитати {}", path.display()))?;
-        let settings: Settings = serde_json::from_slice(&bytes)
-            .with_context(|| format!("пошкоджено {}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow!("некоректний JSON у {}: {error}", path.display()))?;
+        if let Some(schema_version) = value.get("schema_version").and_then(|value| value.as_u64()) {
+            if schema_version > u64::from(SETTINGS_SCHEMA_VERSION) {
+                return Err(anyhow!(
+                    "{} створено новішою версією AniHub (settings schema {schema_version}, підтримується {SETTINGS_SCHEMA_VERSION})",
+                    path.display()
+                ));
+            }
+            if schema_version < u64::from(SETTINGS_SCHEMA_VERSION) {
+                return Err(anyhow!(
+                    "непідтримувана стара версія settings у {}: {schema_version}",
+                    path.display()
+                ));
+            }
+        }
+        let settings: Settings = serde_json::from_value(value)
+            .map_err(|error| anyhow!("несумісні налаштування у {}: {error}", path.display()))?;
         if settings.schema_version != SETTINGS_SCHEMA_VERSION {
             return Err(anyhow!(
                 "непідтримувана версія settings: {}",
@@ -410,24 +426,7 @@ impl SettingsStore {
 
     pub fn save(&self, settings: &Settings) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(settings)?;
-        let temporary = self.settings_file.with_extension("json.tmp");
-        fs::write(&temporary, bytes)
-            .with_context(|| format!("не вдалося записати {}", temporary.display()))?;
-        if let Err(first_error) = fs::rename(&temporary, &self.settings_file) {
-            if self.settings_file.exists() {
-                fs::remove_file(&self.settings_file).with_context(|| {
-                    format!("не вдалося замінити {}", self.settings_file.display())
-                })?;
-                fs::rename(&temporary, &self.settings_file).with_context(|| {
-                    format!("не вдалося оновити {}", self.settings_file.display())
-                })?;
-            } else {
-                return Err(first_error).with_context(|| {
-                    format!("не вдалося оновити {}", self.settings_file.display())
-                });
-            }
-        }
-        Ok(())
+        crate::atomic_file::write(&self.settings_file, &bytes)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -740,6 +739,50 @@ mod tests {
         assert_eq!(store.load().unwrap(), expected);
         assert!(store.settings_path().exists());
         assert!(legacy_path.exists(), "legacy backup must be retained");
+
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_json_and_incompatible_settings_have_distinct_diagnostics() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!(
+            "anihub-settings-diagnostics-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join(SETTINGS_FILE_NAME);
+
+        fs::write(&path, b"{broken").unwrap();
+        assert!(
+            SettingsStore::read_settings(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("некоректний JSON")
+        );
+
+        let mut future = serde_json::to_value(Settings::default()).unwrap();
+        future["schema_version"] = serde_json::json!(SETTINGS_SCHEMA_VERSION + 1);
+        fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(
+            SettingsStore::read_settings(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("новішою версією AniHub")
+        );
+
+        let mut incompatible = serde_json::to_value(Settings::default()).unwrap();
+        incompatible["theme"] = serde_json::json!("future_palette");
+        fs::write(&path, serde_json::to_vec(&incompatible).unwrap()).unwrap();
+        assert!(
+            SettingsStore::read_settings(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("несумісні налаштування")
+        );
 
         fs::remove_dir_all(data_dir).unwrap();
     }
