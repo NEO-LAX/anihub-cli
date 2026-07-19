@@ -194,11 +194,27 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
     }
 
     if chunks.len() >= 2 {
-        let season_items: Vec<ListItem> = app
-            .library_selected_anime()
-            .into_iter()
-            .flat_map(|anime| anime.seasons.iter())
-            .map(|release| {
+        let mut season_items = Vec::new();
+        let mut release_rows = Vec::new();
+        let mut previous_extra = None;
+        if let Some(anime) = app.library_selected_anime() {
+            release_rows.reserve(anime.seasons.len());
+            for release in &anime.seasons {
+                if let Some(section) = library_release_section(release.kind, &mut previous_extra) {
+                    season_items.push(
+                        ListItem::new(Line::from(Span::styled(
+                            release_section_line(
+                                section,
+                                chunks[1].width.saturating_sub(6) as usize,
+                            ),
+                            Style::default()
+                                .fg(color_primary())
+                                .add_modifier(Modifier::BOLD),
+                        )))
+                        .style(Style::default().bg(color_background())),
+                    );
+                }
+                release_rows.push(season_items.len());
                 let count = app.dubbing_choices_for_season(release.season).len();
                 let mut metadata = release_progress(release)
                     .map(|(watched, total)| format!("{watched}/{total}"))
@@ -230,13 +246,13 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 } else {
                     ""
                 };
-                ListItem::new(with_right_marker(
+                season_items.push(ListItem::new(with_right_marker(
                     &label,
                     marker,
                     chunks[1].width.saturating_sub(6) as usize,
-                ))
-            })
-            .collect();
+                )));
+            }
+        }
         if season_items.is_empty() {
             render_list_message(
                 f,
@@ -256,7 +272,13 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 season_items,
                 app.mode == AppMode::LibrarySeason,
             );
-            f.render_stateful_widget(season_list, chunks[1], &mut app.season_list_state);
+            let mut visual_state = ratatui::widgets::ListState::default();
+            visual_state.select(
+                app.season_list_state
+                    .selected()
+                    .and_then(|release_index| release_rows.get(release_index).copied()),
+            );
+            f.render_stateful_widget(season_list, chunks[1], &mut visual_state);
         }
     }
 
@@ -381,6 +403,22 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             f.render_stateful_widget(episode_list, chunks[3], &mut app.episode_list_state);
         }
     }
+}
+
+fn library_release_section(
+    kind: LibraryReleaseKind,
+    previous_extra: &mut Option<bool>,
+) -> Option<&'static str> {
+    let is_extra = kind == LibraryReleaseKind::Extra;
+    if *previous_extra == Some(is_extra) {
+        return None;
+    }
+    *previous_extra = Some(is_extra);
+    Some(if is_extra {
+        "ДОДАТКОВО"
+    } else {
+        "ОСНОВНА ІСТОРІЯ"
+    })
 }
 
 pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
@@ -895,6 +933,27 @@ mod tests {
         let release = ongoing_release();
         assert!(next_airing_label_at(&release, 1_000).is_some());
         assert!(next_airing_label_at(&release, 2_000).is_none());
+    }
+
+    #[test]
+    fn library_sections_group_mainline_and_extra_releases() {
+        let mut previous_extra = None;
+        assert_eq!(
+            library_release_section(LibraryReleaseKind::Season, &mut previous_extra),
+            Some("ОСНОВНА ІСТОРІЯ")
+        );
+        assert_eq!(
+            library_release_section(LibraryReleaseKind::Movie, &mut previous_extra),
+            None
+        );
+        assert_eq!(
+            library_release_section(LibraryReleaseKind::Special, &mut previous_extra),
+            None
+        );
+        assert_eq!(
+            library_release_section(LibraryReleaseKind::Extra, &mut previous_extra),
+            Some("ДОДАТКОВО")
+        );
     }
 
     #[test]
