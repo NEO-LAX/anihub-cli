@@ -21,6 +21,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+mod content_ui;
 mod input;
 mod library_actions;
 mod library_navigation;
@@ -29,6 +30,7 @@ mod playback_ui;
 mod search_actions;
 mod settings_ui;
 
+use content_ui::ContentUiState;
 pub use library_state::{
     LibraryAnimeEntry, LibraryFilter, LibrarySeasonEntry, LibrarySort, LibraryState,
     LibraryWatchedConfirmation,
@@ -381,29 +383,7 @@ pub struct AppState {
     pub mode: AppMode,
     pub focus: FocusPanel,
     pub search: SearchState,
-    pub selected_season_index: Option<usize>,
-    pub selected_dubbing_index: Option<usize>,
-    pub selected_episode_index: Option<usize>,
-
-    pub current_sources: Option<EpisodeSourcesResponse>,
-    /// Exact AniHub release and queried franchise season that own
-    /// `current_sources`. Both must match before episodes may be rendered.
-    pub current_sources_key: Option<EpisodeSourcesKey>,
-    pub current_details: Option<AnimeDetails>,
-
-    // Для кожного studio entry в current_sources.ashdi — який anime_id він представляє
-    pub studio_anime_ids: Vec<u32>,
-    // Який search_result показувати в сайдбарі (None = selected_result_index)
-    pub sidebar_anime_idx: Option<usize>,
-    /// Cache subject whose metadata and poster belong in the sidebar.
-    ///
-    /// Unlike `sidebar_anime_idx`, this also represents releases that are not
-    /// present in the current search response and provides an ownership guard
-    /// for asynchronously completed poster requests.
-    pub sidebar_subject_id: Option<u32>,
-    pub season_list_state: ListState,
-    pub dubbing_list_state: ListState,
-    pub episode_list_state: ListState,
+    pub content: ContentUiState,
 
     pub library: LibraryState,
     pub status_editor: Option<AnimeStatusEditor>,
@@ -496,19 +476,7 @@ impl AppState {
                 SearchOrderingState::new(search_sort, settings.search_sort_reversed),
                 cached_library_catalogs,
             ),
-            selected_season_index: None,
-            selected_dubbing_index: None,
-            selected_episode_index: None,
-            current_sources: None,
-            current_sources_key: None,
-            current_details: None,
-
-            studio_anime_ids: Vec::new(),
-            sidebar_anime_idx: None,
-            sidebar_subject_id: None,
-            season_list_state: ListState::default(),
-            dubbing_list_state: ListState::default(),
-            episode_list_state: ListState::default(),
+            content: ContentUiState::default(),
 
             library: LibraryState::new(
                 default_library_filter,
@@ -588,9 +556,11 @@ impl AppState {
     /// index so releases missing from search results can still own metadata
     /// and poster state.
     pub fn sidebar_subject(&self) -> Option<u32> {
-        self.sidebar_subject_id
+        self.content
+            .sidebar_subject_id
             .or_else(|| {
-                self.sidebar_anime_idx
+                self.content
+                    .sidebar_anime_idx
                     .and_then(|index| self.search.results.get(index))
                     .map(|anime| anime.id)
             })
@@ -605,11 +575,11 @@ impl AppState {
     /// Select the release whose metadata and poster should appear in the
     /// sidebar. This is the single state transition used by release browsing.
     pub fn select_sidebar_subject(&mut self, anime_id: Option<u32>) {
-        let subject_changed = self.sidebar_subject_id != anime_id;
-        self.sidebar_subject_id = anime_id;
-        self.sidebar_anime_idx =
+        let subject_changed = self.content.sidebar_subject_id != anime_id;
+        self.content.sidebar_subject_id = anime_id;
+        self.content.sidebar_anime_idx =
             anime_id.and_then(|id| self.search.results.iter().position(|anime| anime.id == id));
-        self.current_details = anime_id.and_then(|id| self.details_cache.get(&id));
+        self.content.current_details = anime_id.and_then(|id| self.details_cache.get(&id));
 
         if !self.settings.show_posters {
             self.current_poster = None;
@@ -748,25 +718,29 @@ impl AppState {
 
     pub fn select_release(&mut self, index: Option<usize>) {
         self.search.selected_release_index = index;
-        self.season_list_state.select(index);
-        self.selected_dubbing_index = None;
-        self.dubbing_list_state.select(None);
-        self.selected_episode_index = None;
-        self.episode_list_state.select(None);
+        self.content.season_list_state.select(index);
+        self.content.selected_dubbing_index = None;
+        self.content.dubbing_list_state.select(None);
+        self.content.selected_episode_index = None;
+        self.content.episode_list_state.select(None);
 
         let source_key = self.selected_release_source_key();
         let anime_id = source_key.map(|key| key.anime_id);
         let sidebar_subject = self.selected_release_sidebar_subject();
-        self.current_sources = source_key.and_then(|key| self.sources_cache.get(&key));
-        self.current_sources_key = self.current_sources.as_ref().and(source_key);
-        self.studio_anime_ids = self
-            .current_sources
-            .as_ref()
-            .map_or_else(Vec::new, |sources| {
-                vec![anime_id.expect("cached release sources have an owner"); sources.ashdi.len()]
-            });
+        self.content.current_sources = source_key.and_then(|key| self.sources_cache.get(&key));
+        self.content.current_sources_key = self.content.current_sources.as_ref().and(source_key);
+        self.content.studio_anime_ids =
+            self.content
+                .current_sources
+                .as_ref()
+                .map_or_else(Vec::new, |sources| {
+                    vec![
+                        anime_id.expect("cached release sources have an owner");
+                        sources.ashdi.len()
+                    ]
+                });
         self.select_sidebar_subject(sidebar_subject);
-        match (anime_id, self.current_sources.is_some()) {
+        match (anime_id, self.content.current_sources.is_some()) {
             (Some(_), false) => {
                 self.loading = true;
                 self.activity_message = Some("Завантаження вибраного випуску…".to_string());
@@ -786,7 +760,7 @@ impl AppState {
 
     /// Унікальні season_number з current_sources, відсортовані за зростанням.
     pub fn unique_seasons(&self) -> Vec<u32> {
-        let Some(sources) = &self.current_sources else {
+        let Some(sources) = &self.content.current_sources else {
             return Vec::new();
         };
         let mut seasons: Vec<u32> = Vec::new();
@@ -806,7 +780,7 @@ impl AppState {
 
     /// Студії для заданого season_number у порядку як у current_sources.
     pub fn studios_for_season(&self, season_num: u32) -> Vec<&AshdiStudio> {
-        let Some(sources) = &self.current_sources else {
+        let Some(sources) = &self.content.current_sources else {
             return Vec::new();
         };
         sources
@@ -819,7 +793,7 @@ impl AppState {
     /// Dubbing choices in provider priority order. Ashdi always wins; a
     /// MoonAnime studio with the same normalized name is not duplicated.
     pub fn dubbing_choices_for_season(&self, season_num: u32) -> Vec<DubbingChoice<'_>> {
-        let Some(sources) = &self.current_sources else {
+        let Some(sources) = &self.content.current_sources else {
             return Vec::new();
         };
         dubbing_choices_for_sources(sources, season_num)
@@ -828,18 +802,18 @@ impl AppState {
     /// Поточний season_number за selected_season_index.
     pub fn selected_season_num(&self) -> Option<u32> {
         if self.is_library_mode() {
-            let idx = self.selected_season_index?;
+            let idx = self.content.selected_season_index?;
             self.library_selected_anime()?
                 .seasons
                 .get(idx)
                 .map(|release| release.season)
         } else if self.has_release_catalog() {
             (self.selected_release_available()
-                && self.current_sources_key == self.selected_release_source_key())
+                && self.content.current_sources_key == self.selected_release_source_key())
             .then(|| self.unique_seasons().into_iter().next())
             .flatten()
         } else {
-            let idx = self.selected_season_index?;
+            let idx = self.content.selected_season_index?;
             self.unique_seasons().get(idx).copied()
         }
     }
@@ -854,7 +828,7 @@ impl AppState {
 
     pub fn selected_dubbing_choice(&self) -> Option<DubbingChoice<'_>> {
         let season_num = self.selected_season_num()?;
-        let dub_idx = self.selected_dubbing_index?;
+        let dub_idx = self.content.selected_dubbing_index?;
         self.dubbing_choices_for_season(season_num)
             .into_iter()
             .nth(dub_idx)
@@ -879,7 +853,7 @@ impl AppState {
     }
 
     pub fn selected_episode_choice(&self) -> Option<EpisodeChoice<'_>> {
-        let index = self.selected_episode_index?;
+        let index = self.content.selected_episode_index?;
         self.selected_episode_choices().get(index).copied()
     }
 
@@ -887,7 +861,7 @@ impl AppState {
         let Some(season) = self.selected_season_num() else {
             return false;
         };
-        let Some(index) = self.selected_dubbing_index else {
+        let Some(index) = self.content.selected_dubbing_index else {
             return false;
         };
         self.dubbing_choices_for_season(season)
@@ -910,7 +884,8 @@ impl AppState {
 
     pub fn library_selected_season(&self) -> Option<&LibrarySeasonEntry> {
         let anime = self.library_selected_anime()?;
-        self.selected_season_index
+        self.content
+            .selected_season_index
             .and_then(|idx| anime.seasons.get(idx))
     }
 
@@ -1245,17 +1220,20 @@ impl AppState {
                     self.library.items.len(),
                 ),
                 AppMode::LibrarySeason => (
-                    self.season_list_state.selected().unwrap_or(0),
+                    self.content.season_list_state.selected().unwrap_or(0),
                     self.library_season_numbers().len(),
                 ),
                 AppMode::LibraryDubbing => {
                     let total = self
                         .selected_season_num()
                         .map_or(0, |season| self.dubbing_choices_for_season(season).len());
-                    (self.dubbing_list_state.selected().unwrap_or(0), total)
+                    (
+                        self.content.dubbing_list_state.selected().unwrap_or(0),
+                        total,
+                    )
                 }
                 AppMode::LibraryEpisode => (
-                    self.episode_list_state.selected().unwrap_or(0),
+                    self.content.episode_list_state.selected().unwrap_or(0),
                     self.selected_episode_count(),
                 ),
                 _ => (0, 0),
@@ -1268,17 +1246,20 @@ impl AppState {
                 self.search.franchise_groups.len(),
             ),
             FocusPanel::ReleaseList => (
-                self.season_list_state.selected().unwrap_or(0),
+                self.content.season_list_state.selected().unwrap_or(0),
                 self.release_count(),
             ),
             FocusPanel::DubbingList => {
                 let total = self
                     .selected_season_num()
                     .map_or(0, |season| self.dubbing_choices_for_season(season).len());
-                (self.dubbing_list_state.selected().unwrap_or(0), total)
+                (
+                    self.content.dubbing_list_state.selected().unwrap_or(0),
+                    total,
+                )
             }
             FocusPanel::EpisodeList => (
-                self.episode_list_state.selected().unwrap_or(0),
+                self.content.episode_list_state.selected().unwrap_or(0),
                 self.selected_episode_count(),
             ),
         }
@@ -1341,14 +1322,14 @@ impl AppState {
         self.library
             .anime_list_state
             .select(self.library.anime_index);
-        self.season_list_state.select(None);
-        self.dubbing_list_state.select(None);
-        self.episode_list_state.select(None);
+        self.content.season_list_state.select(None);
+        self.content.dubbing_list_state.select(None);
+        self.content.episode_list_state.select(None);
         self.library.pending_delete_confirmation = None;
         if self.library.items.is_empty() {
-            self.current_sources = None;
-            self.current_sources_key = None;
-            self.current_details = None;
+            self.content.current_sources = None;
+            self.content.current_sources_key = None;
+            self.content.current_details = None;
             self.current_poster = None;
             self.loading = false;
             self.activity_message = None;
@@ -1396,6 +1377,7 @@ impl AppState {
 
             // Priority 2: Sidebar/Selected result index
             let idx = self
+                .content
                 .sidebar_anime_idx
                 .or(self.search.selected_result_index)?;
             let item = self.search.results.get(idx)?;
@@ -1631,7 +1613,8 @@ impl AppState {
                 self.details_cache
                     .get(&source_key.anime_id)
                     .or_else(|| {
-                        self.current_details
+                        self.content
+                            .current_details
                             .as_ref()
                             .filter(|details| details.id == source_key.anime_id)
                             .cloned()
@@ -1812,7 +1795,7 @@ impl AppState {
         if !self.selected_dubbing_is_moonanime() {
             return false;
         }
-        let Some(index) = self.selected_episode_index else {
+        let Some(index) = self.content.selected_episode_index else {
             return false;
         };
         let Some(EpisodeChoice::MoonAnime(episode)) =
@@ -1825,6 +1808,7 @@ impl AppState {
             .map(|choice| choice.studio_name().to_string())
             .unwrap_or_else(|| "MoonAnime".to_string());
         let title = self
+            .content
             .current_details
             .as_ref()
             .map(|details| details.title_ukrainian.clone())
@@ -1876,9 +1860,9 @@ impl AppState {
             FocusPanel::SearchList => {
                 // Residual drill-down left open → collapse first, keep results.
                 if self.search.selected_release_index.is_some()
-                    || self.selected_season_index.is_some()
-                    || self.selected_dubbing_index.is_some()
-                    || self.current_sources.is_some()
+                    || self.content.selected_season_index.is_some()
+                    || self.content.selected_dubbing_index.is_some()
+                    || self.content.current_sources.is_some()
                 {
                     self.collapse_search_drilldown();
                     return;
@@ -1895,15 +1879,15 @@ impl AppState {
     fn collapse_search_drilldown(&mut self) {
         self.focus = FocusPanel::SearchList;
         self.search.selected_release_index = None;
-        self.selected_season_index = None;
-        self.selected_dubbing_index = None;
-        self.selected_episode_index = None;
-        self.season_list_state.select(None);
-        self.dubbing_list_state.select(None);
-        self.episode_list_state.select(None);
-        self.current_sources = None;
-        self.current_sources_key = None;
-        self.studio_anime_ids.clear();
+        self.content.selected_season_index = None;
+        self.content.selected_dubbing_index = None;
+        self.content.selected_episode_index = None;
+        self.content.season_list_state.select(None);
+        self.content.dubbing_list_state.select(None);
+        self.content.episode_list_state.select(None);
+        self.content.current_sources = None;
+        self.content.current_sources_key = None;
+        self.content.studio_anime_ids.clear();
         if let Some(index) = self.search.selected_group_index {
             self.search.result_list_state.select(Some(index));
         }
@@ -1925,20 +1909,20 @@ impl AppState {
         self.search.selected_result_index = None;
         self.search.result_list_state.select(None);
         self.search.selected_release_index = None;
-        self.selected_season_index = None;
-        self.selected_dubbing_index = None;
-        self.selected_episode_index = None;
-        self.season_list_state.select(None);
-        self.dubbing_list_state.select(None);
-        self.episode_list_state.select(None);
-        self.current_sources = None;
-        self.current_sources_key = None;
-        self.current_details = None;
+        self.content.selected_season_index = None;
+        self.content.selected_dubbing_index = None;
+        self.content.selected_episode_index = None;
+        self.content.season_list_state.select(None);
+        self.content.dubbing_list_state.select(None);
+        self.content.episode_list_state.select(None);
+        self.content.current_sources = None;
+        self.content.current_sources_key = None;
+        self.content.current_details = None;
         self.current_poster = None;
         self.poster_fetch_pending = None;
-        self.studio_anime_ids.clear();
-        self.sidebar_anime_idx = None;
-        self.sidebar_subject_id = None;
+        self.content.studio_anime_ids.clear();
+        self.content.sidebar_anime_idx = None;
+        self.content.sidebar_subject_id = None;
         self.loading = false;
         self.clear_activity();
         self.clear_status();
@@ -1962,20 +1946,21 @@ impl AppState {
                         FocusPanel::ReleaseList
                     } else {
                         let has_seasons = self
+                            .content
                             .current_sources
                             .as_ref()
                             .is_some_and(|s| !s.ashdi.is_empty());
                         let seasons = self.unique_seasons();
                         if has_seasons && !seasons.is_empty() {
-                            self.selected_season_index = Some(0);
-                            self.season_list_state.select(Some(0));
+                            self.content.selected_season_index = Some(0);
+                            self.content.season_list_state.select(Some(0));
                             self.update_sidebar_for_season();
                             if seasons.len() == 1 {
                                 let season_num = seasons[0];
                                 let studios_len = self.dubbing_choices_for_season(season_num).len();
                                 if studios_len > 0 {
-                                    self.selected_dubbing_index = Some(0);
-                                    self.dubbing_list_state.select(Some(0));
+                                    self.content.selected_dubbing_index = Some(0);
+                                    self.content.dubbing_list_state.select(Some(0));
                                     FocusPanel::DubbingList
                                 } else {
                                     FocusPanel::ReleaseList
@@ -1997,8 +1982,8 @@ impl AppState {
                 } else if let Some(sn) = self.selected_season_num() {
                     let studios_len = self.dubbing_choices_for_season(sn).len();
                     if studios_len > 0 {
-                        self.selected_dubbing_index = Some(0);
-                        self.dubbing_list_state.select(Some(0));
+                        self.content.selected_dubbing_index = Some(0);
+                        self.content.dubbing_list_state.select(Some(0));
                         FocusPanel::DubbingList
                     } else {
                         FocusPanel::ReleaseList
@@ -2010,8 +1995,8 @@ impl AppState {
             FocusPanel::DubbingList => {
                 let has_episodes = self.selected_episode_count() > 0;
                 if has_episodes {
-                    self.selected_episode_index = Some(0);
-                    self.episode_list_state.select(Some(0));
+                    self.content.selected_episode_index = Some(0);
+                    self.content.episode_list_state.select(Some(0));
                     FocusPanel::EpisodeList
                 } else {
                     FocusPanel::DubbingList
@@ -2047,7 +2032,7 @@ impl AppState {
         if total == 0 {
             return;
         }
-        let current = self.season_list_state.selected().unwrap_or(0);
+        let current = self.content.season_list_state.selected().unwrap_or(0);
         let next = if down {
             if current >= total.saturating_sub(1) {
                 0
@@ -2063,10 +2048,10 @@ impl AppState {
         if self.has_release_catalog() {
             self.select_release(Some(next));
         } else {
-            self.season_list_state.select(Some(next));
-            self.selected_season_index = Some(next);
-            self.selected_dubbing_index = None;
-            self.dubbing_list_state.select(None);
+            self.content.season_list_state.select(Some(next));
+            self.content.selected_season_index = Some(next);
+            self.content.selected_dubbing_index = None;
+            self.content.dubbing_list_state.select(None);
             self.update_sidebar_for_season();
         }
     }
@@ -2102,7 +2087,7 @@ impl AppState {
                     if studios_len == 0 {
                         return;
                     }
-                    let i = match self.dubbing_list_state.selected() {
+                    let i = match self.content.dubbing_list_state.selected() {
                         Some(i) => {
                             if i >= studios_len.saturating_sub(1) {
                                 0
@@ -2112,8 +2097,8 @@ impl AppState {
                         }
                         None => 0,
                     };
-                    self.dubbing_list_state.select(Some(i));
-                    self.selected_dubbing_index = Some(i);
+                    self.content.dubbing_list_state.select(Some(i));
+                    self.content.selected_dubbing_index = Some(i);
                 }
             }
             FocusPanel::EpisodeList => {
@@ -2121,7 +2106,7 @@ impl AppState {
                 if episodes_len == 0 {
                     return;
                 }
-                let i = match self.episode_list_state.selected() {
+                let i = match self.content.episode_list_state.selected() {
                     Some(i) => {
                         if i >= episodes_len.saturating_sub(1) {
                             0
@@ -2131,8 +2116,8 @@ impl AppState {
                     }
                     None => 0,
                 };
-                self.episode_list_state.select(Some(i));
-                self.selected_episode_index = Some(i);
+                self.content.episode_list_state.select(Some(i));
+                self.content.selected_episode_index = Some(i);
             }
         }
     }
@@ -2168,7 +2153,7 @@ impl AppState {
                     if studios_len == 0 {
                         return;
                     }
-                    let i = match self.dubbing_list_state.selected() {
+                    let i = match self.content.dubbing_list_state.selected() {
                         Some(i) => {
                             if i == 0 {
                                 studios_len.saturating_sub(1)
@@ -2178,8 +2163,8 @@ impl AppState {
                         }
                         None => 0,
                     };
-                    self.dubbing_list_state.select(Some(i));
-                    self.selected_dubbing_index = Some(i);
+                    self.content.dubbing_list_state.select(Some(i));
+                    self.content.selected_dubbing_index = Some(i);
                 }
             }
             FocusPanel::EpisodeList => {
@@ -2187,7 +2172,7 @@ impl AppState {
                 if episodes_len == 0 {
                     return;
                 }
-                let i = match self.episode_list_state.selected() {
+                let i = match self.content.episode_list_state.selected() {
                     Some(i) => {
                         if i == 0 {
                             episodes_len.saturating_sub(1)
@@ -2197,8 +2182,8 @@ impl AppState {
                     }
                     None => 0,
                 };
-                self.episode_list_state.select(Some(i));
-                self.selected_episode_index = Some(i);
+                self.content.episode_list_state.select(Some(i));
+                self.content.selected_episode_index = Some(i);
             }
         }
     }
@@ -2206,20 +2191,20 @@ impl AppState {
     fn reset_downstream(&mut self) {
         self.loading = true;
         self.activity_message = Some("Завантаження вибраного аніме…".to_string());
-        self.current_sources = None;
-        self.current_sources_key = None;
-        self.current_details = None;
+        self.content.current_sources = None;
+        self.content.current_sources_key = None;
+        self.content.current_details = None;
         self.current_poster = None;
-        self.studio_anime_ids.clear();
-        self.sidebar_anime_idx = None;
-        self.sidebar_subject_id = None;
+        self.content.studio_anime_ids.clear();
+        self.content.sidebar_anime_idx = None;
+        self.content.sidebar_subject_id = None;
         self.search.selected_release_index = None;
-        self.selected_season_index = None;
-        self.season_list_state.select(None);
-        self.selected_dubbing_index = None;
-        self.dubbing_list_state.select(None);
-        self.selected_episode_index = None;
-        self.episode_list_state.select(None);
+        self.content.selected_season_index = None;
+        self.content.season_list_state.select(None);
+        self.content.selected_dubbing_index = None;
+        self.content.dubbing_list_state.select(None);
+        self.content.selected_episode_index = None;
+        self.content.episode_list_state.select(None);
 
         // Moving the search cursor changes the poster owner immediately.
         // Leaving the subject unset would keep the previous pending request,
@@ -2241,22 +2226,22 @@ impl AppState {
         self.focus = FocusPanel::SearchList;
         self.search.query.clear();
         self.search.cursor = 0;
-        self.current_sources = None;
-        self.current_sources_key = None;
-        self.current_details = None;
-        self.studio_anime_ids.clear();
-        self.sidebar_anime_idx = None;
-        self.sidebar_subject_id = None;
+        self.content.current_sources = None;
+        self.content.current_sources_key = None;
+        self.content.current_details = None;
+        self.content.studio_anime_ids.clear();
+        self.content.sidebar_anime_idx = None;
+        self.content.sidebar_subject_id = None;
         self.search
             .result_list_state
             .select(self.search.selected_group_index);
         self.search.selected_release_index = None;
-        self.selected_season_index = None;
-        self.season_list_state.select(None);
-        self.selected_dubbing_index = None;
-        self.dubbing_list_state.select(None);
-        self.selected_episode_index = None;
-        self.episode_list_state.select(None);
+        self.content.selected_season_index = None;
+        self.content.season_list_state.select(None);
+        self.content.selected_dubbing_index = None;
+        self.content.dubbing_list_state.select(None);
+        self.content.selected_episode_index = None;
+        self.content.episode_list_state.select(None);
         self.loading = self.search.selected_result_index.is_some();
         self.activity_message = self
             .loading
@@ -2295,17 +2280,17 @@ impl AppState {
             // Re-pressing 2 while already in the library jumps to the root list.
             if self.mode != AppMode::Library {
                 self.mode = AppMode::Library;
-                self.selected_season_index = None;
-                self.selected_dubbing_index = None;
-                self.selected_episode_index = None;
-                self.season_list_state.select(None);
-                self.dubbing_list_state.select(None);
-                self.episode_list_state.select(None);
-                self.current_sources = None;
-                self.current_sources_key = None;
-                self.current_details = None;
+                self.content.selected_season_index = None;
+                self.content.selected_dubbing_index = None;
+                self.content.selected_episode_index = None;
+                self.content.season_list_state.select(None);
+                self.content.dubbing_list_state.select(None);
+                self.content.episode_list_state.select(None);
+                self.content.current_sources = None;
+                self.content.current_sources_key = None;
+                self.content.current_details = None;
                 self.current_poster = None;
-                self.studio_anime_ids.clear();
+                self.content.studio_anime_ids.clear();
                 if let Some(index) = self.library.anime_index {
                     self.prepare_library_anime_selection();
                     self.library.anime_list_state.select(Some(index));
@@ -2483,8 +2468,8 @@ impl AppState {
                 .search
                 .selected_group_index
                 .and_then(|g_idx| {
-                    if !self.studio_anime_ids.is_empty() {
-                        let mut anime_ids = self.studio_anime_ids.clone();
+                    if !self.content.studio_anime_ids.is_empty() {
+                        let mut anime_ids = self.content.studio_anime_ids.clone();
                         anime_ids.sort_unstable();
                         anime_ids.dedup();
                         Some(ContinueRequest::Group {
@@ -2552,16 +2537,16 @@ impl AppState {
                         self.library.all_items.clear();
                         self.library.items.clear();
                         self.library.anime_index = None;
-                        self.selected_season_index = None;
-                        self.selected_dubbing_index = None;
-                        self.selected_episode_index = None;
+                        self.content.selected_season_index = None;
+                        self.content.selected_dubbing_index = None;
+                        self.content.selected_episode_index = None;
                         self.library.anime_list_state.select(None);
-                        self.season_list_state.select(None);
-                        self.dubbing_list_state.select(None);
-                        self.episode_list_state.select(None);
-                        self.current_sources = None;
-                        self.current_sources_key = None;
-                        self.current_details = None;
+                        self.content.season_list_state.select(None);
+                        self.content.dubbing_list_state.select(None);
+                        self.content.episode_list_state.select(None);
+                        self.content.current_sources = None;
+                        self.content.current_sources_key = None;
+                        self.content.current_details = None;
                         self.current_poster = None;
                         self.poster_fetch_pending = None;
                         self.set_info_status("Бібліотеку та прогрес очищено");
@@ -2724,12 +2709,12 @@ impl AppState {
             return self.selected_release_anihub_id();
         }
         let season_num = self.selected_season_num()?;
-        self.current_sources.as_ref().and_then(|sources| {
+        self.content.current_sources.as_ref().and_then(|sources| {
             sources
                 .ashdi
                 .iter()
                 .position(|studio| studio.season_number == season_num)
-                .and_then(|idx| self.studio_anime_ids.get(idx))
+                .and_then(|idx| self.content.studio_anime_ids.get(idx))
                 .copied()
         })
     }
@@ -2760,7 +2745,8 @@ impl AppState {
                     .map(|anime| anime.title_ukrainian.clone())
             })
             .or_else(|| {
-                self.current_details
+                self.content
+                    .current_details
                     .as_ref()
                     .map(|details| details.title_ukrainian.clone())
             })
@@ -2797,8 +2783,8 @@ impl AppState {
         let prev_release_id = (prev_mode != AppMode::Library)
             .then(|| self.library_selected_anime_id())
             .flatten();
-        let prev_dubbing = self.selected_dubbing_index;
-        let prev_episode = self.selected_episode_index;
+        let prev_dubbing = self.content.selected_dubbing_index;
+        let prev_episode = self.content.selected_episode_index;
 
         self.library.all_items = build_library_items(&self.history);
         self.apply_library_filter();
@@ -2825,7 +2811,7 @@ impl AppState {
         let should_reprepare = match (&prev_anime_title, self.library_selected_anime()) {
             (Some(prev_title), Some(anime)) => anime.anime_title != *prev_title,
             (Some(_), None) => true,
-            _ => self.current_sources.is_none(),
+            _ => self.content.current_sources.is_none(),
         };
 
         if should_reprepare && self.library_selected_anime().is_some() {
@@ -2833,24 +2819,30 @@ impl AppState {
         }
 
         if let Some(anime_id) = prev_release_id {
-            self.selected_season_index = self
+            self.content.selected_season_index = self
                 .library_selected_anime()
                 .into_iter()
                 .flat_map(|anime| anime.seasons.iter())
                 .position(|release| release.anime_id == anime_id);
-            self.season_list_state.select(self.selected_season_index);
+            self.content
+                .season_list_state
+                .select(self.content.selected_season_index);
         }
         if prev_mode == AppMode::LibraryDubbing || prev_mode == AppMode::LibraryEpisode {
-            self.selected_dubbing_index = prev_dubbing.filter(|&idx| {
+            self.content.selected_dubbing_index = prev_dubbing.filter(|&idx| {
                 self.selected_season_num()
                     .is_some_and(|sn| idx < self.dubbing_choices_for_season(sn).len())
             });
-            self.dubbing_list_state.select(self.selected_dubbing_index);
+            self.content
+                .dubbing_list_state
+                .select(self.content.selected_dubbing_index);
         }
         if prev_mode == AppMode::LibraryEpisode {
-            self.selected_episode_index =
+            self.content.selected_episode_index =
                 prev_episode.filter(|&idx| idx < self.selected_episode_count());
-            self.episode_list_state.select(self.selected_episode_index);
+            self.content
+                .episode_list_state
+                .select(self.content.selected_episode_index);
         }
 
         self.mode = match prev_mode {
@@ -2874,7 +2866,13 @@ impl AppState {
 
         self.select_sidebar_subject(Some(anime_id));
 
-        if self.current_details.as_ref().map(|details| details.id) != Some(anime_id) {
+        if self
+            .content
+            .current_details
+            .as_ref()
+            .map(|details| details.id)
+            != Some(anime_id)
+        {
             self.loading = true;
             self.activity_message = Some("Завантаження метаданих…".to_string());
         }
@@ -2886,7 +2884,7 @@ impl AppState {
             Some(n) => n,
             None => return,
         };
-        let j = self.current_sources.as_ref().and_then(|sources| {
+        let j = self.content.current_sources.as_ref().and_then(|sources| {
             sources
                 .ashdi
                 .iter()
@@ -2896,7 +2894,7 @@ impl AppState {
             Some(j) => j,
             None => return,
         };
-        let studio_owner_id = match self.studio_anime_ids.get(j).copied() {
+        let studio_owner_id = match self.content.studio_anime_ids.get(j).copied() {
             Some(id) => id,
             None => return,
         };
@@ -2905,7 +2903,7 @@ impl AppState {
             return;
         }
         self.select_sidebar_subject(Some(anime_id));
-        if self.current_details.is_none() {
+        if self.content.current_details.is_none() {
             self.loading = true;
             self.activity_message = Some("Завантаження метаданих випуску…".to_string());
         }
@@ -2915,7 +2913,7 @@ impl AppState {
     fn restore_representative_poster(&mut self) {
         let representative_id = self
             .canonical_sidebar_subject()
-            .or_else(|| self.studio_anime_ids.first().copied())
+            .or_else(|| self.content.studio_anime_ids.first().copied())
             .or_else(|| {
                 self.search
                     .selected_result_index

@@ -1103,6 +1103,7 @@ fn with_right_marker(left: &str, marker: &str, width: usize) -> String {
 
 fn season_marker_for_search(app: &AppState, season_num: u32) -> Option<&str> {
     let anime_id = app
+        .content
         .current_sources
         .as_ref()
         .and_then(|sources| {
@@ -1111,22 +1112,22 @@ fn season_marker_for_search(app: &AppState, season_num: u32) -> Option<&str> {
                 .iter()
                 .position(|studio| studio.season_number == season_num)
         })
-        .and_then(|idx| app.studio_anime_ids.get(idx))
+        .and_then(|idx| app.content.studio_anime_ids.get(idx))
         .copied()?;
     season_is_complete(app, anime_id, season_num).then_some("✓")
 }
 
 fn selected_search_anime_id(app: &AppState) -> Option<u32> {
     let season_num = app.selected_season_num()?;
-    let dub_idx = app.selected_dubbing_index?;
-    app.current_sources.as_ref().and_then(|sources| {
+    let dub_idx = app.content.selected_dubbing_index?;
+    app.content.current_sources.as_ref().and_then(|sources| {
         sources
             .ashdi
             .iter()
             .enumerate()
             .filter(|(_, studio)| studio.season_number == season_num)
             .nth(dub_idx)
-            .and_then(|(idx, _)| app.studio_anime_ids.get(idx))
+            .and_then(|(idx, _)| app.content.studio_anime_ids.get(idx))
             .copied()
     })
 }
@@ -1201,12 +1202,12 @@ fn season_is_complete(app: &AppState, anime_id: u32, season_num: u32) -> bool {
 
 /// Повертає рік виходу сезону season_num через studio_anime_ids → details_cache.
 fn season_year(app: &AppState, season_num: u32) -> Option<u32> {
-    let sources = app.current_sources.as_ref()?;
+    let sources = app.content.current_sources.as_ref()?;
     let studio_idx = sources
         .ashdi
         .iter()
         .position(|s| s.season_number == season_num)?;
-    let anime_id = app.studio_anime_ids.get(studio_idx).copied()?;
+    let anime_id = app.content.studio_anime_ids.get(studio_idx).copied()?;
     app.details_cache
         .get(&anime_id)
         .and_then(|d| d.year)
@@ -1884,7 +1885,8 @@ fn sidebar_details_override(app: &AppState) -> Option<api::AnimeDetails> {
         return None;
     }
     app.details_cache.get(&subject_id).or_else(|| {
-        app.current_details
+        app.content
+            .current_details
             .as_ref()
             .filter(|details| details.id == subject_id)
             .cloned()

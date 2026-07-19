@@ -27,6 +27,7 @@ pub(super) fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     }
 
     let has_eng = app
+        .content
         .current_details
         .as_ref()
         .and_then(|d| d.title_english.as_ref())
@@ -274,7 +275,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             );
             let mut visual_state = ratatui::widgets::ListState::default();
             visual_state.select(
-                app.season_list_state
+                app.content
+                    .season_list_state
                     .selected()
                     .and_then(|release_index| release_rows.get(release_index).copied()),
             );
@@ -319,7 +321,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 dubbing_items,
                 app.mode == AppMode::LibraryDubbing,
             );
-            f.render_stateful_widget(dubbing_list, chunks[2], &mut app.dubbing_list_state);
+            f.render_stateful_widget(dubbing_list, chunks[2], &mut app.content.dubbing_list_state);
         }
     }
 
@@ -400,7 +402,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 episode_items,
                 app.mode == AppMode::LibraryEpisode,
             );
-            f.render_stateful_widget(episode_list, chunks[3], &mut app.episode_list_state);
+            f.render_stateful_widget(episode_list, chunks[3], &mut app.content.episode_list_state);
         }
     }
 }
@@ -704,7 +706,7 @@ fn next_airing_label_at(release: &crate::ui::app::LibrarySeasonEntry, now: i64) 
 
 fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(details) = &app.current_details {
+    if let Some(details) = &app.content.current_details {
         lines.push(
             Line::from(Span::styled(
                 truncate_with_ellipsis(&details.title_ukrainian, area.width as usize),
@@ -752,7 +754,7 @@ fn render_library_sidebar_details_area(
     };
     let mut text: Vec<Line> = Vec::new();
 
-    if let Some(details) = &app.current_details {
+    if let Some(details) = &app.content.current_details {
         if include_title {
             text.push(
                 Line::from(Span::styled(

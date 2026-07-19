@@ -237,7 +237,7 @@ pub struct PlaybackRelease<'a> {
 }
 
 pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
-    let e_idx = app.selected_episode_index?;
+    let e_idx = app.content.selected_episode_index?;
 
     // Витягуємо дані з обраної студії до будь-яких мутацій
     let studio_info = app.selected_studio().and_then(|s| {
@@ -254,8 +254,8 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
 
     // Знаходимо anime_id для прогресу через studio_anime_ids
     let season_num = app.selected_season_num()?;
-    let dub_idx = app.selected_dubbing_index?;
-    let studio_idx = app.current_sources.clone().and_then(|sources| {
+    let dub_idx = app.content.selected_dubbing_index?;
+    let studio_idx = app.content.current_sources.clone().and_then(|sources| {
         sources
             .ashdi
             .iter()
@@ -265,8 +265,13 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
             .map(|(i, _)| i)
     });
     let progress_anime_id = studio_idx
-        .and_then(|i| app.studio_anime_ids.get(i).copied())
-        .or_else(|| app.current_details.as_ref().map(|details| details.id))
+        .and_then(|i| app.content.studio_anime_ids.get(i).copied())
+        .or_else(|| {
+            app.content
+                .current_details
+                .as_ref()
+                .map(|details| details.id)
+        })
         .or_else(|| {
             app.search
                 .selected_result_index
@@ -274,6 +279,7 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         })
         .unwrap_or(0);
     let progress_title = app
+        .content
         .current_details
         .as_ref()
         .filter(|details| details.id == progress_anime_id)
@@ -292,7 +298,8 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         .unwrap_or_default();
 
     let player_title =
-        app.current_details
+        app.content
+            .current_details
             .as_ref()
             .map(|details| {
                 format!(
@@ -328,7 +335,7 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
 /// Build a deterministic timeline around the selected target. The supervisor
 /// resolves the complete timeline before launching mpv.
 pub fn build_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
-    let Some(sources) = app.current_sources.as_ref() else {
+    let Some(sources) = app.content.current_sources.as_ref() else {
         return PlaybackTimeline::single(target.clone());
     };
     let release = PlaybackRelease {

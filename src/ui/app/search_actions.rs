@@ -23,20 +23,20 @@ impl AppState {
         }
 
         self.focus = FocusPanel::SearchList;
-        self.current_sources = None;
-        self.current_sources_key = None;
-        self.current_details = None;
+        self.content.current_sources = None;
+        self.content.current_sources_key = None;
+        self.content.current_details = None;
         self.current_poster = None;
-        self.studio_anime_ids.clear();
-        self.sidebar_anime_idx = None;
-        self.sidebar_subject_id = None;
+        self.content.studio_anime_ids.clear();
+        self.content.sidebar_anime_idx = None;
+        self.content.sidebar_subject_id = None;
         self.search.selected_release_index = None;
-        self.selected_season_index = None;
-        self.season_list_state.select(None);
-        self.selected_dubbing_index = None;
-        self.dubbing_list_state.select(None);
-        self.selected_episode_index = None;
-        self.episode_list_state.select(None);
+        self.content.selected_season_index = None;
+        self.content.season_list_state.select(None);
+        self.content.selected_dubbing_index = None;
+        self.content.dubbing_list_state.select(None);
+        self.content.selected_episode_index = None;
+        self.content.episode_list_state.select(None);
 
         if !self.search.franchise_groups.is_empty() {
             self.search.result_list_state.select(Some(0));
@@ -125,7 +125,8 @@ impl AppState {
                     .releases
                     .iter()
                     .position(|release| release.anilist_id == Some(anilist_id));
-                self.season_list_state
+                self.content
+                    .season_list_state
                     .select(self.search.selected_release_index);
             }
         }

@@ -449,7 +449,7 @@ fn render_sidebar_details_area(
 
             let details = app.details_cache.get(&item.id).or_else(|| {
                 if sidebar_is_representative(app) {
-                    app.current_details.clone()
+                    app.content.current_details.clone()
                 } else {
                     None
                 }
@@ -712,7 +712,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             } else {
                 let mut visual_state = ratatui::widgets::ListState::default();
                 visual_state.select(
-                    app.season_list_state
+                    app.content
+                        .season_list_state
                         .selected()
                         .and_then(|release_index| release_rows.get(release_index).copied()),
                 );
@@ -754,7 +755,11 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 );
             } else {
                 let list = create_list(" Випуски ", items, app.focus == FocusPanel::ReleaseList);
-                f.render_stateful_widget(list, list_chunks[idx], &mut app.season_list_state);
+                f.render_stateful_widget(
+                    list,
+                    list_chunks[idx],
+                    &mut app.content.season_list_state,
+                );
             }
         }
     }
@@ -792,7 +797,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             );
         } else {
             let list = create_list(" Озвучки ", items, app.focus == FocusPanel::DubbingList);
-            f.render_stateful_widget(list, list_chunks[idx], &mut app.dubbing_list_state);
+            f.render_stateful_widget(list, list_chunks[idx], &mut app.content.dubbing_list_state);
         }
     }
 
@@ -920,7 +925,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
             );
         } else {
             let list = create_list(" Серії ", items, app.focus == FocusPanel::EpisodeList);
-            f.render_stateful_widget(list, list_chunks[idx], &mut app.episode_list_state);
+            f.render_stateful_widget(list, list_chunks[idx], &mut app.content.episode_list_state);
         }
     }
 }

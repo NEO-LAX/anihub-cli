@@ -74,8 +74,8 @@ impl AppState {
             .collect::<BTreeMap<_, _>>();
         let source_key = EpisodeSourcesKey::new(anime_id, release.season);
         let sources = self.sources_cache.get(&source_key).or_else(|| {
-            (self.current_sources_key == Some(source_key))
-                .then(|| self.current_sources.clone())
+            (self.content.current_sources_key == Some(source_key))
+                .then(|| self.content.current_sources.clone())
                 .flatten()
         });
         let mut has_source_episodes = false;

@@ -518,20 +518,26 @@ pub fn apply_continue_context(
     app.search.result_list_state.select(Some(0));
     app.mode = AppMode::Normal;
     app.focus = FocusPanel::EpisodeList;
-    app.current_details = Some(details.clone());
-    app.current_sources = Some(sources.clone());
-    app.current_sources_key = Some(EpisodeSourcesKey::new(details.id, resolved.season));
-    app.studio_anime_ids = vec![details.id; sources.ashdi.len()];
-    app.sidebar_anime_idx = None;
-    app.sidebar_subject_id = Some(details.id);
+    app.content.current_details = Some(details.clone());
+    app.content.current_sources = Some(sources.clone());
+    app.content.current_sources_key = Some(EpisodeSourcesKey::new(details.id, resolved.season));
+    app.content.studio_anime_ids = vec![details.id; sources.ashdi.len()];
+    app.content.sidebar_anime_idx = None;
+    app.content.sidebar_subject_id = Some(details.id);
     app.current_poster = None;
     app.poster_fetch_pending = app.settings.show_posters.then_some(details.id);
-    app.selected_season_index = Some(resolved.season_index);
-    app.season_list_state.select(Some(resolved.season_index));
-    app.selected_dubbing_index = Some(resolved.dubbing_index);
-    app.dubbing_list_state.select(Some(resolved.dubbing_index));
-    app.selected_episode_index = Some(resolved.episode_index);
-    app.episode_list_state.select(Some(resolved.episode_index));
+    app.content.selected_season_index = Some(resolved.season_index);
+    app.content
+        .season_list_state
+        .select(Some(resolved.season_index));
+    app.content.selected_dubbing_index = Some(resolved.dubbing_index);
+    app.content
+        .dubbing_list_state
+        .select(Some(resolved.dubbing_index));
+    app.content.selected_episode_index = Some(resolved.episode_index);
+    app.content
+        .episode_list_state
+        .select(Some(resolved.episode_index));
 }
 
 pub fn apply_library_continue_context(
@@ -554,19 +560,25 @@ pub fn apply_library_continue_context(
     app.library.anime_list_state.select(app.library.anime_index);
 
     app.mode = AppMode::LibraryEpisode;
-    app.current_details = Some(details.clone());
-    app.current_sources = Some(sources.clone());
-    app.current_sources_key = Some(EpisodeSourcesKey::new(details.id, resolved.season));
-    app.studio_anime_ids = vec![details.id; sources.ashdi.len()];
+    app.content.current_details = Some(details.clone());
+    app.content.current_sources = Some(sources.clone());
+    app.content.current_sources_key = Some(EpisodeSourcesKey::new(details.id, resolved.season));
+    app.content.studio_anime_ids = vec![details.id; sources.ashdi.len()];
     app.current_poster = None;
-    app.sidebar_subject_id = Some(details.id);
+    app.content.sidebar_subject_id = Some(details.id);
     app.poster_fetch_pending = app.settings.show_posters.then_some(details.id);
-    app.selected_season_index = Some(resolved.season_index);
-    app.season_list_state.select(Some(resolved.season_index));
-    app.selected_dubbing_index = Some(resolved.dubbing_index);
-    app.dubbing_list_state.select(Some(resolved.dubbing_index));
-    app.selected_episode_index = Some(resolved.episode_index);
-    app.episode_list_state.select(Some(resolved.episode_index));
+    app.content.selected_season_index = Some(resolved.season_index);
+    app.content
+        .season_list_state
+        .select(Some(resolved.season_index));
+    app.content.selected_dubbing_index = Some(resolved.dubbing_index);
+    app.content
+        .dubbing_list_state
+        .select(Some(resolved.dubbing_index));
+    app.content.selected_episode_index = Some(resolved.episode_index);
+    app.content
+        .episode_list_state
+        .select(Some(resolved.episode_index));
 }
 
 #[cfg(test)]

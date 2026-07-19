@@ -327,7 +327,7 @@ impl ResourceCoordinator {
                 });
                 let cached_details = app.details_cache.get(&details_key.anime_id);
                 if let Some(details) = cached_details.clone() {
-                    app.current_details = Some(details);
+                    app.content.current_details = Some(details);
                 }
                 let details_need_refresh = cached_details.is_none()
                     || !app.metadata_cache.details_are_fresh(details_key.anime_id);
@@ -350,14 +350,16 @@ impl ResourceCoordinator {
                 }
 
                 if let Some(sources) = app.sources_cache.get(&details_key) {
-                    app.current_sources = Some(sources);
-                    app.current_sources_key = Some(details_key);
-                    app.studio_anime_ids = vec![
-                        details_key.anime_id;
-                        app.current_sources
-                            .as_ref()
-                            .map_or(0, |sources| sources.ashdi.len())
-                    ];
+                    app.content.current_sources = Some(sources);
+                    app.content.current_sources_key = Some(details_key);
+                    app.content.studio_anime_ids =
+                        vec![
+                            details_key.anime_id;
+                            app.content
+                                .current_sources
+                                .as_ref()
+                                .map_or(0, |sources| sources.ashdi.len())
+                        ];
                     app.clear_activity();
                 }
 
@@ -443,7 +445,8 @@ impl ResourceCoordinator {
             })
             .or_else(|| app.poster_url_for_subject(anime_id))
             .or_else(|| {
-                app.current_details
+                app.content
+                    .current_details
                     .as_ref()
                     .filter(|details| details.id == anime_id)
                     .and_then(|details| details.poster_url.clone())
@@ -588,7 +591,7 @@ impl ResourceCoordinator {
                         if details_key.anime_id == anime_id
                 );
                 if is_current {
-                    app.current_details = Some(details);
+                    app.content.current_details = Some(details);
                     if app.settings.show_posters
                         && app.current_poster.is_none()
                         && app.sidebar_subject() == Some(anime_id)
@@ -625,9 +628,9 @@ impl ResourceCoordinator {
                     Some(ResourceContext::Content { details_key, .. }) if details_key == source_key
                 );
                 if is_current {
-                    app.studio_anime_ids = vec![source_key.anime_id; sources.ashdi.len()];
-                    app.current_sources = Some(sources);
-                    app.current_sources_key = Some(source_key);
+                    app.content.studio_anime_ids = vec![source_key.anime_id; sources.ashdi.len()];
+                    app.content.current_sources = Some(sources);
+                    app.content.current_sources_key = Some(source_key);
                     app.clear_activity();
                 }
             }

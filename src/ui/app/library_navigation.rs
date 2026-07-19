@@ -37,17 +37,17 @@ const fn parent_mode(mode: AppMode) -> Option<AppMode> {
 
 impl AppState {
     pub(super) fn prepare_library_anime_selection(&mut self) {
-        self.selected_season_index = None;
-        self.selected_dubbing_index = None;
-        self.selected_episode_index = None;
-        self.season_list_state.select(None);
-        self.dubbing_list_state.select(None);
-        self.episode_list_state.select(None);
-        self.current_sources = None;
-        self.current_sources_key = None;
-        self.current_details = None;
+        self.content.selected_season_index = None;
+        self.content.selected_dubbing_index = None;
+        self.content.selected_episode_index = None;
+        self.content.season_list_state.select(None);
+        self.content.dubbing_list_state.select(None);
+        self.content.episode_list_state.select(None);
+        self.content.current_sources = None;
+        self.content.current_sources_key = None;
+        self.content.current_details = None;
         self.current_poster = None;
-        self.studio_anime_ids.clear();
+        self.content.studio_anime_ids.clear();
         self.sync_library_sidebar_selection();
         self.loading = true;
         self.activity_message = Some("Завантаження бібліотеки…".to_string());
@@ -57,24 +57,24 @@ impl AppState {
         match parent_mode(self.mode) {
             Some(AppMode::LibraryDubbing) => {
                 self.mode = AppMode::LibraryDubbing;
-                self.selected_episode_index = None;
-                self.episode_list_state.select(None);
+                self.content.selected_episode_index = None;
+                self.content.episode_list_state.select(None);
             }
             Some(AppMode::LibrarySeason) => {
                 self.mode = AppMode::LibrarySeason;
-                self.selected_dubbing_index = None;
-                self.dubbing_list_state.select(None);
-                self.selected_episode_index = None;
-                self.episode_list_state.select(None);
+                self.content.selected_dubbing_index = None;
+                self.content.dubbing_list_state.select(None);
+                self.content.selected_episode_index = None;
+                self.content.episode_list_state.select(None);
             }
             Some(AppMode::Library) => {
                 self.mode = AppMode::Library;
-                self.selected_season_index = None;
-                self.selected_dubbing_index = None;
-                self.selected_episode_index = None;
-                self.season_list_state.select(None);
-                self.dubbing_list_state.select(None);
-                self.episode_list_state.select(None);
+                self.content.selected_season_index = None;
+                self.content.selected_dubbing_index = None;
+                self.content.selected_episode_index = None;
+                self.content.season_list_state.select(None);
+                self.content.dubbing_list_state.select(None);
+                self.content.episode_list_state.select(None);
             }
             None if self.mode == AppMode::Library => self.reset_to_home(),
             None | Some(_) => {}
@@ -92,12 +92,12 @@ impl AppState {
         }
 
         self.mode = AppMode::LibrarySeason;
-        self.selected_season_index = Some(0);
-        self.selected_dubbing_index = None;
-        self.selected_episode_index = None;
-        self.season_list_state.select(Some(0));
-        self.dubbing_list_state.select(None);
-        self.episode_list_state.select(None);
+        self.content.selected_season_index = Some(0);
+        self.content.selected_dubbing_index = None;
+        self.content.selected_episode_index = None;
+        self.content.season_list_state.select(Some(0));
+        self.content.dubbing_list_state.select(None);
+        self.content.episode_list_state.select(None);
         self.sync_library_sidebar_selection();
     }
 
@@ -111,10 +111,10 @@ impl AppState {
         self.acknowledge_selected_library_release();
 
         self.mode = AppMode::LibraryDubbing;
-        self.selected_dubbing_index = Some(0);
-        self.selected_episode_index = None;
-        self.dubbing_list_state.select(Some(0));
-        self.episode_list_state.select(None);
+        self.content.selected_dubbing_index = Some(0);
+        self.content.selected_episode_index = None;
+        self.content.dubbing_list_state.select(Some(0));
+        self.content.episode_list_state.select(None);
     }
 
     pub(super) fn enter_library_episode(&mut self) {
@@ -122,8 +122,8 @@ impl AppState {
             return;
         }
         self.mode = AppMode::LibraryEpisode;
-        self.selected_episode_index = Some(0);
-        self.episode_list_state.select(Some(0));
+        self.content.selected_episode_index = Some(0);
+        self.content.episode_list_state.select(Some(0));
     }
 
     pub(super) fn move_library_down(&mut self) {
@@ -151,14 +151,14 @@ impl AppState {
             }
             AppMode::LibrarySeason => {
                 let Some(next) = wrapped_index(
-                    self.season_list_state.selected(),
+                    self.content.season_list_state.selected(),
                     self.library_season_numbers().len(),
                     direction,
                 ) else {
                     return;
                 };
-                self.selected_season_index = Some(next);
-                self.season_list_state.select(Some(next));
+                self.content.selected_season_index = Some(next);
+                self.content.season_list_state.select(Some(next));
                 self.sync_library_sidebar_selection();
             }
             AppMode::LibraryDubbing => {
@@ -166,25 +166,25 @@ impl AppState {
                     return;
                 };
                 let Some(next) = wrapped_index(
-                    self.dubbing_list_state.selected(),
+                    self.content.dubbing_list_state.selected(),
                     self.dubbing_choices_for_season(season_num).len(),
                     direction,
                 ) else {
                     return;
                 };
-                self.selected_dubbing_index = Some(next);
-                self.dubbing_list_state.select(Some(next));
+                self.content.selected_dubbing_index = Some(next);
+                self.content.dubbing_list_state.select(Some(next));
             }
             AppMode::LibraryEpisode => {
                 let Some(next) = wrapped_index(
-                    self.episode_list_state.selected(),
+                    self.content.episode_list_state.selected(),
                     self.selected_episode_count(),
                     direction,
                 ) else {
                     return;
                 };
-                self.selected_episode_index = Some(next);
-                self.episode_list_state.select(Some(next));
+                self.content.selected_episode_index = Some(next);
+                self.content.episode_list_state.select(Some(next));
             }
             _ => {}
         }
