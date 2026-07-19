@@ -638,15 +638,15 @@ impl Actor {
             return;
         }
         self.shutting_down = true;
-        let pending = std::mem::take(&mut self.pending);
-        for key in pending {
-            if let Some(in_flight) = self.in_flight.remove(&key) {
-                for waiter in in_flight.waiters {
-                    self.emit_failed(waiter, key.clone(), LoadError::Shutdown)
-                        .await;
-                }
+        self.pending.clear();
+        for in_flight in self.in_flight.values() {
+            if let Some(abort_handle) = &in_flight.abort_handle {
+                abort_handle.abort();
             }
         }
+        self.in_flight.clear();
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
     }
 
     async fn handle_outcome(&mut self, outcome: TaskOutcome) {
@@ -1146,6 +1146,32 @@ mod tests {
         ));
 
         runtime.shutdown().await.unwrap();
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_a_running_request() {
+        let server = TestServer::start(200, Duration::from_secs(30)).await;
+        let api = ApiClient::with_base_urls(&server.url, &server.url).unwrap();
+        let runtime = ResourceWorker::spawn_with_config(api, test_config());
+        runtime
+            .handle
+            .load(ViewGeneration::new(30), ResourceKey::Details(7))
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            while server.request_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        timeout(Duration::from_millis(500), runtime.shutdown())
+            .await
+            .expect("shutdown must abort active network work")
+            .unwrap();
         server.stop().await;
     }
 

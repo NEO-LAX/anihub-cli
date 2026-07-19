@@ -140,15 +140,21 @@ enum Command {
 pub struct DiscordPresence {
     commands: Sender<Command>,
     worker: Option<JoinHandle<()>>,
+    worker_done: Receiver<()>,
 }
 
 impl DiscordPresence {
     pub fn new(enabled: bool) -> Self {
         let (commands, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || run_worker(receiver));
+        let (worker_done_tx, worker_done) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_worker(receiver);
+            let _ = worker_done_tx.send(());
+        });
         let presence = Self {
             commands,
             worker: Some(worker),
+            worker_done,
         };
         presence.configure(enabled);
         presence
@@ -170,7 +176,12 @@ impl DiscordPresence {
 
     pub fn shutdown(mut self) {
         let _ = self.commands.send(Command::Shutdown);
-        if let Some(worker) = self.worker.take() {
+        if self
+            .worker_done
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok()
+            && let Some(worker) = self.worker.take()
+        {
             let _ = worker.join();
         }
     }
@@ -463,6 +474,13 @@ mod tests {
     fn discord_is_opt_in_and_uses_the_anihub_application() {
         assert_eq!(false.then_some(APPLICATION_ID), None);
         assert_eq!(true.then_some(APPLICATION_ID), Some(APPLICATION_ID));
+    }
+
+    #[test]
+    fn disabled_worker_shuts_down_without_blocking() {
+        let started = std::time::Instant::now();
+        DiscordPresence::new(false).shutdown();
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

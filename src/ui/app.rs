@@ -994,9 +994,7 @@ impl AppState {
                     let shortcut = super::keys::shortcut_code(key.code);
                     let raw = key.code;
 
-                    if shortcut == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
+                    if is_global_quit_key(shortcut, key.modifiers) {
                         self.should_quit = true;
                         return Ok(());
                     }
@@ -2947,6 +2945,10 @@ fn byte_index_for_char(text: &str, char_index: usize) -> usize {
         .map_or(text.len(), |(byte_index, _)| byte_index)
 }
 
+fn is_global_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'q'))
+}
+
 fn compact_studio_name(name: &str) -> String {
     name.chars()
         .filter(|character| character.is_alphanumeric())
@@ -3075,6 +3077,23 @@ mod tests {
         assert_eq!(byte_index_for_char(text, 0), 0);
         assert_eq!(byte_index_for_char(text, 1), "Н".len());
         assert_eq!(byte_index_for_char(text, text.chars().count()), text.len());
+    }
+
+    #[test]
+    fn ctrl_c_and_ctrl_q_are_global_quit_shortcuts() {
+        assert!(is_global_quit_key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(is_global_quit_key(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(!is_global_quit_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!is_global_quit_key(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL
+        ));
     }
 
     #[test]
