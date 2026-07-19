@@ -176,6 +176,16 @@ pub enum LibrarySortPreference {
     Progress,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSortPreference {
+    #[default]
+    Relevance,
+    Title,
+    Year,
+    Rating,
+}
+
 impl DefaultLibraryFilter {
     pub const ALL: [Self; 6] = [
         Self::All,
@@ -207,7 +217,7 @@ impl DefaultLibraryFilter {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Settings {
     pub schema_version: u32,
     pub autoplay_next: bool,
@@ -223,6 +233,8 @@ pub struct Settings {
     pub last_library_filter: Option<DefaultLibraryFilter>,
     pub library_sort: LibrarySortPreference,
     pub library_sort_reversed: bool,
+    pub search_sort: SearchSortPreference,
+    pub search_sort_reversed: bool,
     pub last_library_anime_id: Option<u32>,
     /// Highest episode count acknowledged by opening each release.
     pub seen_episode_counts: BTreeMap<u32, u32>,
@@ -239,6 +251,11 @@ pub struct Settings {
     pub legacy_discord_application_id: String,
     pub mpv_path: String,
     pub mpv_extra_args: String,
+    /// Preserve settings written by a newer AniHub version. Older binaries
+    /// may not understand these keys yet, but must not call the file corrupt
+    /// or silently erase them on the next save.
+    #[serde(flatten)]
+    pub unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -254,6 +271,8 @@ impl Default for Settings {
             last_library_filter: None,
             library_sort: LibrarySortPreference::Recent,
             library_sort_reversed: false,
+            search_sort: SearchSortPreference::Relevance,
+            search_sort_reversed: false,
             last_library_anime_id: None,
             seen_episode_counts: BTreeMap::new(),
             show_posters: true,
@@ -266,6 +285,7 @@ impl Default for Settings {
             legacy_discord_application_id: String::new(),
             mpv_path: "mpv".to_string(),
             mpv_extra_args: String::new(),
+            unknown_fields: BTreeMap::new(),
         }
     }
 }
@@ -510,6 +530,8 @@ mod tests {
         object.remove("last_library_filter");
         object.remove("library_sort");
         object.remove("library_sort_reversed");
+        object.remove("search_sort");
+        object.remove("search_sort_reversed");
         object.remove("last_library_anime_id");
         object.remove("seen_episode_counts");
 
@@ -524,6 +546,8 @@ mod tests {
         assert_eq!(settings.last_library_filter, None);
         assert_eq!(settings.library_sort, LibrarySortPreference::Recent);
         assert!(!settings.library_sort_reversed);
+        assert_eq!(settings.search_sort, SearchSortPreference::Relevance);
+        assert!(!settings.search_sort_reversed);
         assert_eq!(settings.last_library_anime_id, None);
         assert!(settings.seen_episode_counts.is_empty());
     }
@@ -600,12 +624,37 @@ mod tests {
         settings.last_library_filter = Some(DefaultLibraryFilter::Watching);
         settings.library_sort = LibrarySortPreference::Progress;
         settings.library_sort_reversed = true;
+        settings.search_sort = SearchSortPreference::Rating;
+        settings.search_sort_reversed = true;
         settings.last_library_anime_id = Some(42);
         settings.seen_episode_counts.insert(42, 8);
+        settings.unknown_fields.insert(
+            "future_option".to_string(),
+            serde_json::json!({ "enabled": true }),
+        );
         store.save(&settings).unwrap();
 
         assert_eq!(store.load().unwrap(), settings);
         fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_settings_survive_load_and_save() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("future_option".to_string(), serde_json::json!([1, 2, 3]));
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            settings.unknown_fields.get("future_option"),
+            Some(&serde_json::json!([1, 2, 3]))
+        );
+        assert_eq!(
+            serde_json::to_value(settings).unwrap().get("future_option"),
+            Some(&serde_json::json!([1, 2, 3]))
+        );
     }
 
     #[test]

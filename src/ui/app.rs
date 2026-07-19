@@ -6,8 +6,8 @@ use crate::api::{
 use crate::cache::MetadataCache;
 use crate::poster_cache::PosterCache;
 use crate::settings::{
-    DefaultLibraryFilter, GITHUB_URL, LibrarySortPreference, Settings, SettingsStore, StartScreen,
-    ThemePreset, UpdateCheck, mpv_is_available,
+    DefaultLibraryFilter, GITHUB_URL, LibrarySortPreference, SearchSortPreference, Settings,
+    SettingsStore, StartScreen, ThemePreset, UpdateCheck, mpv_is_available,
 };
 use crate::storage::{
     AnimeStatus, AnimeStatusUpdate, AppHistory, EpisodeWatchedUpdate, LibraryReleaseKind,
@@ -150,6 +150,16 @@ impl Default for SearchOrderingState {
         Self {
             sort: SearchSort::Relevance,
             reversed: false,
+            popup: None,
+        }
+    }
+}
+
+impl SearchOrderingState {
+    fn new(sort: SearchSort, reversed: bool) -> Self {
+        Self {
+            sort,
+            reversed,
             popup: None,
         }
     }
@@ -654,6 +664,7 @@ impl AppState {
                 .unwrap_or(settings.default_library_filter),
         );
         let library_sort = library_sort_from_setting(settings.library_sort);
+        let search_sort = search_sort_from_setting(settings.search_sort);
         let start_in_library = settings.start_screen == StartScreen::Library;
 
         let mut app = Self {
@@ -664,7 +675,7 @@ impl AppState {
             search_cursor: 0,
 
             search_results: Vec::new(),
-            search_ordering: SearchOrderingState::default(),
+            search_ordering: SearchOrderingState::new(search_sort, settings.search_sort_reversed),
             franchise_groups: Vec::new(),
             // Cached searches retain AniList relation graphs. Keeping the
             // catalogs that intersect history lets the first Library open
@@ -3664,6 +3675,24 @@ const fn library_sort_to_setting(sort: LibrarySort) -> LibrarySortPreference {
         LibrarySort::Year => LibrarySortPreference::Year,
         LibrarySort::Rating => LibrarySortPreference::Rating,
         LibrarySort::Progress => LibrarySortPreference::Progress,
+    }
+}
+
+const fn search_sort_from_setting(sort: SearchSortPreference) -> SearchSort {
+    match sort {
+        SearchSortPreference::Relevance => SearchSort::Relevance,
+        SearchSortPreference::Title => SearchSort::Title,
+        SearchSortPreference::Year => SearchSort::Year,
+        SearchSortPreference::Rating => SearchSort::Rating,
+    }
+}
+
+const fn search_sort_to_setting(sort: SearchSort) -> SearchSortPreference {
+    match sort {
+        SearchSort::Relevance => SearchSortPreference::Relevance,
+        SearchSort::Title => SearchSortPreference::Title,
+        SearchSort::Year => SearchSortPreference::Year,
+        SearchSort::Rating => SearchSortPreference::Rating,
     }
 }
 

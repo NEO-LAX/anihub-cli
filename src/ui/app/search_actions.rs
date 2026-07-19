@@ -34,6 +34,8 @@ impl AppState {
                     self.search_ordering.sort = selected_sort;
                     self.search_ordering.reversed = false;
                 }
+                self.settings.search_sort = search_sort_to_setting(self.search_ordering.sort);
+                self.settings.search_sort_reversed = self.search_ordering.reversed;
                 self.search_ordering.popup = None;
                 self.sort_search_projection();
             }
