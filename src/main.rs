@@ -233,6 +233,7 @@ async fn main() -> Result<()> {
     }
     discord_presence.clear();
     resources.shutdown().await;
+    let metadata_cache_error = app.metadata_cache.flush().err();
     if let Some(task) = update_check {
         task.abort();
     }
@@ -241,6 +242,9 @@ async fn main() -> Result<()> {
         return Err(error);
     }
     if let Some(error) = session_settings_error {
+        return Err(error);
+    }
+    if let Some(error) = metadata_cache_error {
         return Err(error);
     }
     Ok(())

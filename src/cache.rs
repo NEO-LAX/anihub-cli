@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
@@ -13,6 +15,7 @@ const CACHE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const DETAILS_FRESHNESS: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SEARCHES: usize = 64;
 const MAX_DETAILS: usize = 500;
+const WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CachedSearch {
@@ -49,6 +52,21 @@ impl Default for CacheEnvelope {
 pub struct MetadataCache {
     path: PathBuf,
     data: CacheEnvelope,
+    writer: CacheWriter,
+}
+
+#[derive(Debug)]
+struct CacheWriter {
+    sender: mpsc::Sender<WriterCommand>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum WriterCommand {
+    PutSearch(String, CachedSearch),
+    PutDetails(u32, Box<CachedDetails>),
+    Flush(mpsc::Sender<std::result::Result<(), String>>),
+    Shutdown(mpsc::Sender<std::result::Result<(), String>>),
 }
 
 impl MetadataCache {
@@ -71,7 +89,8 @@ impl MetadataCache {
             CacheEnvelope::default()
         };
         prune(&mut data);
-        Ok(Self { path, data })
+        let writer = CacheWriter::spawn(path.clone(), data.clone());
+        Ok(Self { path, data, writer })
     }
 
     pub fn search(&self, query: &str, extended: bool) -> Option<CachedSearch> {
@@ -94,28 +113,27 @@ impl MetadataCache {
         items: Vec<AnimeItem>,
         anilist_media: Vec<AniListMedia>,
     ) -> Result<()> {
-        self.data.searches.insert(
-            search_key(query, extended),
-            CachedSearch {
-                items,
-                anilist_media,
-                updated_at: Utc::now().timestamp(),
-            },
-        );
+        let key = search_key(query, extended);
+        let cached = CachedSearch {
+            items,
+            anilist_media,
+            updated_at: Utc::now().timestamp(),
+        };
+        self.data.searches.insert(key.clone(), cached.clone());
         prune(&mut self.data);
-        self.save()
+        self.writer.send(WriterCommand::PutSearch(key, cached))
     }
 
     pub fn put_details(&mut self, details: AnimeDetails) -> Result<()> {
-        self.data.details.insert(
-            details.id,
-            CachedDetails {
-                value: details,
-                updated_at: Utc::now().timestamp(),
-            },
-        );
+        let anime_id = details.id;
+        let cached = CachedDetails {
+            value: details,
+            updated_at: Utc::now().timestamp(),
+        };
+        self.data.details.insert(anime_id, cached.clone());
         prune(&mut self.data);
-        self.save()
+        self.writer
+            .send(WriterCommand::PutDetails(anime_id, Box::new(cached)))
     }
 
     pub fn details(&self) -> impl Iterator<Item = (u32, AnimeDetails)> + '_ {
@@ -136,24 +154,114 @@ impl MetadataCache {
         &self.path
     }
 
-    fn save(&self) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(&self.data)?;
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, bytes)
-            .with_context(|| format!("не вдалося записати {}", temporary.display()))?;
-        if let Err(first_error) = fs::rename(&temporary, &self.path) {
-            if self.path.exists() {
-                fs::remove_file(&self.path)
-                    .with_context(|| format!("не вдалося замінити {}", self.path.display()))?;
-                fs::rename(&temporary, &self.path)
-                    .with_context(|| format!("не вдалося оновити {}", self.path.display()))?;
-            } else {
-                return Err(first_error)
-                    .with_context(|| format!("не вдалося оновити {}", self.path.display()));
+    pub fn flush(&self) -> Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl CacheWriter {
+    fn spawn(path: PathBuf, data: CacheEnvelope) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("metadata-cache-writer".to_string())
+            .spawn(move || writer_loop(&path, data, &receiver))
+            .expect("failed to start metadata cache writer");
+        Self {
+            sender,
+            thread: Some(thread),
+        }
+    }
+
+    fn send(&self, command: WriterCommand) -> Result<()> {
+        self.sender
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("фоновий запис кешу несподівано зупинився"))
+    }
+
+    fn flush(&self) -> Result<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.send(WriterCommand::Flush(sender))?;
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("фоновий запис кешу несподівано зупинився"))?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+impl Drop for CacheWriter {
+    fn drop(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        if self.sender.send(WriterCommand::Shutdown(sender)).is_ok() {
+            let _ = receiver.recv();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn writer_loop(path: &Path, mut data: CacheEnvelope, receiver: &mpsc::Receiver<WriterCommand>) {
+    let mut dirty = false;
+    loop {
+        let command = if dirty {
+            match receiver.recv_timeout(WRITE_DEBOUNCE) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if write_cache(path, &data).is_ok() {
+                        dirty = false;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = write_cache(path, &data);
+                    break;
+                }
+            }
+        } else {
+            match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            }
+        };
+
+        match command {
+            WriterCommand::PutSearch(key, cached) => {
+                data.searches.insert(key, cached);
+                prune(&mut data);
+                dirty = true;
+            }
+            WriterCommand::PutDetails(anime_id, cached) => {
+                data.details.insert(anime_id, *cached);
+                prune(&mut data);
+                dirty = true;
+            }
+            WriterCommand::Flush(reply) => {
+                let result = if dirty {
+                    write_cache(path, &data).map_err(|error| error.to_string())
+                } else {
+                    Ok(())
+                };
+                if result.is_ok() {
+                    dirty = false;
+                }
+                let _ = reply.send(result);
+            }
+            WriterCommand::Shutdown(reply) => {
+                let result = if dirty {
+                    write_cache(path, &data).map_err(|error| error.to_string())
+                } else {
+                    Ok(())
+                };
+                let _ = reply.send(result);
+                break;
             }
         }
-        Ok(())
     }
+}
+
+fn write_cache(path: &Path, data: &CacheEnvelope) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(data)?;
+    crate::atomic_file::write(path, &bytes)
 }
 
 fn search_key(query: &str, extended: bool) -> String {
@@ -252,6 +360,7 @@ mod tests {
         cache
             .put_search("каґуя", true, vec![item(2)], Vec::new())
             .unwrap();
+        cache.flush().unwrap();
 
         let cache = MetadataCache::new(&directory).unwrap();
         assert_eq!(cache.search("КАҐУЯ", false).unwrap().items[0].id, 1);
@@ -274,6 +383,21 @@ mod tests {
                 .to_string_lossy()
                 .contains("corrupt")
         }));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn foreground_updates_memory_before_debounced_flush() {
+        let directory = temp_dir("foreground");
+        let mut cache = MetadataCache::new(&directory).unwrap();
+
+        cache
+            .put_search("frieren", false, vec![item(7)], Vec::new())
+            .unwrap();
+
+        assert_eq!(cache.search("frieren", false).unwrap().items[0].id, 7);
+        cache.flush().unwrap();
+        assert!(directory.join(CACHE_FILE_NAME).exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }
