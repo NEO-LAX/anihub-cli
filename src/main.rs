@@ -1,6 +1,7 @@
 mod api;
 mod atomic_file;
 mod cache;
+mod diagnostics;
 mod discord;
 mod library_refresh;
 mod platform;
@@ -123,6 +124,14 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = AppState::new(picker, image_protocol)?;
+    let diagnostics_path = diagnostics::init(app.settings_store.data_dir())?;
+    diagnostics::info(
+        "app.started",
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "diagnostics_file": diagnostics_path.is_some(),
+        }),
+    );
     let mut resources =
         ResourceCoordinator::new(app.api_client.clone(), app.poster_disk_cache.clone());
     let mut playback = PlaybackSupervisor::new();
@@ -239,6 +248,7 @@ async fn main() -> Result<()> {
         task.abort();
     }
     discord_presence.shutdown();
+    diagnostics::info("app.stopped", serde_json::json!({}));
     if let Some(error) = playback_shutdown_error {
         return Err(error);
     }
@@ -352,6 +362,14 @@ fn persist_playback_event(
 ) {
     match event {
         PlaybackEvent::SessionStarted { session_id, target } => {
+            diagnostics::info(
+                "playback.session.started",
+                serde_json::json!({
+                    "anime_id": target.anime_id,
+                    "season": target.season,
+                    "episode": target.episode,
+                }),
+            );
             app.clear_activity();
             app.playback.now_playing = Some(ui::app::NowPlaying {
                 anime_id: target.anime_id,
@@ -413,6 +431,15 @@ fn persist_playback_event(
             position,
             ..
         } => {
+            diagnostics::debug(
+                "playback.pause.changed",
+                serde_json::json!({
+                    "anime_id": identity.anime_id,
+                    "season": identity.season,
+                    "episode": identity.episode,
+                    "paused": paused,
+                }),
+            );
             if let Some(now_playing) = app.playback.now_playing.as_mut()
                 && now_playing.anime_id == identity.anime_id
                 && now_playing.season == identity.season
@@ -426,6 +453,14 @@ fn persist_playback_event(
             }
         }
         PlaybackEvent::MarkWatched(mark) => {
+            diagnostics::info(
+                "playback.episode.watched",
+                serde_json::json!({
+                    "anime_id": mark.identity.anime_id,
+                    "season": mark.identity.season,
+                    "episode": mark.identity.episode,
+                }),
+            );
             if let Some(now_playing) = app.playback.now_playing.as_mut() {
                 now_playing.position = mark.position;
                 now_playing.duration = mark.duration;
@@ -450,11 +485,16 @@ fn persist_playback_event(
             persisted_positions.insert(mark.session_id, mark.position);
         }
         PlaybackEvent::SessionStopped { session_id } => {
+            diagnostics::info("playback.session.stopped", serde_json::json!({}));
             persisted_positions.remove(&session_id);
             app.playback.now_playing = None;
             app.clear_activity();
         }
         PlaybackEvent::Error { message, .. } => {
+            diagnostics::error(
+                "playback.session.failed",
+                serde_json::json!({ "kind": "supervisor" }),
+            );
             app.set_error_status(format!("Помилка відтворення: {message}"));
         }
         PlaybackEvent::EndFile { .. } => {}

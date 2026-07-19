@@ -9,6 +9,7 @@ use crate::api::{
     EpisodeSourcesKey, EpisodeSourcesResponse, RequestId, ResourceEvent, ResourceKey,
     ResourceValue, ResourceWorker, ResourceWorkerRuntime, ViewGeneration,
 };
+use crate::diagnostics;
 use crate::library_refresh;
 use crate::playback::*;
 use crate::poster_cache;
@@ -106,6 +107,13 @@ impl ResourceCoordinator {
                 let _ = self.runtime.handle.cancel_generation(previous).await;
             }
             self.context = desired.clone();
+            diagnostics::debug(
+                "resource.context.changed",
+                serde_json::json!({
+                    "generation": self.generation.get(),
+                    "context": resource_context_kind(desired.as_ref()),
+                }),
+            );
             self.poster_requests.clear();
             self.posters_in_flight.clear();
             self.cached_search_used = None;
@@ -483,11 +491,32 @@ impl ResourceCoordinator {
                 error,
             } => (request_id, generation, key, Err(error)),
         };
-        match event_owner(
+        let owner = event_owner(
             generation,
             self.generation,
             self.library_refresh.generation(),
-        ) {
+        );
+        if let Err(error) = &result {
+            diagnostics::warn(
+                "resource.event.failed",
+                serde_json::json!({
+                    "generation": generation.get(),
+                    "owner": event_owner_label(owner),
+                    "resource": resource_key_kind(&key),
+                    "error": load_error_kind(error),
+                }),
+            );
+        } else {
+            diagnostics::debug(
+                "resource.event.completed",
+                serde_json::json!({
+                    "generation": generation.get(),
+                    "owner": event_owner_label(owner),
+                    "resource": resource_key_kind(&key),
+                }),
+            );
+        }
+        match owner {
             EventOwner::LibraryRefresh => {
                 self.library_refresh
                     .apply_event(app, &self.runtime.handle, request_id, key, result)
@@ -642,6 +671,58 @@ impl ResourceCoordinator {
 
     pub(super) async fn shutdown(self) {
         let _ = self.runtime.shutdown().await;
+    }
+}
+
+fn resource_context_kind(context: Option<&ResourceContext>) -> &'static str {
+    match context {
+        None => "none",
+        Some(ResourceContext::Search { .. }) => "search",
+        Some(ResourceContext::Content {
+            source_scope: SourceLoadScope::DetailsOnly,
+            ..
+        }) => "details",
+        Some(ResourceContext::Content {
+            source_scope: SourceLoadScope::Preview,
+            ..
+        }) => "preview",
+        Some(ResourceContext::Content {
+            source_scope: SourceLoadScope::Full,
+            ..
+        }) => "full",
+    }
+}
+
+const fn event_owner_label(owner: EventOwner) -> &'static str {
+    match owner {
+        EventOwner::LibraryRefresh => "library_refresh",
+        EventOwner::Foreground => "foreground",
+        EventOwner::Stale => "stale",
+    }
+}
+
+const fn resource_key_kind(key: &ResourceKey) -> &'static str {
+    match key {
+        ResourceKey::Search { .. } => "search",
+        ResourceKey::AniHubByAniList(_) => "anihub_by_anilist",
+        ResourceKey::Details(_) => "details",
+        ResourceKey::Sources(_) => "sources",
+        ResourceKey::Poster(_) => "poster",
+    }
+}
+
+const fn load_error_kind(error: &LoadError) -> &'static str {
+    match error {
+        LoadError::NotFound => "not_found",
+        LoadError::Http { status: 429, .. } => "rate_limited",
+        LoadError::Http { status, .. } if *status >= 500 => "server",
+        LoadError::Http { .. } => "http",
+        LoadError::Network(_) => "network",
+        LoadError::Parse(_) => "parse",
+        LoadError::Decode(_) => "decode",
+        LoadError::Unsupported(_) => "unsupported",
+        LoadError::NoSources => "no_sources",
+        LoadError::Shutdown => "shutdown",
     }
 }
 
@@ -877,5 +958,17 @@ mod tests {
             source_keys_for_scope(keys.clone(), &SourceLoadScope::Full),
             keys
         );
+    }
+
+    #[test]
+    fn diagnostics_describe_resource_types_without_payloads() {
+        let secret = "https://example.test/private-poster?token=secret";
+        assert_eq!(resource_key_kind(&ResourceKey::poster(secret)), "poster");
+        assert!(!resource_key_kind(&ResourceKey::poster(secret)).contains("secret"));
+        assert_eq!(
+            load_error_kind(&LoadError::Network(secret.to_string())),
+            "network"
+        );
+        assert!(!load_error_kind(&LoadError::Network(secret.to_string())).contains("secret"));
     }
 }

@@ -209,6 +209,12 @@ brew install mpv
 Файли: `settings.json`, `history.json`, кеші.  
 Autoplay, resume, режим пошуку, теми, mpv, Discord, очищення постерів, перевірка оновлень (без авто-встановлення).
 
+Для opt-in JSONL-діагностики запустіть `ANIHUB_LOG=debug anihub-cli`.
+Доступні рівні: `error`, `warn`, `info`, `debug`, `trace`; за замовчуванням
+логування вимкнене. Файл `logs/anihub-cli.log` лежить у теці даних і під час
+запуску ротується після 2 МіБ. Пошукові запити, назви аніме та browser/stream URL
+не записуються.
+
 ---
 
 ## 🛠 Збірка

@@ -211,6 +211,12 @@ Stored in the platform data directory:
 Files: `settings.json`, `history.json`, metadata & poster caches.  
 Options include autoplay, resume threshold, search mode, themes, mpv path/args, Discord, poster cache clear, and in-app update check (never auto-installs).
 
+For opt-in JSONL diagnostics, start the app with `ANIHUB_LOG=debug anihub-cli`.
+Accepted levels are `error`, `warn`, `info`, `debug`, and `trace`; logging is off by
+default. Logs are stored in `logs/anihub-cli.log` under the data directory and
+rotated at 2 MiB on startup. Search queries, anime titles, and browser/stream URLs
+are not recorded.
+
 ---
 
 ## 🛠 Build from source
