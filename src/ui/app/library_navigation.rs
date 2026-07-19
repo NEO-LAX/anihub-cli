@@ -26,23 +26,102 @@ fn wrapped_index(selected: Option<usize>, total: usize, direction: Direction) ->
     })
 }
 
-const fn parent_mode(mode: AppMode) -> Option<AppMode> {
-    match mode {
-        AppMode::LibraryEpisode => Some(AppMode::LibraryDubbing),
-        AppMode::LibraryDubbing => Some(AppMode::LibrarySeason),
-        AppMode::LibrarySeason => Some(AppMode::Library),
-        _ => None,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LibraryDrillDown {
+    mode: AppMode,
+    season: Option<usize>,
+    dubbing: Option<usize>,
+    episode: Option<usize>,
+}
+
+impl LibraryDrillDown {
+    const fn root() -> Self {
+        Self {
+            mode: AppMode::Library,
+            season: None,
+            dubbing: None,
+            episode: None,
+        }
+    }
+
+    fn enter_season(&mut self, has_releases: bool) -> bool {
+        if self.mode != AppMode::Library || !has_releases {
+            return false;
+        }
+        self.mode = AppMode::LibrarySeason;
+        self.season = Some(0);
+        self.dubbing = None;
+        self.episode = None;
+        true
+    }
+
+    fn enter_dubbing(&mut self, has_dubbings: bool) -> bool {
+        if self.mode != AppMode::LibrarySeason || self.season.is_none() || !has_dubbings {
+            return false;
+        }
+        self.mode = AppMode::LibraryDubbing;
+        self.dubbing = Some(0);
+        self.episode = None;
+        true
+    }
+
+    fn enter_episode(&mut self, has_episodes: bool) -> bool {
+        if self.mode != AppMode::LibraryDubbing || self.dubbing.is_none() || !has_episodes {
+            return false;
+        }
+        self.mode = AppMode::LibraryEpisode;
+        self.episode = Some(0);
+        true
+    }
+
+    fn leave(&mut self) -> bool {
+        match self.mode {
+            AppMode::LibraryEpisode => {
+                self.mode = AppMode::LibraryDubbing;
+                self.episode = None;
+            }
+            AppMode::LibraryDubbing => {
+                self.mode = AppMode::LibrarySeason;
+                self.dubbing = None;
+                self.episode = None;
+            }
+            AppMode::LibrarySeason => *self = Self::root(),
+            _ => return false,
+        }
+        true
+    }
+
+    const fn clear_selection(mut self) -> Self {
+        self.season = None;
+        self.dubbing = None;
+        self.episode = None;
+        self
     }
 }
 
 impl AppState {
+    fn library_drill_down(&self) -> LibraryDrillDown {
+        LibraryDrillDown {
+            mode: self.mode,
+            season: self.content.selected_season_index,
+            dubbing: self.content.selected_dubbing_index,
+            episode: self.content.selected_episode_index,
+        }
+    }
+
+    fn apply_library_drill_down(&mut self, drill_down: LibraryDrillDown) {
+        self.mode = drill_down.mode;
+        self.content.selected_season_index = drill_down.season;
+        self.content.selected_dubbing_index = drill_down.dubbing;
+        self.content.selected_episode_index = drill_down.episode;
+        self.content.season_list_state.select(drill_down.season);
+        self.content.dubbing_list_state.select(drill_down.dubbing);
+        self.content.episode_list_state.select(drill_down.episode);
+    }
+
     pub(super) fn prepare_library_anime_selection(&mut self) {
-        self.content.selected_season_index = None;
-        self.content.selected_dubbing_index = None;
-        self.content.selected_episode_index = None;
-        self.content.season_list_state.select(None);
-        self.content.dubbing_list_state.select(None);
-        self.content.episode_list_state.select(None);
+        let cleared = self.library_drill_down().clear_selection();
+        self.apply_library_drill_down(cleared);
         self.content.current_sources = None;
         self.content.current_sources_key = None;
         self.content.current_details = None;
@@ -54,50 +133,24 @@ impl AppState {
     }
 
     pub(super) fn leave_library_level(&mut self) {
-        match parent_mode(self.mode) {
-            Some(AppMode::LibraryDubbing) => {
-                self.mode = AppMode::LibraryDubbing;
-                self.content.selected_episode_index = None;
-                self.content.episode_list_state.select(None);
-            }
-            Some(AppMode::LibrarySeason) => {
-                self.mode = AppMode::LibrarySeason;
-                self.content.selected_dubbing_index = None;
-                self.content.dubbing_list_state.select(None);
-                self.content.selected_episode_index = None;
-                self.content.episode_list_state.select(None);
-            }
-            Some(AppMode::Library) => {
-                self.mode = AppMode::Library;
-                self.content.selected_season_index = None;
-                self.content.selected_dubbing_index = None;
-                self.content.selected_episode_index = None;
-                self.content.season_list_state.select(None);
-                self.content.dubbing_list_state.select(None);
-                self.content.episode_list_state.select(None);
-            }
-            None if self.mode == AppMode::Library => self.reset_to_home(),
-            None | Some(_) => {}
+        let mut drill_down = self.library_drill_down();
+        if drill_down.leave() {
+            self.apply_library_drill_down(drill_down);
+        } else if self.mode == AppMode::Library {
+            self.reset_to_home();
         }
     }
 
     pub(super) fn enter_library_season(&mut self) {
-        if self.library_selected_anime().is_none()
-            || (self.unique_seasons().is_empty()
-                && self
-                    .library_selected_anime()
-                    .is_none_or(|anime| anime.seasons.is_empty()))
-        {
+        let has_releases = self
+            .library_selected_anime()
+            .is_some_and(|anime| !self.unique_seasons().is_empty() || !anime.seasons.is_empty());
+        let mut drill_down = self.library_drill_down();
+        if !drill_down.enter_season(has_releases) {
             return;
         }
 
-        self.mode = AppMode::LibrarySeason;
-        self.content.selected_season_index = Some(0);
-        self.content.selected_dubbing_index = None;
-        self.content.selected_episode_index = None;
-        self.content.season_list_state.select(Some(0));
-        self.content.dubbing_list_state.select(None);
-        self.content.episode_list_state.select(None);
+        self.apply_library_drill_down(drill_down);
         self.sync_library_sidebar_selection();
     }
 
@@ -105,25 +158,21 @@ impl AppState {
         let Some(season_num) = self.selected_season_num() else {
             return;
         };
-        if self.dubbing_choices_for_season(season_num).is_empty() {
+        let mut drill_down = self.library_drill_down();
+        if !drill_down.enter_dubbing(!self.dubbing_choices_for_season(season_num).is_empty()) {
             return;
         }
         self.acknowledge_selected_library_release();
 
-        self.mode = AppMode::LibraryDubbing;
-        self.content.selected_dubbing_index = Some(0);
-        self.content.selected_episode_index = None;
-        self.content.dubbing_list_state.select(Some(0));
-        self.content.episode_list_state.select(None);
+        self.apply_library_drill_down(drill_down);
     }
 
     pub(super) fn enter_library_episode(&mut self) {
-        if self.selected_episode_count() == 0 {
+        let mut drill_down = self.library_drill_down();
+        if !drill_down.enter_episode(self.selected_episode_count() > 0) {
             return;
         }
-        self.mode = AppMode::LibraryEpisode;
-        self.content.selected_episode_index = Some(0);
-        self.content.episode_list_state.select(Some(0));
+        self.apply_library_drill_down(drill_down);
     }
 
     pub(super) fn move_library_down(&mut self) {
@@ -207,17 +256,44 @@ mod tests {
     }
 
     #[test]
-    fn library_parent_modes_follow_the_visible_drill_down() {
-        assert_eq!(
-            parent_mode(AppMode::LibraryEpisode),
-            Some(AppMode::LibraryDubbing)
-        );
-        assert_eq!(
-            parent_mode(AppMode::LibraryDubbing),
-            Some(AppMode::LibrarySeason)
-        );
-        assert_eq!(parent_mode(AppMode::LibrarySeason), Some(AppMode::Library));
-        assert_eq!(parent_mode(AppMode::Library), None);
-        assert_eq!(parent_mode(AppMode::Normal), None);
+    fn library_drill_down_round_trips_and_clears_child_selections() {
+        let mut navigation = LibraryDrillDown::root();
+
+        assert!(navigation.enter_season(true));
+        assert_eq!(navigation.mode, AppMode::LibrarySeason);
+        assert_eq!(navigation.season, Some(0));
+        assert!(navigation.enter_dubbing(true));
+        assert_eq!(navigation.mode, AppMode::LibraryDubbing);
+        assert_eq!(navigation.dubbing, Some(0));
+        assert!(navigation.enter_episode(true));
+        assert_eq!(navigation.mode, AppMode::LibraryEpisode);
+        assert_eq!(navigation.episode, Some(0));
+
+        assert!(navigation.leave());
+        assert_eq!(navigation.mode, AppMode::LibraryDubbing);
+        assert_eq!(navigation.episode, None);
+        assert!(navigation.leave());
+        assert_eq!(navigation.mode, AppMode::LibrarySeason);
+        assert_eq!(navigation.dubbing, None);
+        assert!(navigation.leave());
+        assert_eq!(navigation, LibraryDrillDown::root());
+        assert!(!navigation.leave());
+    }
+
+    #[test]
+    fn library_drill_down_rejects_missing_content_without_partial_state() {
+        let mut navigation = LibraryDrillDown::root();
+        assert!(!navigation.enter_season(false));
+        assert_eq!(navigation, LibraryDrillDown::root());
+
+        assert!(navigation.enter_season(true));
+        let season = navigation;
+        assert!(!navigation.enter_dubbing(false));
+        assert_eq!(navigation, season);
+
+        assert!(navigation.enter_dubbing(true));
+        let dubbing = navigation;
+        assert!(!navigation.enter_episode(false));
+        assert_eq!(navigation, dubbing);
     }
 }
