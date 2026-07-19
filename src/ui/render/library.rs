@@ -221,8 +221,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     .map(|(watched, total)| format!("{watched}/{total}"))
                     .into_iter()
                     .collect::<Vec<_>>();
-                if let Some(count) = dubbing_count.filter(|count| *count > 1) {
-                    metadata.push(format!("{count} озвучок"));
+                if let Some(count) = dubbing_count.filter(|count| *count > 0) {
+                    metadata.push(dubbing_count_label(count));
                 }
                 if let Some(label) = new_content_label(&app.settings, release) {
                     metadata.push(label);
@@ -799,7 +799,7 @@ fn render_library_sidebar_details_area(
             if !studios.is_empty() {
                 let s = studios
                     .iter()
-                    .map(|s| s.name.as_str())
+                    .map(|s| canonical_studio_name(&s.name))
                     .collect::<Vec<_>>()
                     .join(", ");
                 text.push(Line::from(vec![

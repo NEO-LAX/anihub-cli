@@ -329,10 +329,10 @@ impl EpisodeChoice<'_> {
 
 impl DubbingChoice<'_> {
     pub fn studio_name(&self) -> &str {
-        match self {
+        canonical_studio_name(match self {
             Self::Ashdi(studio) => &studio.studio_name,
             Self::MoonAnime(studio) => &studio.studio_name,
-        }
+        })
     }
 
     pub fn episodes_count(&self) -> u32 {
@@ -2955,8 +2955,25 @@ fn normalize_studio_name(name: &str) -> String {
         .collect::<String>();
 
     match normalized.as_str() {
-        "fanwoxua" => "fanvoxua".to_string(),
+        "fanwoxua" | "fanvoxua" => "fanvoxua".to_string(),
+        "clankaizoku" | "кланкайзоку" => "clankaizoku".to_string(),
+        name if name == "субтитри"
+            || name.starts_with("субтитри")
+            || name == "subtitles"
+            || name.starts_with("subtitles") =>
+        {
+            "subtitles".to_string()
+        }
         _ => normalized,
+    }
+}
+
+pub fn canonical_studio_name(name: &str) -> &str {
+    match normalize_studio_name(name).as_str() {
+        "fanvoxua" => "FanVoxUA",
+        "clankaizoku" => "Клан Кайзоку",
+        "subtitles" => "Субтитри",
+        _ => name,
     }
 }
 
@@ -3125,6 +3142,8 @@ mod tests {
 
     #[test]
     fn known_fanwox_typo_is_deduplicated_as_fanvox() {
+        assert_eq!(canonical_studio_name("FanWoxUa"), "FanVoxUA");
+
         let sources = EpisodeSourcesResponse {
             ashdi: vec![AshdiStudio {
                 id: 1,
@@ -3145,6 +3164,48 @@ mod tests {
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].studio_name(), "FanVoxUA");
         assert!(!choices[0].is_moonanime());
+    }
+
+    #[test]
+    fn transliterated_k_on_sources_are_deduplicated() {
+        let sources = EpisodeSourcesResponse {
+            ashdi: vec![
+                AshdiStudio {
+                    id: 1,
+                    studio_name: "Клан Кайзоку".to_string(),
+                    season_number: 2,
+                    episodes: Vec::new(),
+                    episodes_count: 10,
+                },
+                AshdiStudio {
+                    id: 2,
+                    studio_name: "Субтитри".to_string(),
+                    season_number: 2,
+                    episodes: Vec::new(),
+                    episodes_count: 26,
+                },
+            ],
+            moonanime: vec![
+                MoonAnimeSourceMarker {
+                    studio_name: "Clan Kaizoku".to_string(),
+                    season_number: 2,
+                    episodes_count: 16,
+                    episodes: Vec::new(),
+                },
+                MoonAnimeSourceMarker {
+                    studio_name: "Субтитри Clan Kaizoku".to_string(),
+                    season_number: 2,
+                    episodes_count: 16,
+                    episodes: Vec::new(),
+                },
+            ],
+        };
+
+        let choices = dubbing_choices_for_sources(&sources, 2);
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].studio_name(), "Клан Кайзоку");
+        assert_eq!(choices[1].studio_name(), "Субтитри");
+        assert!(choices.iter().all(|choice| !choice.is_moonanime()));
     }
 
     #[test]

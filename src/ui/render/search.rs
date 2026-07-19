@@ -401,7 +401,7 @@ fn render_sidebar_details_area(
             if !studios.is_empty() {
                 let s = studios
                     .iter()
-                    .map(|s| s.name.as_str())
+                    .map(|s| canonical_studio_name(&s.name))
                     .collect::<Vec<_>>()
                     .join(", ");
                 text.push(Line::from(vec![
@@ -479,7 +479,7 @@ fn render_sidebar_details_area(
                     if !studios.is_empty() {
                         let s = studios
                             .iter()
-                            .map(|s| s.name.as_str())
+                            .map(|s| canonical_studio_name(&s.name))
                             .collect::<Vec<_>>()
                             .join(", ");
                         text.push(Line::from(vec![
@@ -728,8 +728,8 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                     let count = app.dubbing_choices_for_season(sn).len();
                     let year_str = season_year(app, sn).map(|y| y.to_string());
                     let mut metadata = year_str.into_iter().collect::<Vec<_>>();
-                    if count > 1 {
-                        metadata.push(format!("{count} озвучок"));
+                    if count > 0 {
+                        metadata.push(dubbing_count_label(count));
                     }
                     let label = label_with_metadata(&format!("Сезон {sn}"), &metadata);
                     let marker = season_marker_for_search(app, sn);

@@ -13,6 +13,7 @@ use crate::storage::{AnimeStatus, LibraryReleaseKind};
 use crate::ui::app::{
     AppMode, AppState, FocusPanel, LibraryFilter, LibrarySort, PrimaryTab, SearchSort,
     SettingsChoiceKind, SettingsInput, SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
+    canonical_studio_name,
 };
 
 mod library;
@@ -918,6 +919,17 @@ fn season_count_label(count: usize) -> String {
         "сезони"
     } else {
         "сезонів"
+    };
+    format!("{count} {suffix}")
+}
+
+fn dubbing_count_label(count: usize) -> String {
+    let suffix = if count % 10 == 1 && count % 100 != 11 {
+        "озвучка"
+    } else if (2..=4).contains(&(count % 10)) && !(12..=14).contains(&(count % 100)) {
+        "озвучки"
+    } else {
+        "озвучок"
     };
     format!("{count} {suffix}")
 }
@@ -2224,6 +2236,15 @@ mod tests {
             ),
             "Клас убивць [2 сезони · 22 сер.]"
         );
+    }
+
+    #[test]
+    fn dubbing_count_uses_ukrainian_pluralization() {
+        assert_eq!(dubbing_count_label(1), "1 озвучка");
+        assert_eq!(dubbing_count_label(2), "2 озвучки");
+        assert_eq!(dubbing_count_label(5), "5 озвучок");
+        assert_eq!(dubbing_count_label(11), "11 озвучок");
+        assert_eq!(dubbing_count_label(22), "22 озвучки");
     }
 
     #[test]
