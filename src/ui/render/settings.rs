@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn render(f: &mut Frame, app: &AppState, area: Rect) {
-    match app.settings_tab {
+    match app.settings_ui.tab {
         SettingsTab::General => render_general_settings(f, app, area),
         SettingsTab::Themes => render_theme_settings(f, app, area),
         SettingsTab::About => render_about_settings(f, app, area),
@@ -83,7 +83,7 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
     ];
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(
-        app.settings_selected.min(items.len().saturating_sub(1)),
+        app.settings_ui.selected.min(items.len().saturating_sub(1)),
     ));
     let list = List::new(items)
         .block(block)
@@ -167,8 +167,8 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
         ]))
     }));
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(theme_settings_display_row(app.settings_selected)));
-    let disabled_theme_selected = mode == ColorMode::AniHubRgb && app.settings_selected >= 3;
+    state.select(Some(theme_settings_display_row(app.settings_ui.selected)));
+    let disabled_theme_selected = mode == ColorMode::AniHubRgb && app.settings_ui.selected >= 3;
     let highlight_style = if disabled_theme_selected {
         Style::default()
             .fg(color_dim())
@@ -185,7 +185,7 @@ fn render_theme_settings(f: &mut Frame, app: &AppState, area: Rect) {
         &mut state,
     );
 
-    let hovered_theme = selected_theme_preview(app.settings_selected);
+    let hovered_theme = selected_theme_preview(app.settings_ui.selected);
     let preview_theme = hovered_theme.unwrap_or(app.settings.theme);
     let preview_mode = if hovered_theme.is_some() && mode == ColorMode::AniHubRgb {
         ColorMode::Ansi256
@@ -299,7 +299,7 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
         settings_item("Очистити бібліотеку", "", action_width),
     ];
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(app.settings_selected.min(actions.len() - 1)));
+    state.select(Some(app.settings_ui.selected.min(actions.len() - 1)));
     f.render_stateful_widget(
         List::new(actions)
             .block(
@@ -374,12 +374,12 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
         Line::from(vec![
             Span::styled("mpv: ", Style::default().fg(color_dim())),
             Span::styled(
-                if app.mpv_available {
+                if app.settings_ui.mpv_available {
                     "знайдено"
                 } else {
                     "не знайдено"
                 },
-                Style::default().fg(if app.mpv_available {
+                Style::default().fg(if app.settings_ui.mpv_available {
                     color_success()
                 } else {
                     color_error()
@@ -387,7 +387,7 @@ fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
             ),
             Span::styled(" · image: ", Style::default().fg(color_dim())),
             Span::styled(
-                app.image_protocol.clone(),
+                app.settings_ui.image_protocol.clone(),
                 Style::default().fg(color_text()),
             ),
         ]),
@@ -430,7 +430,7 @@ fn threshold_bar(percent: Option<u8>, width: usize) -> String {
 }
 
 pub(super) fn render_choice_popup(f: &mut Frame, app: &AppState) {
-    let Some(editor) = app.settings_choice.as_ref() else {
+    let Some(editor) = app.settings_ui.choice.as_ref() else {
         return;
     };
     let labels = editor.kind.option_labels();
@@ -494,7 +494,7 @@ pub(super) fn render_choice_popup(f: &mut Frame, app: &AppState) {
 }
 
 pub(super) fn render_text_popup(f: &mut Frame, app: &AppState) {
-    let Some(kind) = app.settings_input else {
+    let Some(kind) = app.settings_ui.input else {
         return;
     };
     let (title, hint) = match kind {
@@ -527,10 +527,10 @@ pub(super) fn render_text_popup(f: &mut Frame, app: &AppState) {
         layout[0],
     );
 
-    let value = if app.settings_input_value.is_empty() {
+    let value = if app.settings_ui.input_value.is_empty() {
         " ".to_string()
     } else {
-        app.settings_input_value.clone()
+        app.settings_ui.input_value.clone()
     };
     let field = Block::default()
         .borders(Borders::ALL)
@@ -549,7 +549,8 @@ pub(super) fn render_text_popup(f: &mut Frame, app: &AppState) {
     );
     #[allow(clippy::cast_possible_truncation)]
     f.set_cursor_position((
-        field_inner.x + (app.settings_input_cursor as u16).min(field_inner.width.saturating_sub(1)),
+        field_inner.x
+            + (app.settings_ui.input_cursor as u16).min(field_inner.width.saturating_sub(1)),
         field_inner.y,
     ));
 
@@ -589,7 +590,8 @@ pub(super) fn render_update_popup(f: &mut Frame, app: &AppState) {
         layout[0],
     );
 
-    let (body, actions): (Vec<Line>, Vec<(&str, &str, Color)>) = match &app.update_state {
+    let (body, actions): (Vec<Line>, Vec<(&str, &str, Color)>) = match &app.settings_ui.update_state
+    {
         UpdateState::Checking | UpdateState::Idle => (
             vec![
                 Line::from(""),
@@ -671,7 +673,7 @@ pub(super) fn render_update_popup(f: &mut Frame, app: &AppState) {
 }
 
 pub(super) fn render_threshold_popup(f: &mut Frame, app: &AppState) {
-    let Some(editor) = app.settings_threshold.as_ref() else {
+    let Some(editor) = app.settings_ui.threshold.as_ref() else {
         return;
     };
     let actions = [("Enter", "OK", color_highlight()), ("Esc", "", color_dim())];

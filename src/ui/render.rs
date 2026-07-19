@@ -411,13 +411,13 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         library::render_watched_confirmation(f, app);
     } else if app.library.clear_confirmation {
         render_clear_library_popup(f);
-    } else if app.settings_update_popup {
+    } else if app.settings_ui.update_popup {
         settings::render_update_popup(f, app);
-    } else if app.settings_input.is_some() {
+    } else if app.settings_ui.input.is_some() {
         settings::render_text_popup(f, app);
-    } else if app.settings_threshold.is_some() {
+    } else if app.settings_ui.threshold.is_some() {
         settings::render_threshold_popup(f, app);
-    } else if app.settings_choice.is_some() {
+    } else if app.settings_ui.choice.is_some() {
         settings::render_choice_popup(f, app);
     } else if let Some((_, anime_title)) = app.library.pending_delete_confirmation.clone() {
         render_delete_popup(f, &anime_title);
@@ -562,7 +562,7 @@ fn settings_tabs_context(app: &AppState) -> Line<'static> {
         if index > 0 {
             spans.push(Span::styled("  |  ", Style::default().fg(color_dim())));
         }
-        let active = tab == app.settings_tab;
+        let active = tab == app.settings_ui.tab;
         spans.push(Span::styled(
             format!(" {} ", tab.label()),
             if active {
@@ -1156,7 +1156,7 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
         .unwrap_or_else(|| {
             if let Some(activity) = &app.activity_message {
                 format!("⟳ {}", activity)
-            } else if let Some(now) = &app.now_playing {
+            } else if let Some(now) = &app.playback.now_playing {
                 let progress = if now.duration > 0.0 {
                     format!(
                         " · {}/{}",
@@ -1285,10 +1285,10 @@ fn framed_shortcuts_line(shortcuts: &str) -> Line<'static> {
 
 fn context_shortcuts(app: &AppState) -> String {
     if app.mode == AppMode::Settings {
-        if app.settings_update_popup {
+        if app.settings_ui.update_popup {
             return "Enter Дія  Esc Закрити  Ctrl+C Вихід".to_string();
         }
-        if app.settings_input.is_some() {
+        if app.settings_ui.input.is_some() {
             return "Enter Зберегти  Esc Скасувати  Ctrl+C Вихід".to_string();
         }
         return "↑↓ Вибір  Space Змінити  Enter Дія  Tab Вкладка  Esc Назад".to_string();

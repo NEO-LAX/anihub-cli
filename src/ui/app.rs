@@ -24,8 +24,12 @@ use std::time::{Duration, Instant};
 mod input;
 mod library_actions;
 mod library_navigation;
+mod playback_ui;
 mod search_actions;
 mod settings_ui;
+
+use playback_ui::PlaybackUiState;
+use settings_ui::SettingsUiState;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppMode {
@@ -598,22 +602,9 @@ pub struct AppState {
     pub status_editor: Option<AnimeStatusEditor>,
 
     pub settings: Settings,
-    pub settings_tab: SettingsTab,
-    pub settings_selected: usize,
-    pub settings_input: Option<SettingsInput>,
-    pub settings_input_value: String,
-    pub settings_input_cursor: usize,
-    pub settings_choice: Option<SettingsChoiceEditor>,
-    pub settings_threshold: Option<SettingsThresholdEditor>,
-    /// Centered popup for the GitHub update check flow.
-    pub settings_update_popup: bool,
+    pub(crate) settings_ui: SettingsUiState,
     pub settings_store: SettingsStore,
     pub metadata_cache: MetadataCache,
-    pub mpv_available: bool,
-    pub image_protocol: String,
-    pub update_state: UpdateState,
-    pub update_check_requested: bool,
-    pub discord_config_changed: bool,
 
     pub should_quit: bool,
     pub api_client: ApiClient,
@@ -621,8 +612,7 @@ pub struct AppState {
     pub history: AppHistory,
     pub loading: bool,
     pub activity_message: Option<String>,
-    pub play_episode: bool,
-    pub continue_request: Option<ContinueRequest>,
+    pub(crate) playback: PlaybackUiState,
     pub status_message: Option<(String, StatusKind)>,
     pub status_expires_at: Option<Instant>,
     pub status_retry_available: bool,
@@ -630,8 +620,6 @@ pub struct AppState {
     pub show_help: bool,
     /// (display title, direct MoonAnime iframe URL)
     pub moonanime_browser_prompt: Option<(String, String)>,
-
-    pub now_playing: Option<NowPlaying>,
 
     // Кеші ресурсів
     pub details_cache: moka::sync::Cache<u32, AnimeDetails>,
@@ -723,21 +711,9 @@ impl AppState {
             status_editor: None,
 
             settings,
-            settings_tab: SettingsTab::General,
-            settings_selected: 0,
-            settings_input: None,
-            settings_input_value: String::new(),
-            settings_input_cursor: 0,
-            settings_choice: None,
-            settings_threshold: None,
-            settings_update_popup: false,
+            settings_ui: SettingsUiState::new(mpv_available, image_protocol.into()),
             settings_store,
             metadata_cache,
-            mpv_available,
-            image_protocol: image_protocol.into(),
-            update_state: UpdateState::Idle,
-            update_check_requested: false,
-            discord_config_changed: false,
 
             should_quit: false,
             api_client: ApiClient::new()?,
@@ -745,16 +721,13 @@ impl AppState {
             history,
             loading: false,
             activity_message: None,
-            play_episode: false,
-            continue_request: None,
+            playback: PlaybackUiState::default(),
             status_message: None,
             status_expires_at: None,
             status_retry_available: false,
             retry_requested: false,
             show_help: false,
             moonanime_browser_prompt: None,
-
-            now_playing: None,
 
             details_cache,
             sources_cache: moka::sync::Cache::builder().max_capacity(100).build(),
@@ -1173,12 +1146,7 @@ impl AppState {
         self.library.clear_confirmation = false;
         self.moonanime_browser_prompt = None;
         self.library.search_editing = false;
-        self.settings_input = None;
-        self.settings_input_value.clear();
-        self.settings_input_cursor = 0;
-        self.settings_choice = None;
-        self.settings_threshold = None;
-        self.settings_update_popup = false;
+        self.settings_ui.close_editors();
         // Leaving search-edit must not require Esc first when the user
         // deliberately picks another primary tab (including via Alt/Ctrl).
         if self.mode == AppMode::SearchInput {
@@ -1215,15 +1183,15 @@ impl AppState {
     }
 
     pub fn take_update_check_request(&mut self) -> bool {
-        std::mem::take(&mut self.update_check_requested)
+        std::mem::take(&mut self.settings_ui.update_check_requested)
     }
 
     pub fn take_discord_config_changed(&mut self) -> bool {
-        std::mem::take(&mut self.discord_config_changed)
+        std::mem::take(&mut self.settings_ui.discord_config_changed)
     }
 
     pub fn finish_update_check(&mut self, result: anyhow::Result<UpdateCheck>) {
-        self.update_state = match result {
+        self.settings_ui.update_state = match result {
             Ok(update) if update.update_available => UpdateState::Available(update),
             Ok(update) => UpdateState::Current(update.latest_version),
             Err(error) => UpdateState::Failed(error.to_string()),
@@ -2082,7 +2050,7 @@ impl AppState {
 
     fn activate_selected_episode(&mut self) {
         if !self.prompt_selected_moonanime_episode() {
-            self.play_episode = true;
+            self.playback.play_requested = true;
         }
     }
 
@@ -2675,7 +2643,7 @@ impl AppState {
             "Підготовка потоку · S{}E{}…",
             target.season, target.episode
         ));
-        self.now_playing = Some(NowPlaying {
+        self.playback.now_playing = Some(NowPlaying {
             anime_id: target.anime_id,
             anime_title: target.anime_title.clone(),
             season: target.season,
@@ -2712,7 +2680,7 @@ impl AppState {
     }
 
     fn request_continue(&mut self) {
-        self.continue_request = match self.mode {
+        self.playback.continue_request = match self.mode {
             AppMode::Library
             | AppMode::LibrarySeason
             | AppMode::LibraryDubbing

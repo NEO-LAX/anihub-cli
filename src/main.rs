@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
             }
         }
         let playback_events = playback.drain_events();
-        let previous_now_playing = app.now_playing.clone();
+        let previous_now_playing = app.playback.now_playing.clone();
         let mut presence_immediate = false;
         for event in playback_events {
             presence_immediate |= matches!(
@@ -186,22 +186,23 @@ async fn main() -> Result<()> {
         }
         // Duration often arrives only after the first progress snapshot — push
         // immediately so Discord can switch from elapsed-only to a full bar.
-        presence_immediate |=
-            duration_became_known(previous_now_playing.as_ref(), app.now_playing.as_ref())
-                || episode_identity_changed(
-                    previous_now_playing.as_ref(),
-                    app.now_playing.as_ref(),
-                );
+        presence_immediate |= duration_became_known(
+            previous_now_playing.as_ref(),
+            app.playback.now_playing.as_ref(),
+        ) || episode_identity_changed(
+            previous_now_playing.as_ref(),
+            app.playback.now_playing.as_ref(),
+        );
         let presence_due = app.settings.discord_presence
-            && app.now_playing.is_some()
+            && app.playback.now_playing.is_some()
             && last_discord_sync.elapsed() >= PRESENCE_SYNC_INTERVAL;
         if presence_immediate || presence_due {
             sync_discord_presence(&app, &discord_presence);
             last_discord_sync = Instant::now();
         }
 
-        if app.play_episode {
-            app.play_episode = false;
+        if app.playback.play_requested {
+            app.playback.play_requested = false;
             if let Some(target) = selected_play_target(&app) {
                 let mut timeline = build_active_playback_timeline(&app, &target);
                 if let Err(error) = apply_playback_settings(&app, &mut timeline) {
@@ -214,7 +215,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        if let Some(request) = app.continue_request.take() {
+        if let Some(request) = app.playback.continue_request.take() {
             resources.request_continue(&mut app, request).await;
         }
 
@@ -255,7 +256,7 @@ fn sync_discord_presence(app: &AppState, discord: &DiscordPresence) {
         discord.clear();
         return;
     }
-    let Some(now) = &app.now_playing else {
+    let Some(now) = &app.playback.now_playing else {
         discord.update(PresenceActivity::idle());
         return;
     };
@@ -352,7 +353,7 @@ fn persist_playback_event(
     match event {
         PlaybackEvent::SessionStarted { session_id, target } => {
             app.clear_activity();
-            app.now_playing = Some(ui::app::NowPlaying {
+            app.playback.now_playing = Some(ui::app::NowPlaying {
                 anime_id: target.anime_id,
                 anime_title: target.anime_title,
                 season: target.season,
@@ -367,7 +368,7 @@ fn persist_playback_event(
             persisted_positions.insert(session_id, target.start_time.unwrap_or(0.0));
         }
         PlaybackEvent::ProgressSnapshot(snapshot) => {
-            if let Some(now_playing) = app.now_playing.as_mut() {
+            if let Some(now_playing) = app.playback.now_playing.as_mut() {
                 if now_playing.season == snapshot.identity.season
                     && now_playing.episode == snapshot.identity.episode
                     && now_playing.studio_name == snapshot.identity.studio_name
@@ -412,7 +413,7 @@ fn persist_playback_event(
             position,
             ..
         } => {
-            if let Some(now_playing) = app.now_playing.as_mut()
+            if let Some(now_playing) = app.playback.now_playing.as_mut()
                 && now_playing.anime_id == identity.anime_id
                 && now_playing.season == identity.season
                 && now_playing.episode == identity.episode
@@ -425,7 +426,7 @@ fn persist_playback_event(
             }
         }
         PlaybackEvent::MarkWatched(mark) => {
-            if let Some(now_playing) = app.now_playing.as_mut() {
+            if let Some(now_playing) = app.playback.now_playing.as_mut() {
                 now_playing.position = mark.position;
                 now_playing.duration = mark.duration;
             }
@@ -450,7 +451,7 @@ fn persist_playback_event(
         }
         PlaybackEvent::SessionStopped { session_id } => {
             persisted_positions.remove(&session_id);
-            app.now_playing = None;
+            app.playback.now_playing = None;
             app.clear_activity();
         }
         PlaybackEvent::Error { message, .. } => {
