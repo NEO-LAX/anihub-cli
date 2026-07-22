@@ -140,6 +140,22 @@ bash -s -- uninstall --purge  # wipe all user data
 
 Default path: `~/.local/bin` · override with `ANIHUB_INSTALL_DIR`.
 
+### Arch Linux (AUR)
+
+Install the prebuilt release binary:
+
+```bash
+paru -S anihub-cli-bin
+# or: yay -S anihub-cli-bin
+```
+
+To build locally from source instead:
+
+```bash
+paru -S anihub-cli
+# or: yay -S anihub-cli
+```
+
 ### Nix
 
 ```bash

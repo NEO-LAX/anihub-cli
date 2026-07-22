@@ -140,6 +140,22 @@ bash -s -- uninstall --purge  # стерти всі дані
 
 Типовий шлях: `~/.local/bin` · змінити: `ANIHUB_INSTALL_DIR`.
 
+### Arch Linux (AUR)
+
+Готовий релізний бінарник:
+
+```bash
+paru -S anihub-cli-bin
+# або: yay -S anihub-cli-bin
+```
+
+Якщо хочете збирати локально з коду:
+
+```bash
+paru -S anihub-cli
+# або: yay -S anihub-cli
+```
+
 ### Nix
 
 ```bash
