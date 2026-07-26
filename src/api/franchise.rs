@@ -23,8 +23,13 @@ static PART_RE: LazyLock<Regex> = LazyLock::new(|| {
 static NUMBERED_PART_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(\d+)\s*(?:частина)\b").expect("valid numbered part regex")
 });
+/// Roman season suffixes, as in "Overlord IV". Anchored to the end of the title
+/// and case-sensitive on purpose: unanchored and case-insensitive, the bare `X`
+/// alternative also matches the separator in "Hunter x Hunter", which made that
+/// title render as season 10 — and, because the mainline counter takes the max
+/// of the seasons it has seen, would have pushed any sequel to 11 and beyond.
 static ROMAN_SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(II|III|IV|V|VI|VII|VIII|IX|X)\b").expect("valid roman season regex")
+    Regex::new(r"\b(II|III|IV|V|VI|VII|VIII|IX|X)\s*$").expect("valid roman season regex")
 });
 
 /// AniList title fields returned by the batch query.
@@ -826,6 +831,32 @@ fn catalog_sort_key(catalog: &FranchiseCatalog) -> (u32, u32, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_x_separator_in_a_title_is_not_a_roman_season() {
+        // "Hunter x Hunter" used to parse as season 10: the roman-numeral
+        // fallback was case-insensitive and unanchored, so the separator matched.
+        for title in [
+            "Hunter x Hunter",
+            "Hunter X Hunter",
+            "Hunter x Hunter (2011)",
+            "HUNTER×HUNTER (2011)",
+            "Мисливець х Мисливець",
+        ] {
+            assert_eq!(parse_season(title), None, "{title} parsed as a season");
+        }
+    }
+
+    #[test]
+    fn roman_season_suffixes_are_still_recognized() {
+        assert_eq!(parse_season("Overlord IV"), Some(4));
+        assert_eq!(parse_season("Classroom of the Elite II"), Some(2));
+        assert_eq!(parse_season("Mob Psycho 100 III"), Some(3));
+        // Trailing whitespace must not defeat the anchor.
+        assert_eq!(parse_season("Overlord IV  "), Some(4));
+        // Digit and ordinal forms keep priority over the roman fallback.
+        assert_eq!(parse_season("Vinland Saga Season 2"), Some(2));
+    }
 
     fn item(
         id: u32,

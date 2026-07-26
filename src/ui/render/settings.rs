@@ -126,56 +126,61 @@ pub(super) fn general_settings_items(
         }
     };
     let threshold = format_threshold_value(settings.watched_threshold_percent);
-    vec![
-        settings_item(
-            "Авто-продовження наступної серії",
-            on_off(settings.autoplay_next),
-            inner_width,
-        ),
-        settings_item(
-            "Resume з таймкоду",
-            on_off(settings.resume_from_timestamp),
-            inner_width,
-        ),
-        settings_item("Позначати переглянутим", &threshold, inner_width),
-        settings_item("Режим пошуку", settings.search_mode.label(), inner_width),
-        settings_item(
-            "Стартовий екран",
-            settings.start_screen.label(),
-            inner_width,
-        ),
-        settings_item(
-            "Фільтр бібліотеки за замовчуванням",
-            settings.default_library_filter.label(),
-            inner_width,
-        ),
-        settings_item(
-            "Показувати постери",
-            on_off(settings.show_posters),
-            inner_width,
-        ),
-        settings_item(
-            "Discord Rich Presence",
-            on_off(settings.discord_presence),
-            inner_width,
-        ),
-        settings_item("Якість відео", settings.stream_quality.label(), inner_width),
-        settings_item(
-            "MoonAnime у mpv (експеримент)",
-            on_off(settings.moonanime_direct_playback),
-            inner_width,
-        ),
-        settings_item("Шлях до mpv", &settings.mpv_path, inner_width),
-        settings_item(
-            "Додаткові аргументи mpv",
-            if settings.mpv_extra_args.is_empty() {
-                "—"
-            } else {
-                &settings.mpv_extra_args
-            },
-            inner_width,
-        ),
-    ]
+    GENERAL_ROWS
+        .iter()
+        .map(|row| match row {
+            GeneralRow::Section(label) => ListItem::new(Line::from(Span::styled(
+                release_section_line(label, inner_width),
+                Style::default().fg(color_dim()),
+            ))),
+            GeneralRow::Setting(setting) => {
+                let (label, value) = match setting {
+                    GeneralSetting::AutoplayNext => (
+                        "Авто-продовження наступної серії",
+                        on_off(settings.autoplay_next),
+                    ),
+                    GeneralSetting::ResumeFromTimestamp => (
+                        "Продовжувати з таймкоду",
+                        on_off(settings.resume_from_timestamp),
+                    ),
+                    GeneralSetting::WatchedThreshold => {
+                        ("Позначати переглянутим", threshold.as_str())
+                    }
+                    GeneralSetting::StreamQuality => {
+                        ("Якість відео", settings.stream_quality.label())
+                    }
+                    GeneralSetting::StartScreen => {
+                        ("Стартовий екран", settings.start_screen.label())
+                    }
+                    GeneralSetting::SearchMode => ("Режим пошуку", settings.search_mode.label()),
+                    GeneralSetting::DefaultLibraryFilter => (
+                        "Фільтр бібліотеки за замовчуванням",
+                        settings.default_library_filter.label(),
+                    ),
+                    GeneralSetting::ShowPosters => {
+                        ("Показувати постери", on_off(settings.show_posters))
+                    }
+                    GeneralSetting::DiscordPresence => {
+                        ("Discord Rich Presence", on_off(settings.discord_presence))
+                    }
+                    GeneralSetting::MoonAnimeDirectPlayback => (
+                        "MoonAnime у mpv (експеримент)",
+                        on_off(settings.moonanime_direct_playback),
+                    ),
+                    GeneralSetting::MpvPath => ("Шлях до mpv", settings.mpv_path.as_str()),
+                    GeneralSetting::MpvArgs => (
+                        "Додаткові аргументи mpv",
+                        if settings.mpv_extra_args.is_empty() {
+                            "—"
+                        } else {
+                            settings.mpv_extra_args.as_str()
+                        },
+                    ),
+                };
+                settings_item(label, value, inner_width)
+            }
+        })
+        .collect()
 }
 
 fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
@@ -188,9 +193,8 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
     let inner_width = block.inner(area).width.saturating_sub(4) as usize;
     let items = general_settings_items(&app.settings, inner_width);
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(
-        app.settings_ui.selected.min(items.len().saturating_sub(1)),
-    ));
+    // Selection counts settings; the rendered list also contains section labels.
+    state.select(Some(general_display_row(app.settings_ui.selected)));
     let list = List::new(items)
         .block(block)
         .highlight_symbol(">> ")

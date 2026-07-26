@@ -47,6 +47,9 @@ pub use library_state::{
 use playback_ui::PlaybackUiState;
 pub use search_state::{SearchOrderingState, SearchSort, SearchState};
 use settings_ui::SettingsUiState;
+pub use settings_ui::{
+    GENERAL_ROWS, GeneralRow, GeneralSetting, general_display_row, general_settings,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppMode {
@@ -154,7 +157,8 @@ impl SettingsTab {
     /// rows unreachable or activates the wrong setting.
     pub fn row_count(self) -> usize {
         match self {
-            Self::General => 12,
+            // Derived from the row table so a new row cannot desync the count.
+            Self::General => general_settings().count(),
             Self::Themes => ThemePreset::ALL.len() + 3,
             // Read-only screen: nothing to select or activate.
             Self::Stats => 0,

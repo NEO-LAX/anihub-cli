@@ -2,6 +2,74 @@
 
 use super::*;
 
+/// One row of the General tab. Sections are labels only — navigation steps over
+/// them, and because the rendered list and the activation dispatch are both
+/// derived from [`GENERAL_ROWS`], adding or reordering a row cannot silently
+/// shift which setting an index activates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneralRow {
+    Section(&'static str),
+    Setting(GeneralSetting),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneralSetting {
+    AutoplayNext,
+    ResumeFromTimestamp,
+    WatchedThreshold,
+    StreamQuality,
+    StartScreen,
+    SearchMode,
+    DefaultLibraryFilter,
+    ShowPosters,
+    DiscordPresence,
+    MoonAnimeDirectPlayback,
+    MpvPath,
+    MpvArgs,
+}
+
+pub const GENERAL_ROWS: &[GeneralRow] = &[
+    GeneralRow::Section("ВІДТВОРЕННЯ"),
+    GeneralRow::Setting(GeneralSetting::AutoplayNext),
+    GeneralRow::Setting(GeneralSetting::ResumeFromTimestamp),
+    GeneralRow::Setting(GeneralSetting::WatchedThreshold),
+    GeneralRow::Setting(GeneralSetting::StreamQuality),
+    GeneralRow::Section("ІНТЕРФЕЙС"),
+    GeneralRow::Setting(GeneralSetting::StartScreen),
+    GeneralRow::Setting(GeneralSetting::SearchMode),
+    GeneralRow::Setting(GeneralSetting::DefaultLibraryFilter),
+    GeneralRow::Setting(GeneralSetting::ShowPosters),
+    GeneralRow::Section("ІНТЕГРАЦІЇ"),
+    GeneralRow::Setting(GeneralSetting::DiscordPresence),
+    GeneralRow::Setting(GeneralSetting::MoonAnimeDirectPlayback),
+    GeneralRow::Section("ПЛЕЄР"),
+    GeneralRow::Setting(GeneralSetting::MpvPath),
+    GeneralRow::Setting(GeneralSetting::MpvArgs),
+];
+
+/// The settings in [`GENERAL_ROWS`] order — this is what selection indices mean.
+pub fn general_settings() -> impl Iterator<Item = GeneralSetting> {
+    GENERAL_ROWS.iter().filter_map(|row| match row {
+        GeneralRow::Setting(setting) => Some(*setting),
+        GeneralRow::Section(_) => None,
+    })
+}
+
+/// Maps a selected setting index onto its position in the rendered list, which
+/// also contains the section labels.
+pub fn general_display_row(selected: usize) -> usize {
+    let mut seen = 0;
+    for (display, row) in GENERAL_ROWS.iter().enumerate() {
+        if let GeneralRow::Setting(_) = row {
+            if seen == selected {
+                return display;
+            }
+            seen += 1;
+        }
+    }
+    GENERAL_ROWS.len().saturating_sub(1)
+}
+
 /// Transient settings-screen state. Persisted preferences remain in
 /// `Settings`; this struct owns selection, modal drafts and async UI signals.
 pub(crate) struct SettingsUiState {
@@ -81,39 +149,47 @@ impl AppState {
     }
 
     fn activate_general_setting(&mut self) {
-        match self.settings_ui.selected {
-            0 => {
+        let Some(setting) = general_settings().nth(self.settings_ui.selected) else {
+            return;
+        };
+        match setting {
+            GeneralSetting::AutoplayNext => {
                 self.settings.autoplay_next = !self.settings.autoplay_next;
                 self.persist_settings();
             }
-            1 => {
+            GeneralSetting::ResumeFromTimestamp => {
                 self.settings.resume_from_timestamp = !self.settings.resume_from_timestamp;
                 self.persist_settings();
             }
-            2 => self.open_settings_threshold(),
-            3 => {
+            GeneralSetting::WatchedThreshold => self.open_settings_threshold(),
+            GeneralSetting::StreamQuality => {
+                self.open_settings_choice(SettingsChoiceKind::StreamQuality);
+            }
+            GeneralSetting::StartScreen => {
+                self.open_settings_choice(SettingsChoiceKind::StartScreen);
+            }
+            GeneralSetting::SearchMode => {
                 self.settings.search_mode = self.settings.search_mode.toggled();
                 self.persist_settings();
             }
-            4 => self.open_settings_choice(SettingsChoiceKind::StartScreen),
-            5 => self.open_settings_choice(SettingsChoiceKind::LibraryFilter),
-            6 => {
+            GeneralSetting::DefaultLibraryFilter => {
+                self.open_settings_choice(SettingsChoiceKind::LibraryFilter);
+            }
+            GeneralSetting::ShowPosters => {
                 self.toggle_poster_setting();
                 self.persist_settings();
             }
-            7 => {
+            GeneralSetting::DiscordPresence => {
                 self.settings.discord_presence = !self.settings.discord_presence;
                 self.settings_ui.discord_config_changed = true;
                 self.persist_settings();
             }
-            8 => self.open_settings_choice(SettingsChoiceKind::StreamQuality),
-            9 => {
+            GeneralSetting::MoonAnimeDirectPlayback => {
                 self.settings.moonanime_direct_playback = !self.settings.moonanime_direct_playback;
                 self.persist_settings();
             }
-            10 => self.open_settings_text(SettingsInput::MpvPath),
-            11 => self.open_settings_text(SettingsInput::MpvArgs),
-            _ => {}
+            GeneralSetting::MpvPath => self.open_settings_text(SettingsInput::MpvPath),
+            GeneralSetting::MpvArgs => self.open_settings_text(SettingsInput::MpvArgs),
         }
     }
 

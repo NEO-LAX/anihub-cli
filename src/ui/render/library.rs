@@ -343,7 +343,7 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                         format!(" · {title}")
                     };
                     let label = format!("Серія {}{}", episode.episode_number(), suffix);
-                    let mut metadata = vec!["браузер".to_string()];
+                    let mut metadata = moonanime_episode_metadata(app);
                     if anime_id.zip(season).is_some_and(|(anime_id, season)| {
                         episode_is_watched(app, anime_id, season, episode.episode_number())
                     }) {

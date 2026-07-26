@@ -12,14 +12,16 @@ use crate::api;
 use crate::settings::{ColorMode, SurfaceMode, ThemePreset};
 use crate::storage::{AnimeStatus, LibraryReleaseKind};
 use crate::ui::app::{
-    AppMode, AppState, FocusPanel, LibraryFilter, LibrarySort, PrimaryTab, SearchSort,
-    SettingsChoiceKind, SettingsInput, SettingsTab, StatusKind, THRESHOLD_BAR_WIDTH, UpdateState,
-    canonical_studio_name,
+    AppMode, AppState, FocusPanel, GENERAL_ROWS, GeneralRow, GeneralSetting, LibraryFilter,
+    LibrarySort, PrimaryTab, SearchSort, SettingsChoiceKind, SettingsInput, SettingsTab,
+    StatusKind, THRESHOLD_BAR_WIDTH, UpdateState, canonical_studio_name, general_display_row,
 };
 
 mod library;
 mod search;
 mod settings;
+#[cfg(test)]
+use crate::ui::app::general_settings;
 #[cfg(test)]
 use settings::{
     about_settings_items, format_watch_time, general_settings_items, selected_theme_preview,
@@ -950,10 +952,7 @@ fn context_shortcuts(app: &AppState) -> String {
                 "Enter Далі  Space Переглянуто  e Статус  Esc Назад".to_string()
             }
             AppMode::LibraryEpisode => {
-                if app
-                    .selected_dubbing_choice()
-                    .is_some_and(|choice| choice.is_moonanime())
-                {
+                if selected_episode_opens_in_browser(app) {
                     "Enter Embed  e Статус  Esc Назад".to_string()
                 } else {
                     "Enter Відтворити  Space Переглянуто  Backspace Таймкод  e Статус".to_string()
@@ -975,15 +974,36 @@ fn context_shortcuts(app: &AppState) -> String {
             "Enter Далі  Space Переглянуто  e Статус  i Опис  Esc Назад".to_string()
         }
         FocusPanel::EpisodeList => {
-            if app
-                .selected_dubbing_choice()
-                .is_some_and(|choice| choice.is_moonanime())
-            {
+            if selected_episode_opens_in_browser(app) {
                 "Enter Embed  e Статус  Esc Назад".to_string()
             } else {
                 "Enter Відтворити  Space Переглянуто  Backspace Таймкод  e Статус".to_string()
             }
         }
+    }
+}
+
+/// Whether activating the selected episode hands off to a browser instead of
+/// playing in mpv. With MoonAnime direct playback enabled nothing does, so the
+/// UI must stop advertising an embed.
+fn selected_episode_opens_in_browser(app: &AppState) -> bool {
+    !app.settings.moonanime_direct_playback
+        && app
+            .selected_dubbing_choice()
+            .is_some_and(|choice| choice.is_moonanime())
+}
+
+/// Badge for a MoonAnime episode row. Under direct playback the episode behaves
+/// like any other, so it carries no marker at all.
+fn moonanime_episode_metadata(app: &AppState) -> Vec<String> {
+    browser_badge(&app.settings)
+}
+
+fn browser_badge(settings: &crate::settings::Settings) -> Vec<String> {
+    if settings.moonanime_direct_playback {
+        Vec::new()
+    } else {
+        vec!["браузер".to_string()]
     }
 }
 
@@ -2292,6 +2312,18 @@ mod tests {
     }
 
     #[test]
+    fn moonanime_rows_lose_the_browser_badge_under_direct_playback() {
+        let mut settings = crate::settings::Settings::default();
+
+        // Off by default: the episode really does open a browser.
+        assert!(!settings.moonanime_direct_playback);
+        assert_eq!(browser_badge(&settings), vec!["браузер".to_string()]);
+
+        settings.moonanime_direct_playback = true;
+        assert!(browser_badge(&settings).is_empty());
+    }
+
+    #[test]
     fn watch_time_drops_empty_units_and_never_shows_a_bare_zero() {
         assert_eq!(format_watch_time(0.0), "—");
         assert_eq!(format_watch_time(-5.0), "—");
@@ -2362,17 +2394,58 @@ mod tests {
 
     #[test]
     fn settings_row_counts_match_the_rendered_rows() {
-        // Row counts drive both keyboard navigation and which index each
-        // `activate_*_setting` arm handles. If a row is added to one side only,
-        // it becomes unreachable or shifts every action below it.
-        assert_eq!(
-            general_settings_items(&crate::settings::Settings::default(), 60).len(),
-            SettingsTab::General.row_count()
-        );
+        // Row counts drive keyboard navigation and which activate_* arm fires.
+        // The General list also renders section labels, so its count must track
+        // the settings only.
+        let rendered = general_settings_items(&crate::settings::Settings::default(), 60);
+        let sections = GENERAL_ROWS
+            .iter()
+            .filter(|row| matches!(row, GeneralRow::Section(_)))
+            .count();
+        assert!(sections > 0, "the whole point is grouped sections");
+        assert_eq!(rendered.len() - sections, SettingsTab::General.row_count());
         assert_eq!(
             about_settings_items(60).len(),
             SettingsTab::About.row_count()
         );
+    }
+
+    #[test]
+    fn every_general_setting_is_reachable_and_maps_to_its_own_row() {
+        let count = SettingsTab::General.row_count();
+        let rows = (0..count).map(general_display_row).collect::<Vec<_>>();
+
+        // No two settings may resolve to the same rendered row, and none may
+        // land on a section label.
+        let mut sorted = rows.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), count, "duplicate display rows in {rows:?}");
+        for row in &rows {
+            assert!(
+                matches!(GENERAL_ROWS[*row], GeneralRow::Setting(_)),
+                "index maps onto a section label at {row}"
+            );
+        }
+        // Selection order must follow the table order.
+        assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn the_moonanime_toggle_sits_under_integrations() {
+        // Grouping is the user-visible point of the table; pin one row so a
+        // careless move is caught.
+        let index = general_settings()
+            .position(|setting| setting == GeneralSetting::MoonAnimeDirectPlayback)
+            .expect("MoonAnime setting is listed");
+        let preceding_section = GENERAL_ROWS[..general_display_row(index)]
+            .iter()
+            .rev()
+            .find_map(|row| match row {
+                GeneralRow::Section(label) => Some(*label),
+                GeneralRow::Setting(_) => None,
+            });
+        assert_eq!(preceding_section, Some("ІНТЕГРАЦІЇ"));
     }
 
     #[test]
