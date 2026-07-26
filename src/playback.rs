@@ -167,17 +167,22 @@ fn play_target_cache_key(target: &PlayTarget) -> String {
 #[derive(Clone, Debug)]
 struct CachedStreamUrl {
     url: String,
+    /// Signed like the manifest, so they expire together and must be cached
+    /// with it rather than re-derived later.
+    subtitle_urls: Vec<String>,
     inserted_at: Instant,
 }
 
+/// Returns the cached stream URL together with its subtitle tracks; they are
+/// signed as one set and expire together.
 fn fresh_cached_url(
     cache: &mut HashMap<String, CachedStreamUrl>,
     key: &str,
     now: Instant,
-) -> Option<String> {
+) -> Option<(String, Vec<String>)> {
     let entry = cache.get(key)?;
     if now.duration_since(entry.inserted_at) < STREAM_URL_CACHE_TTL {
-        return Some(entry.url.clone());
+        return Some((entry.url.clone(), entry.subtitle_urls.clone()));
     }
     cache.remove(key);
     None
@@ -392,10 +397,10 @@ pub fn selected_moonanime_play_target(app: &AppState) -> Option<PlayTarget> {
 /// Build a deterministic timeline around the selected target. The supervisor
 /// resolves the complete timeline before launching mpv.
 pub fn build_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
-    // The neighbor window is built from Ashdi studio listings, so a MoonAnime
-    // episode plays on its own rather than silently pulling in Ashdi entries.
-    if target.source != StreamSource::Ashdi {
-        return PlaybackTimeline::single(target.clone());
+    // Ashdi and MoonAnime episode listings live in separate fields, so the
+    // neighbors have to be gathered from the matching one.
+    if target.source == StreamSource::MoonAnime {
+        return build_moonanime_playback_timeline(app, target);
     }
     let Some(sources) = app.content.current_sources.as_ref() else {
         return PlaybackTimeline::single(target.clone());
@@ -407,6 +412,50 @@ pub fn build_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackT
         sources,
     };
     build_release_playback_timeline(target, &[release])
+}
+
+/// Timeline over every episode of the selected MoonAnime dubbing, so the native
+/// mpv playlist window and autoplay behave the same as they do for Ashdi. The
+/// episode list, including each embed URL, already arrives with the sources —
+/// only the stream behind each URL is resolved lazily at play time.
+fn build_moonanime_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
+    let Some(sources) = app.content.current_sources.as_ref() else {
+        return PlaybackTimeline::single(target.clone());
+    };
+    moonanime_timeline_from_sources(sources, target)
+}
+
+fn moonanime_timeline_from_sources(
+    sources: &EpisodeSourcesResponse,
+    target: &PlayTarget,
+) -> PlaybackTimeline {
+    let Some(marker) = sources.moonanime.iter().find(|marker| {
+        marker.season_number == target.season && marker.studio_name == target.studio_name
+    }) else {
+        return PlaybackTimeline::single(target.clone());
+    };
+
+    let mut episodes = marker.episodes.iter().collect::<Vec<_>>();
+    episodes.sort_by_key(|episode| episode.episode_number);
+    let entries = episodes
+        .into_iter()
+        .map(|episode| {
+            let generated = PlayTarget {
+                episode: episode.episode_number,
+                episode_title: format!("Серія {}", episode.episode_number),
+                stream_page_url: episode.iframe_url.clone(),
+                // Only the selected episode carries a resume position.
+                start_time: None,
+                ..target.clone()
+            };
+            if same_episode(&generated, target) {
+                target.clone()
+            } else {
+                generated
+            }
+        })
+        .collect::<Vec<_>>();
+    PlaybackTimeline::from_entries(entries, target)
 }
 
 /// Build bidirectional targets across an ordered list of distinct releases.
@@ -1654,8 +1703,8 @@ const PLAYLIST_NEIGHBOR_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-entry mpv options for a given source. Ashdi needs nothing beyond the
 /// referrer that every entry already carries.
-fn source_extra_args(source: StreamSource) -> Vec<String> {
-    match source {
+fn source_extra_args(source: StreamSource, subtitle_urls: &[String]) -> Vec<String> {
+    let mut args = match source {
         StreamSource::Ashdi => Vec::new(),
         StreamSource::MoonAnime => vec![
             // `-append` rather than assigning the list: mpv splits
@@ -1669,7 +1718,18 @@ fn source_extra_args(source: StreamSource) -> Vec<String> {
             // and quietly overrides the quality preference.
             "--no-ytdl".to_string(),
         ],
+    };
+    if !subtitle_urls.is_empty() {
+        for url in subtitle_urls {
+            // `--sub-file` is only a CLI alias for this; spell out the real
+            // option so the append semantics are explicit.
+            args.push(format!("--sub-files-append={url}"));
+        }
+        // These are a dub's full-text and signs tracks. Attaching them without
+        // selecting one keeps today's behaviour; `j` in mpv cycles them.
+        args.push("--sid=no".to_string());
     }
+    args
 }
 
 async fn resolve_playlist_entry(
@@ -1680,53 +1740,56 @@ async fn resolve_playlist_entry(
     url_cache: Arc<Mutex<HashMap<String, CachedStreamUrl>>>,
 ) -> Result<MpvPlaylistEntry> {
     let cache_key = play_target_cache_key(&target);
-    let cached_url = {
+    let cached = {
         let mut cache = url_cache.lock().await;
         fresh_cached_url(&mut cache, &cache_key, Instant::now())
     };
-    if let Some(url) = cached_url {
-        return Ok(MpvPlaylistEntry {
-            media_url: url,
-            title: format!("{} - {}", target.player_title, target.episode_title),
-            start_time: target.start_time,
-            referrer: target.referrer,
-            extra_args: source_extra_args(target.source),
-        });
-    }
-
-    let url = tokio::select! {
-        _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
-        result = async {
-            match target.source {
-                StreamSource::Ashdi => parser.extract_m3u8(&target.stream_page_url).await,
-                StreamSource::MoonAnime => {
-                    moonanime.extract_manifest(&target.stream_page_url).await
+    let resolved = match cached {
+        Some(cached) => cached,
+        None => {
+            let resolved = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow!("playlist resolution cancelled"));
                 }
-            }
-        } => result
-            .map_err(|error| anyhow!(
-                "не вдалося отримати S{}E{}: {error}",
-                target.season,
-                target.episode
-            ))?,
+                result = async {
+                    match target.source {
+                        StreamSource::Ashdi => parser
+                            .extract_m3u8(&target.stream_page_url)
+                            .await
+                            .map(|url| (url, Vec::new())),
+                        StreamSource::MoonAnime => moonanime
+                            .extract_stream(&target.stream_page_url)
+                            .await
+                            .map(|stream| (stream.manifest_url, stream.subtitle_urls)),
+                    }
+                } => result
+                    .map_err(|error| anyhow!(
+                        "не вдалося отримати S{}E{}: {error}",
+                        target.season,
+                        target.episode
+                    ))?,
+            };
+            let now = Instant::now();
+            let mut cache = url_cache.lock().await;
+            cache.retain(|_, entry| now.duration_since(entry.inserted_at) < STREAM_URL_CACHE_TTL);
+            cache.insert(
+                cache_key,
+                CachedStreamUrl {
+                    url: resolved.0.clone(),
+                    subtitle_urls: resolved.1.clone(),
+                    inserted_at: now,
+                },
+            );
+            resolved
+        }
     };
-    let now = Instant::now();
-    let mut cache = url_cache.lock().await;
-    cache.retain(|_, entry| now.duration_since(entry.inserted_at) < STREAM_URL_CACHE_TTL);
-    cache.insert(
-        cache_key,
-        CachedStreamUrl {
-            url: url.clone(),
-            inserted_at: now,
-        },
-    );
-    drop(cache);
+
     Ok(MpvPlaylistEntry {
-        media_url: url,
+        media_url: resolved.0,
         title: format!("{} - {}", target.player_title, target.episode_title),
         start_time: target.start_time,
         referrer: target.referrer,
-        extra_args: source_extra_args(target.source),
+        extra_args: source_extra_args(target.source, &resolved.1),
     })
 }
 
@@ -1867,6 +1930,112 @@ mod supervisor_tests {
         }
     }
 
+    fn moonanime_sources(season: u32, episodes: &[u32]) -> EpisodeSourcesResponse {
+        EpisodeSourcesResponse {
+            ashdi: Vec::new(),
+            moonanime: vec![api::MoonAnimeSourceMarker {
+                studio_name: "dub".to_string(),
+                season_number: season,
+                episodes_count: episodes.len() as u32,
+                episodes: episodes
+                    .iter()
+                    .map(|episode| api::MoonAnimeBrowserEpisode {
+                        episode_number: *episode,
+                        display_episode_number: None,
+                        title: format!("Episode {episode}"),
+                        iframe_url: format!("https://moonanime.art/iframe/s{season}e{episode}/"),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn moonanime_target(episode: u32, start_time: Option<f64>) -> PlayTarget {
+        PlayTarget {
+            stream_page_url: format!("https://moonanime.art/iframe/s1e{episode}/"),
+            referrer: "https://moonanime.art/".to_string(),
+            source: StreamSource::MoonAnime,
+            ..target(episode, start_time)
+        }
+    }
+
+    #[test]
+    fn moonanime_timeline_covers_every_episode_of_the_selected_dubbing() {
+        // The whole point: neighbors exist, so mpv gets a real playlist and
+        // autoplay works instead of the episode playing alone.
+        let sources = moonanime_sources(1, &[1, 2, 3, 4, 5]);
+        let timeline = moonanime_timeline_from_sources(&sources, &moonanime_target(3, None));
+
+        assert_eq!(timeline.entries.len(), 5);
+        assert_eq!(timeline.current_index, 2);
+        assert_eq!(
+            timeline
+                .entries
+                .iter()
+                .map(|entry| entry.episode)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // Every entry must carry an embed URL, never an Ashdi player page.
+        assert!(
+            timeline
+                .entries
+                .iter()
+                .all(|entry| entry.source == StreamSource::MoonAnime
+                    && entry.stream_page_url.contains("moonanime.art/iframe/"))
+        );
+    }
+
+    #[test]
+    fn moonanime_timeline_keeps_resume_on_the_selected_episode_only() {
+        let sources = moonanime_sources(1, &[1, 2, 3]);
+        let timeline = moonanime_timeline_from_sources(&sources, &moonanime_target(2, Some(310.0)));
+
+        assert_eq!(timeline.current().start_time, Some(310.0));
+        assert!(
+            timeline
+                .entries
+                .iter()
+                .filter(|entry| entry.episode != 2)
+                .all(|entry| entry.start_time.is_none())
+        );
+    }
+
+    #[test]
+    fn moonanime_timeline_sorts_out_of_order_episode_lists() {
+        let sources = moonanime_sources(1, &[3, 1, 5, 2]);
+        let timeline = moonanime_timeline_from_sources(&sources, &moonanime_target(5, None));
+
+        assert_eq!(
+            timeline
+                .entries
+                .iter()
+                .map(|entry| entry.episode)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+        );
+        assert_eq!(timeline.current().episode, 5);
+    }
+
+    #[test]
+    fn moonanime_timeline_falls_back_to_a_single_entry_when_the_dubbing_is_absent() {
+        // Neither another studio nor another season may be mistaken for this one.
+        let mut other_studio = moonanime_sources(1, &[1, 2, 3]);
+        other_studio.moonanime[0].studio_name = "someone else".to_string();
+        let timeline =
+            moonanime_timeline_from_sources(&other_studio, &moonanime_target(2, Some(12.0)));
+        assert_eq!(timeline.entries.len(), 1);
+        assert_eq!(timeline.current().start_time, Some(12.0));
+
+        let other_season = moonanime_sources(2, &[1, 2, 3]);
+        assert_eq!(
+            moonanime_timeline_from_sources(&other_season, &moonanime_target(2, None))
+                .entries
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn playlist_window_keeps_twelve_behind_and_ahead() {
         // 12 behind + current + 12 ahead = 25 when not clipped.
@@ -1962,6 +2131,9 @@ mod supervisor_tests {
                 "fresh".to_string(),
                 CachedStreamUrl {
                     url: "https://cdn.test/fresh.m3u8".to_string(),
+                    // Subtitles are signed with the manifest, so they have to
+                    // come back out of the cache alongside it.
+                    subtitle_urls: vec!["https://cdn.test/full.vtt".to_string()],
                     inserted_at: now - Duration::from_secs(30),
                 },
             ),
@@ -1969,13 +2141,17 @@ mod supervisor_tests {
                 "stale".to_string(),
                 CachedStreamUrl {
                     url: "https://cdn.test/stale.m3u8".to_string(),
+                    subtitle_urls: Vec::new(),
                     inserted_at: now - STREAM_URL_CACHE_TTL - Duration::from_secs(1),
                 },
             ),
         ]);
         assert_eq!(
-            fresh_cached_url(&mut cache, "fresh", now).as_deref(),
-            Some("https://cdn.test/fresh.m3u8")
+            fresh_cached_url(&mut cache, "fresh", now),
+            Some((
+                "https://cdn.test/fresh.m3u8".to_string(),
+                vec!["https://cdn.test/full.vtt".to_string()]
+            ))
         );
         assert_eq!(fresh_cached_url(&mut cache, "stale", now), None);
         assert!(!cache.contains_key("stale"));

@@ -991,6 +991,35 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_tracks_are_attached_without_being_switched_on() {
+        let endpoint = IpcEndpoint::for_session(97);
+        let entry = MpvPlaylistEntry {
+            media_url: "https://s.moonanime.art/a/manifest.m3u8".to_string(),
+            title: "Anime - Ep 1".to_string(),
+            start_time: None,
+            referrer: "https://moonanime.art/".to_string(),
+            extra_args: vec![
+                "--sub-files-append=https://s.moonanime.art/full.vtt".to_string(),
+                "--sub-files-append=https://s.moonanime.art/signs.vtt".to_string(),
+                "--sid=no".to_string(),
+            ],
+        };
+        let args = build_mpv_args(&endpoint, std::slice::from_ref(&entry), 0, &[]);
+
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.starts_with("--sub-files-append="))
+                .count(),
+            2
+        );
+        // Attached but not selected: a dub should not gain subtitles by surprise.
+        assert!(args.iter().any(|arg| arg == "--sid=no"));
+        // Verified against mpv: `--sub-file` is merely a CLI alias for
+        // `--sub-files-append`, and `--sub-file-append` does not exist at all.
+        assert!(!args.iter().any(|arg| arg.starts_with("--sub-file-append=")));
+    }
+
+    #[test]
     fn entries_without_extra_options_emit_none() {
         let endpoint = IpcEndpoint::for_session(98);
         let entry = MpvPlaylistEntry {

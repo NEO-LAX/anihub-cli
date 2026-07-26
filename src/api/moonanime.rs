@@ -43,6 +43,11 @@ static RE_INNER_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"var\s+k\s*=\s*"([^"]+)""#).unwrap());
 static RE_FILE_FIELD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"file\s*:\s*_0xd\("([^"]+)"\)"#).unwrap());
+static RE_SUBTITLE_FIELD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"subtitle\s*:\s*_0xd\("([^"]+)"\)"#).unwrap());
+/// The subtitle field is a comma-separated `[label]url` list.
+static RE_SUBTITLE_TRACK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]*)\]([^,]+)").unwrap());
 
 /// Undoes layer 1: `cipher[0]` seeds the state, `cipher[1..33]` is the key.
 fn rolling_xor(cipher: &[u8]) -> Option<Vec<u8>> {
@@ -87,28 +92,50 @@ fn decode_field(script: &str, field: &Regex) -> Option<String> {
     String::from_utf8(xor_with_key(&raw, key.as_bytes())?).ok()
 }
 
-/// Rejects anything that is not an HLS playlist served by MoonAnime, so a
-/// changed page layout cannot turn into an arbitrary URL handed to mpv.
-fn validate_manifest_url(candidate: &str) -> Option<String> {
-    let url = reqwest::Url::parse(candidate).ok()?;
+/// Rejects anything that is not the expected kind of file served by MoonAnime,
+/// so a changed page layout cannot turn into an arbitrary URL handed to mpv.
+fn validate_url(candidate: &str, extension: &str) -> Option<String> {
+    let url = reqwest::Url::parse(candidate.trim()).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
-    if !url.path().ends_with(".m3u8") {
+    if !url.path().ends_with(extension) {
         return None;
     }
     let host = url.host_str()?;
     if host != "moonanime.art" && !host.ends_with(".moonanime.art") {
         return None;
     }
-    Some(candidate.to_string())
+    Some(candidate.trim().to_string())
 }
 
-/// Extracts the master playlist URL from a MoonAnime embed page.
-pub fn extract_manifest_url(html: &str) -> Option<String> {
+/// What a MoonAnime embed yields once decoded.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MoonAnimeStream {
+    pub manifest_url: String,
+    /// External WebVTT tracks, full subtitles first as the page orders them.
+    /// Labels are dropped: mpv cannot name external subtitle files from the
+    /// command line, so only the order carries meaning.
+    pub subtitle_urls: Vec<String>,
+}
+
+fn parse_subtitle_tracks(field: &str) -> Vec<String> {
+    RE_SUBTITLE_TRACK
+        .captures_iter(field)
+        .filter_map(|track| validate_url(track.get(2)?.as_str(), ".vtt"))
+        .collect()
+}
+
+/// Extracts the master playlist and any external subtitles from an embed page.
+pub fn extract_stream(html: &str) -> Option<MoonAnimeStream> {
     let script = decode_player_script(html)?;
-    let candidate = decode_field(&script, &RE_FILE_FIELD)?;
-    validate_manifest_url(&candidate)
+    let manifest_url = validate_url(&decode_field(&script, &RE_FILE_FIELD)?, ".m3u8")?;
+    Some(MoonAnimeStream {
+        manifest_url,
+        subtitle_urls: decode_field(&script, &RE_SUBTITLE_FIELD)
+            .map(|field| parse_subtitle_tracks(&field))
+            .unwrap_or_default(),
+    })
 }
 
 pub struct MoonAnimeParser {
@@ -125,7 +152,7 @@ impl MoonAnimeParser {
         Ok(Self { client })
     }
 
-    pub async fn extract_manifest(&self, iframe_url: &str) -> Result<String> {
+    pub async fn extract_stream(&self, iframe_url: &str) -> Result<MoonAnimeStream> {
         let response = self
             .client
             .get(iframe_url)
@@ -143,7 +170,7 @@ impl MoonAnimeParser {
             .await
             .context("Failed to read the MoonAnime embed page")?;
 
-        extract_manifest_url(&html).context(
+        extract_stream(&html).context(
             "Could not decode a stream URL from the MoonAnime embed \
              (the page layout may have changed)",
         )
@@ -157,10 +184,19 @@ mod tests {
     /// Builds a page in the same shape MoonAnime serves, so the decoder is
     /// exercised end to end without committing a real signed URL.
     fn obfuscated_page(manifest: &str, inner_key: &str) -> String {
-        let payload =
-            BASE64.encode(xor_with_key(manifest.as_bytes(), inner_key.as_bytes()).unwrap());
+        page_with_subtitles(manifest, inner_key, None)
+    }
+
+    fn page_with_subtitles(manifest: &str, inner_key: &str, subtitle: Option<&str>) -> String {
+        let encode = |text: &str| {
+            BASE64.encode(xor_with_key(text.as_bytes(), inner_key.as_bytes()).unwrap())
+        };
+        let subtitle_field = subtitle
+            .map(|field| format!(r#", subtitle: _0xd("{}")"#, encode(field)))
+            .unwrap_or_default();
         let script = format!(
-            r#"function _0xd(e){{var k="{inner_key}";}} var player = {{ file: _0xd("{payload}") }};"#
+            r#"function _0xd(e){{var k="{inner_key}";}} var player = {{ file: _0xd("{}"){subtitle_field} }};"#,
+            encode(manifest)
         );
 
         // Re-apply layer 1: pick a seed and key, then walk the plaintext.
@@ -189,7 +225,10 @@ mod tests {
     #[test]
     fn decodes_a_stream_url_through_both_obfuscation_layers() {
         let page = obfuscated_page(MANIFEST, "Ox7YCNNPwP8J");
-        assert_eq!(extract_manifest_url(&page).as_deref(), Some(MANIFEST));
+        assert_eq!(
+            extract_stream(&page).map(|s| s.manifest_url).as_deref(),
+            Some(MANIFEST)
+        );
     }
 
     #[test]
@@ -203,11 +242,54 @@ mod tests {
         ] {
             let page = obfuscated_page(MANIFEST, key);
             assert_eq!(
-                extract_manifest_url(&page).as_deref(),
+                extract_stream(&page).map(|s| s.manifest_url).as_deref(),
                 Some(MANIFEST),
                 "failed for inner key {key}"
             );
         }
+    }
+
+    #[test]
+    fn decodes_subtitle_tracks_in_page_order() {
+        let field = "[Повні UKR]https://s.moonanime.art/subtitles/full.vtt?expires=1&sig=a,\
+                     [ukr Написи]https://s.moonanime.art/subtitles/signs.vtt?expires=1&sig=b";
+        let page = page_with_subtitles(MANIFEST, "Ox7YCNNPwP8J", Some(field));
+        let stream = extract_stream(&page).unwrap();
+
+        assert_eq!(stream.manifest_url, MANIFEST);
+        assert_eq!(
+            stream.subtitle_urls,
+            vec![
+                "https://s.moonanime.art/subtitles/full.vtt?expires=1&sig=a".to_string(),
+                "https://s.moonanime.art/subtitles/signs.vtt?expires=1&sig=b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_page_without_subtitles_still_yields_the_stream() {
+        let stream = extract_stream(&obfuscated_page(MANIFEST, "Ox7YCNNPwP8J")).unwrap();
+        assert_eq!(stream.manifest_url, MANIFEST);
+        assert!(stream.subtitle_urls.is_empty());
+    }
+
+    #[test]
+    fn subtitle_tracks_are_filtered_to_moonanime_vtt_files() {
+        assert_eq!(
+            parse_subtitle_tracks(
+                "[a]https://evil.example/x.vtt,\
+                 [b]https://s.moonanime.art/y.exe,\
+                 [c]https://s.moonanime.art/ok.vtt,\
+                 [d]javascript:alert(1)//z.vtt"
+            ),
+            vec!["https://s.moonanime.art/ok.vtt".to_string()]
+        );
+        assert!(parse_subtitle_tracks("").is_empty());
+        // Missing labels must not drop an otherwise valid track.
+        assert_eq!(
+            parse_subtitle_tracks("[]https://s.moonanime.art/ok.vtt"),
+            vec!["https://s.moonanime.art/ok.vtt".to_string()]
+        );
     }
 
     #[test]
@@ -224,7 +306,7 @@ mod tests {
         ] {
             let page = obfuscated_page(candidate, "Ox7YCNNPwP8J");
             assert_eq!(
-                extract_manifest_url(&page),
+                extract_stream(&page).map(|s| s.manifest_url),
                 None,
                 "should have rejected {candidate}"
             );
@@ -233,13 +315,13 @@ mod tests {
 
     #[test]
     fn a_page_without_the_expected_shape_decodes_to_nothing() {
-        assert_eq!(extract_manifest_url("<html>no player here</html>"), None);
+        assert!(extract_stream("<html>no player here</html>").is_none());
         // Blob present but not valid base64 of a long enough payload.
-        assert_eq!(
-            extract_manifest_url(
+        assert!(
+            extract_stream(
                 r#"<script>atob("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=")</script>"#
-            ),
-            None
+            )
+            .is_none()
         );
     }
 

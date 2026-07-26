@@ -328,6 +328,11 @@ fn apply_playback_settings(app: &AppState, timeline: &mut PlaybackTimeline) -> R
 }
 
 fn build_active_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
+    // The cross-release window below is assembled from Ashdi listings only, so a
+    // MoonAnime target would fall through it and lose its neighbors.
+    if target.source == playback::StreamSource::MoonAnime {
+        return build_playback_timeline(app, target);
+    }
     let Some(catalog) = app.selected_franchise_catalog() else {
         return build_playback_timeline(app, target);
     };
