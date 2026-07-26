@@ -27,6 +27,7 @@ fn handle_search_results_key(app: &mut AppState, key: KeyCode) {
         KeyCode::Char('e') => app.open_status_editor(),
         KeyCode::Char('s') => app.open_search_sort_popup(),
         KeyCode::Char('o') => app.open_in_browser(),
+        KeyCode::Char('i') => app.open_synopsis(),
         KeyCode::Char('l') => app.open_library(),
         KeyCode::Esc => app.handle_esc(),
         KeyCode::Char('/') => {
@@ -96,6 +97,7 @@ fn handle_library_key(app: &mut AppState, key: KeyCode) {
         }
         (_, KeyCode::Char('e')) => app.open_status_editor(),
         (_, KeyCode::Char('o')) => app.open_in_browser(),
+        (_, KeyCode::Char('i')) => app.open_synopsis(),
         (_, KeyCode::Char('/')) => app.open_library_search(),
         (_, KeyCode::Tab) => app.cycle_library_filter(false),
         (_, KeyCode::BackTab) => app.cycle_library_filter(true),

@@ -1,7 +1,6 @@
 //! Library tab renderers.
 
 use super::*;
-use chrono::{Local, TimeZone};
 
 pub(super) fn render_sidebar(f: &mut Frame, app: &mut AppState, area: Rect) {
     let block = Block::default()
@@ -227,7 +226,9 @@ pub(super) fn render_lists(f: &mut Frame, app: &mut AppState, area: Rect) {
                 if let Some(label) = new_content_label(&app.settings, release) {
                     metadata.push(label);
                 }
-                if let Some(next_airing) = next_airing_label(release) {
+                if let Some(next_airing) =
+                    next_airing_label(release.next_airing_episode, release.next_airing_at)
+                {
                     metadata.push(next_airing);
                 }
                 let release_label = match release.kind {
@@ -690,20 +691,6 @@ fn new_episode_label(count: u32) -> Option<String> {
     }
 }
 
-fn next_airing_label(release: &crate::ui::app::LibrarySeasonEntry) -> Option<String> {
-    next_airing_label_at(release, chrono::Utc::now().timestamp())
-}
-
-fn next_airing_label_at(release: &crate::ui::app::LibrarySeasonEntry, now: i64) -> Option<String> {
-    let episode = release.next_airing_episode?;
-    let airing_at = release.next_airing_at?;
-    if airing_at <= now {
-        return None;
-    }
-    let local = Local.timestamp_opt(airing_at, 0).single()?;
-    Some(format!("далі E{episode} · {}", local.format("%d.%m %H:%M")))
-}
-
 fn render_library_sidebar_title_area(f: &mut Frame, app: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(details) = &app.content.current_details {
@@ -927,8 +914,14 @@ mod tests {
     #[test]
     fn future_airing_is_rendered_but_expired_airing_is_hidden() {
         let release = ongoing_release();
-        assert!(next_airing_label_at(&release, 1_000).is_some());
-        assert!(next_airing_label_at(&release, 2_000).is_none());
+        assert!(
+            next_airing_label_at(release.next_airing_episode, release.next_airing_at, 1_000)
+                .is_some()
+        );
+        assert!(
+            next_airing_label_at(release.next_airing_episode, release.next_airing_at, 2_000)
+                .is_none()
+        );
     }
 
     #[test]

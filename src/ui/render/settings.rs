@@ -6,8 +6,102 @@ pub(super) fn render(f: &mut Frame, app: &AppState, area: Rect) {
     match app.settings_ui.tab {
         SettingsTab::General => render_general_settings(f, app, area),
         SettingsTab::Themes => render_theme_settings(f, app, area),
+        SettingsTab::Stats => render_stats_settings(f, app, area),
         SettingsTab::About => render_about_settings(f, app, area),
     }
+}
+
+/// Renders a watch-time total as `12 д 4 год 30 хв`, dropping empty leading
+/// units so short totals stay readable.
+pub(super) fn format_watch_time(seconds: f64) -> String {
+    let total_minutes = (seconds.max(0.0) / 60.0).round() as u64;
+    if total_minutes == 0 {
+        return "—".to_string();
+    }
+    let days = total_minutes / (24 * 60);
+    let hours = (total_minutes % (24 * 60)) / 60;
+    let minutes = total_minutes % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days} д"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours} год"));
+    }
+    if minutes > 0 && days == 0 {
+        parts.push(format!("{minutes} хв"));
+    }
+    parts.join(" ")
+}
+
+pub(super) fn stats_rows(stats: &crate::storage::LibraryStats) -> Vec<(String, String)> {
+    let mut rows = vec![
+        ("Тайтлів у бібліотеці".to_string(), stats.titles.to_string()),
+        (
+            "Серій переглянуто".to_string(),
+            stats.episodes_watched.to_string(),
+        ),
+    ];
+
+    let watch_time = format_watch_time(stats.watch_seconds);
+    rows.push((
+        "Час перегляду".to_string(),
+        if stats.estimated_episodes > 0 {
+            // Never present a guess as a measurement.
+            format!("≈ {watch_time}")
+        } else {
+            watch_time
+        },
+    ));
+    if stats.estimated_episodes > 0 {
+        rows.push((
+            "  з них оцінено".to_string(),
+            format!("{} сер. без тривалості", stats.estimated_episodes),
+        ));
+    }
+
+    let completed = stats
+        .by_status
+        .iter()
+        .find(|(status, _)| *status == AnimeStatus::Completed)
+        .map_or(0, |(_, count)| *count);
+    if let Some(percent) = (completed * 100).checked_div(stats.titles) {
+        rows.push(("Завершено".to_string(), format!("{percent}%")));
+    }
+
+    for (status, count) in &stats.by_status {
+        if *count > 0 && *status != AnimeStatus::NotAdded {
+            rows.push((status.label().to_string(), count.to_string()));
+        }
+    }
+    rows
+}
+
+fn render_stats_settings(f: &mut Frame, app: &AppState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color_highlight()))
+        .title(" Статистика ")
+        .title_alignment(Alignment::Center)
+        .padding(Padding::horizontal(2));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let stats = crate::storage::library_stats(&app.history, app.settings.watched_threshold_percent);
+    if stats.titles == 0 && stats.episodes_watched == 0 {
+        render_centered_sidebar_message(f, inner, "Ще немає що показати — подивись щось :)");
+        return;
+    }
+
+    let width = inner.width.saturating_sub(2) as usize;
+    let lines = stats_rows(&stats)
+        .into_iter()
+        .map(|(label, value)| {
+            Line::from(with_right_marker(&label, &value, width))
+                .style(Style::default().fg(color_text()))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn settings_item(label: &str, value: &str, width: usize) -> ListItem<'static> {
@@ -15,6 +109,73 @@ fn settings_item(label: &str, value: &str, width: usize) -> ListItem<'static> {
     let label_width = width.saturating_sub(value_width + 3).max(8);
     let label = truncate_with_ellipsis(label, label_width);
     ListItem::new(with_right_marker(&label, value, width))
+}
+
+/// Row order here defines the indices handled by
+/// `AppState::activate_general_setting` and counted by
+/// `SettingsTab::row_count`; all three must be changed together.
+pub(super) fn general_settings_items(
+    settings: &crate::settings::Settings,
+    inner_width: usize,
+) -> Vec<ListItem<'static>> {
+    let on_off = |enabled| {
+        if enabled {
+            "увімкнено"
+        } else {
+            "вимкнено"
+        }
+    };
+    let threshold = format_threshold_value(settings.watched_threshold_percent);
+    vec![
+        settings_item(
+            "Авто-продовження наступної серії",
+            on_off(settings.autoplay_next),
+            inner_width,
+        ),
+        settings_item(
+            "Resume з таймкоду",
+            on_off(settings.resume_from_timestamp),
+            inner_width,
+        ),
+        settings_item("Позначати переглянутим", &threshold, inner_width),
+        settings_item("Режим пошуку", settings.search_mode.label(), inner_width),
+        settings_item(
+            "Стартовий екран",
+            settings.start_screen.label(),
+            inner_width,
+        ),
+        settings_item(
+            "Фільтр бібліотеки за замовчуванням",
+            settings.default_library_filter.label(),
+            inner_width,
+        ),
+        settings_item(
+            "Показувати постери",
+            on_off(settings.show_posters),
+            inner_width,
+        ),
+        settings_item(
+            "Discord Rich Presence",
+            on_off(settings.discord_presence),
+            inner_width,
+        ),
+        settings_item("Якість відео", settings.stream_quality.label(), inner_width),
+        settings_item(
+            "MoonAnime у mpv (експеримент)",
+            on_off(settings.moonanime_direct_playback),
+            inner_width,
+        ),
+        settings_item("Шлях до mpv", &settings.mpv_path, inner_width),
+        settings_item(
+            "Додаткові аргументи mpv",
+            if settings.mpv_extra_args.is_empty() {
+                "—"
+            } else {
+                &settings.mpv_extra_args
+            },
+            inner_width,
+        ),
+    ]
 }
 
 fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
@@ -25,62 +186,7 @@ fn render_general_settings(f: &mut Frame, app: &AppState, area: Rect) {
         .title_alignment(Alignment::Center)
         .padding(Padding::horizontal(2));
     let inner_width = block.inner(area).width.saturating_sub(4) as usize;
-    let on_off = |enabled| {
-        if enabled {
-            "увімкнено"
-        } else {
-            "вимкнено"
-        }
-    };
-    let threshold = format_threshold_value(app.settings.watched_threshold_percent);
-    let items = vec![
-        settings_item(
-            "Авто-продовження наступної серії",
-            on_off(app.settings.autoplay_next),
-            inner_width,
-        ),
-        settings_item(
-            "Resume з таймкоду",
-            on_off(app.settings.resume_from_timestamp),
-            inner_width,
-        ),
-        settings_item("Позначати переглянутим", &threshold, inner_width),
-        settings_item(
-            "Режим пошуку",
-            app.settings.search_mode.label(),
-            inner_width,
-        ),
-        settings_item(
-            "Стартовий екран",
-            app.settings.start_screen.label(),
-            inner_width,
-        ),
-        settings_item(
-            "Фільтр бібліотеки за замовчуванням",
-            app.settings.default_library_filter.label(),
-            inner_width,
-        ),
-        settings_item(
-            "Показувати постери",
-            on_off(app.settings.show_posters),
-            inner_width,
-        ),
-        settings_item(
-            "Discord Rich Presence",
-            on_off(app.settings.discord_presence),
-            inner_width,
-        ),
-        settings_item("Шлях до mpv", &app.settings.mpv_path, inner_width),
-        settings_item(
-            "Додаткові аргументи mpv",
-            if app.settings.mpv_extra_args.is_empty() {
-                "—"
-            } else {
-                &app.settings.mpv_extra_args
-            },
-            inner_width,
-        ),
-    ];
+    let items = general_settings_items(&app.settings, inner_width);
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(
         app.settings_ui.selected.min(items.len().saturating_sub(1)),
@@ -285,19 +391,28 @@ pub(super) fn selected_theme_preview(selected_row: usize) -> Option<ThemePreset>
         .and_then(|index| ThemePreset::ALL.get(index).copied())
 }
 
-fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(5)])
-        .split(area);
-    let action_width = chunks[0].width.saturating_sub(8) as usize;
-    let actions = vec![
+/// Row order here defines the indices handled by
+/// `AppState::activate_about_setting` and counted by `SettingsTab::row_count`.
+/// The `Length` constraint of the actions block must also leave room for every
+/// row, or the last one is silently clipped.
+pub(super) fn about_settings_items(action_width: usize) -> Vec<ListItem<'static>> {
+    vec![
         settings_item("Тека даних", "", action_width),
+        settings_item("Експортувати бібліотеку (JSON)", "", action_width),
         settings_item("GitHub", "", action_width),
         settings_item("Перевірити оновлення", "", action_width),
         settings_item("Очистити кеш постерів", "", action_width),
         settings_item("Очистити бібліотеку", "", action_width),
-    ];
+    ]
+}
+
+fn render_about_settings(f: &mut Frame, app: &AppState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(5)])
+        .split(area);
+    let action_width = chunks[0].width.saturating_sub(8) as usize;
+    let actions = about_settings_items(action_width);
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(app.settings_ui.selected.min(actions.len() - 1)));
     f.render_stateful_widget(
@@ -444,6 +559,7 @@ pub(super) fn render_choice_popup(f: &mut Frame, app: &AppState) {
     let min_width = match editor.kind {
         SettingsChoiceKind::StartScreen => 36,
         SettingsChoiceKind::LibraryFilter => 40,
+        SettingsChoiceKind::StreamQuality => 36,
     };
     let area = centered_fixed(f.area(), dialog_width_for(min_width, &actions), height);
     let block = dialog_block(editor.kind.title(), color_primary(), color_secondary());

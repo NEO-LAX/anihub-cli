@@ -2,6 +2,7 @@ pub mod client;
 pub mod franchise;
 pub mod grouper;
 pub mod models;
+pub mod moonanime;
 pub mod parser;
 pub mod resource;
 
@@ -12,6 +13,7 @@ pub use franchise::{
 };
 pub use grouper::{deduplicate_anime, franchise_display_name};
 pub use models::*;
+pub use moonanime::MoonAnimeParser;
 pub use parser::AshdiParser;
 pub use resource::{
     RequestId, ResourceEvent, ResourceKey, ResourceValue, ResourceWorker, ResourceWorkerRuntime,

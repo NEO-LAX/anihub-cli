@@ -1,4 +1,5 @@
 use crate::platform;
+use crate::settings::StreamQuality;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -581,15 +582,28 @@ impl Default for MpvLaunchSettings {
 
 static MPV_LAUNCH_SETTINGS: OnceLock<RwLock<MpvLaunchSettings>> = OnceLock::new();
 
-pub fn configure_mpv(path: &str, extra_args: &str) -> Result<()> {
+/// Merges the quality preference with the user's own mpv arguments. The
+/// preference goes first so an explicit `--hls-bitrate` among the user's
+/// arguments still wins — mpv honors the last occurrence of an option.
+fn launch_extra_args(extra_args: &str, quality: StreamQuality) -> Result<Vec<String>> {
     let parsed = shell_words::split(extra_args).context("Invalid additional mpv arguments")?;
+    Ok(quality
+        .mpv_arg()
+        .map(ToString::to_string)
+        .into_iter()
+        .chain(parsed)
+        .collect())
+}
+
+pub fn configure_mpv(path: &str, extra_args: &str, quality: StreamQuality) -> Result<()> {
+    let extra_args = launch_extra_args(extra_args, quality)?;
     let settings = MpvLaunchSettings {
         path: if path.trim().is_empty() {
             "mpv".to_string()
         } else {
             path.trim().to_string()
         },
-        extra_args: parsed,
+        extra_args,
     };
     *MPV_LAUNCH_SETTINGS
         .get_or_init(|| RwLock::new(MpvLaunchSettings::default()))
@@ -614,6 +628,11 @@ pub struct MpvPlaylistEntry {
     pub title: String,
     pub start_time: Option<f64>,
     pub referrer: String,
+    /// Per-entry mpv options. MoonAnime needs an `Accept-Language` header (its
+    /// CDN answers 400 without one) and `--no-ytdl`, since the manifest is
+    /// already resolved and mpv's ytdl hook would otherwise re-resolve it into a
+    /// single lower-quality variant.
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -675,6 +694,7 @@ pub fn build_mpv_args(
         args.push("--{".to_string());
         args.push(format!("--force-media-title={}", entry.title));
         args.push(format!("--referrer={}", entry.referrer));
+        args.extend(entry.extra_args.iter().cloned());
         if let Some(start_time) = entry
             .start_time
             .filter(|time| time.is_finite() && *time > 0.0)
@@ -934,6 +954,125 @@ mod tests {
     #[cfg(unix)]
     use tokio::net::UnixListener;
 
+    #[test]
+    fn per_entry_options_land_inside_the_entry_block() {
+        let endpoint = IpcEndpoint::for_session(99);
+        let entry = MpvPlaylistEntry {
+            media_url: "https://s.moonanime.art/a/manifest.m3u8".to_string(),
+            title: "Anime - Ep 1".to_string(),
+            start_time: None,
+            referrer: "https://moonanime.art/".to_string(),
+            extra_args: vec![
+                "--http-header-fields-append=Accept-Language: uk".to_string(),
+                "--no-ytdl".to_string(),
+            ],
+        };
+        let args = build_mpv_args(&endpoint, std::slice::from_ref(&entry), 0, &[]);
+
+        // `-append` rather than `=`: mpv splits the plain form on commas.
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--http-header-fields-append=Accept-Language: uk"),
+            "missing header arg in {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--http-header-fields="))
+        );
+        // The header must sit inside the entry's own `--{ ... --}` block.
+        let open = args.iter().position(|arg| arg == "--{").unwrap();
+        let close = args.iter().position(|arg| arg == "--}").unwrap();
+        let header = args
+            .iter()
+            .position(|arg| arg.starts_with("--http-header-fields-append="))
+            .unwrap();
+        assert!(open < header && header < close);
+    }
+
+    #[test]
+    fn subtitle_tracks_are_attached_without_being_switched_on() {
+        let endpoint = IpcEndpoint::for_session(97);
+        let entry = MpvPlaylistEntry {
+            media_url: "https://s.moonanime.art/a/manifest.m3u8".to_string(),
+            title: "Anime - Ep 1".to_string(),
+            start_time: None,
+            referrer: "https://moonanime.art/".to_string(),
+            extra_args: vec![
+                "--sub-files-append=https://s.moonanime.art/full.vtt".to_string(),
+                "--sub-files-append=https://s.moonanime.art/signs.vtt".to_string(),
+                "--sid=no".to_string(),
+            ],
+        };
+        let args = build_mpv_args(&endpoint, std::slice::from_ref(&entry), 0, &[]);
+
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.starts_with("--sub-files-append="))
+                .count(),
+            2
+        );
+        // Attached but not selected: a dub should not gain subtitles by surprise.
+        assert!(args.iter().any(|arg| arg == "--sid=no"));
+        // Verified against mpv: `--sub-file` is merely a CLI alias for
+        // `--sub-files-append`, and `--sub-file-append` does not exist at all.
+        assert!(!args.iter().any(|arg| arg.starts_with("--sub-file-append=")));
+    }
+
+    #[test]
+    fn entries_without_extra_options_emit_none() {
+        let endpoint = IpcEndpoint::for_session(98);
+        let entry = MpvPlaylistEntry {
+            media_url: "https://ashdi.vip/a/index.m3u8".to_string(),
+            title: "Anime - Ep 1".to_string(),
+            start_time: None,
+            referrer: "https://ashdi.vip/".to_string(),
+            extra_args: Vec::new(),
+        };
+        let args = build_mpv_args(&endpoint, std::slice::from_ref(&entry), 0, &[]);
+
+        assert!(!args.iter().any(|arg| arg.contains("http-header-fields")));
+        assert!(!args.iter().any(|arg| arg == "--no-ytdl"));
+    }
+
+    #[test]
+    fn auto_quality_adds_no_mpv_argument() {
+        assert_eq!(
+            launch_extra_args("--hwdec=auto", StreamQuality::Auto).unwrap(),
+            vec!["--hwdec=auto".to_string()]
+        );
+        assert!(
+            launch_extra_args("", StreamQuality::Auto)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quality_preference_precedes_user_arguments_so_they_can_override_it() {
+        assert_eq!(
+            launch_extra_args("--fs", StreamQuality::Min).unwrap(),
+            vec!["--hls-bitrate=min".to_string(), "--fs".to_string()]
+        );
+
+        // A user who spells the option out themselves must still win, which
+        // only holds if theirs comes last.
+        let args = launch_extra_args("--hls-bitrate=1500000", StreamQuality::Max).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--hls-bitrate=max".to_string(),
+                "--hls-bitrate=1500000".to_string()
+            ]
+        );
+        assert_eq!(args.last().unwrap(), "--hls-bitrate=1500000");
+    }
+
+    #[test]
+    fn malformed_user_arguments_are_reported_rather_than_dropped() {
+        assert!(launch_extra_args("--title=\"unclosed", StreamQuality::Max).is_err());
+    }
+
     #[cfg(unix)]
     async fn run_fake_playlist_server(
         listener: UnixListener,
@@ -1008,6 +1147,7 @@ mod tests {
             title: format!("Anime - Ep {episode}"),
             start_time: None,
             referrer: "https://ref.test/".to_string(),
+            extra_args: Vec::new(),
         }
     }
 
@@ -1028,18 +1168,21 @@ mod tests {
                 title: "Anime - Ep 1".to_string(),
                 start_time: None,
                 referrer: "https://ref.test/".to_string(),
+                extra_args: Vec::new(),
             },
             MpvPlaylistEntry {
                 media_url: "https://media.test/2.m3u8".to_string(),
                 title: "Anime - Ep 2".to_string(),
                 start_time: Some(42.0),
                 referrer: "https://ref.test/".to_string(),
+                extra_args: Vec::new(),
             },
             MpvPlaylistEntry {
                 media_url: "https://media.test/3.m3u8".to_string(),
                 title: "Anime - Ep 3".to_string(),
                 start_time: None,
                 referrer: "https://ref.test/".to_string(),
+                extra_args: Vec::new(),
             },
         ];
         let args = build_mpv_args(&endpoint, &entries, 1, &["--hwdec=auto".to_string()]);
@@ -1071,6 +1214,7 @@ mod tests {
             title: "Anime - Ep 2".to_string(),
             start_time: Some(42.5),
             referrer: "https://ref.test/".to_string(),
+            extra_args: Vec::new(),
         };
         assert_eq!(
             loadfile_insert_command(&entry, 3),

@@ -212,7 +212,9 @@ async fn main() -> Result<()> {
 
         if app.playback.play_requested {
             app.playback.play_requested = false;
-            if let Some(target) = selected_play_target(&app) {
+            let selected = selected_play_target(&app)
+                .or_else(|| playback::selected_moonanime_play_target(&app));
+            if let Some(target) = selected {
                 let mut timeline = build_active_playback_timeline(&app, &target);
                 if let Err(error) = apply_playback_settings(&app, &mut timeline) {
                     app.set_error_status(format!("Помилка відтворення: {error}"));
@@ -314,7 +316,11 @@ fn episode_identity_changed(
 }
 
 fn apply_playback_settings(app: &AppState, timeline: &mut PlaybackTimeline) -> Result<()> {
-    player::configure_mpv(&app.settings.mpv_path, &app.settings.mpv_extra_args)?;
+    player::configure_mpv(
+        &app.settings.mpv_path,
+        &app.settings.mpv_extra_args,
+        app.settings.stream_quality,
+    )?;
     if !app.settings.resume_from_timestamp {
         timeline.clear_resume_positions();
     }
@@ -322,6 +328,11 @@ fn apply_playback_settings(app: &AppState, timeline: &mut PlaybackTimeline) -> R
 }
 
 fn build_active_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
+    // The cross-release window below is assembled from Ashdi listings only, so a
+    // MoonAnime target would fall through it and lose its neighbors.
+    if target.source == playback::StreamSource::MoonAnime {
+        return build_playback_timeline(app, target);
+    }
     let Some(catalog) = app.selected_franchise_catalog() else {
         return build_playback_timeline(app, target);
     };

@@ -121,6 +121,126 @@ pub struct AppHistory {
     pub library: HashMap<u32, AnimeLibraryRecord>,
 }
 
+/// File name for a library export, stamped with local time. Colons are left out
+/// so the name stays valid on Windows, and the timestamp means each export
+/// lands beside the previous ones instead of overwriting them.
+pub fn export_file_name(at: chrono::DateTime<chrono::Local>) -> String {
+    format!("anihub-library-{}.json", at.format("%Y-%m-%d_%H-%M-%S"))
+}
+
+/// Episode length assumed when nothing in the history reports a real duration.
+const FALLBACK_EPISODE_SECONDS: f64 = 24.0 * 60.0;
+
+/// Aggregate figures for the statistics screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryStats {
+    pub titles: usize,
+    /// Counts in [`AnimeStatus::ALL`] order.
+    pub by_status: Vec<(AnimeStatus, usize)>,
+    pub episodes_watched: usize,
+    pub watch_seconds: f64,
+    /// Watched episodes whose real length mpv never reported, so their share of
+    /// `watch_seconds` is an estimate. Callers should mark the total as
+    /// approximate when this is non-zero.
+    pub estimated_episodes: usize,
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[middle - 1] + values[middle]) / 2.0)
+    } else {
+        Some(values[middle])
+    }
+}
+
+/// Summarizes watch history and library composition.
+///
+/// Watch time is deliberately conservative about what it does not know: mpv
+/// only reports a duration for episodes that were actually played, so an
+/// episode marked watched with Space carries no length at all. Those are
+/// credited with the median of the durations that *are* known, scaled by the
+/// auto-watched threshold, and counted in `estimated_episodes` so the UI can
+/// admit the total is approximate.
+pub fn library_stats(history: &AppHistory, watched_threshold_percent: Option<u8>) -> LibraryStats {
+    // The progress key includes the dubbing studio, so one episode appears once
+    // per dub. Collapse to the episode and keep the largest figures, otherwise
+    // re-watching in another dub would inflate every total.
+    let mut per_episode: HashMap<(u32, u32, u32), (bool, f64, f64)> = HashMap::new();
+    for progress in history.progress.values() {
+        let entry = per_episode
+            .entry((progress.anime_id, progress.season, progress.episode))
+            .or_insert((false, 0.0, 0.0));
+        entry.0 |= progress.watched;
+        entry.1 = entry.1.max(progress.duration.max(0.0));
+        entry.2 = entry.2.max(progress.timestamp.max(0.0));
+    }
+
+    let typical = median(
+        per_episode
+            .values()
+            .map(|(_, duration, _)| *duration)
+            .filter(|duration| *duration > 0.0)
+            .collect(),
+    )
+    .unwrap_or(FALLBACK_EPISODE_SECONDS);
+    // With auto-watched disabled, "watched" is always a deliberate action, so
+    // there is nothing to discount.
+    let threshold = f64::from(watched_threshold_percent.unwrap_or(100)) / 100.0;
+
+    let mut episodes_watched = 0;
+    let mut estimated_episodes = 0;
+    let mut watch_seconds = 0.0;
+    for (watched, duration, timestamp) in per_episode.values() {
+        if !*watched {
+            // Never finished: the furthest position reached is the real figure.
+            watch_seconds += *timestamp;
+            continue;
+        }
+        episodes_watched += 1;
+        let length = if *duration > 0.0 {
+            *duration
+        } else {
+            estimated_episodes += 1;
+            typical
+        };
+        // The threshold is a floor, not a cap: someone who watched past it gets
+        // credited for the position they actually reached.
+        watch_seconds += timestamp.max(length * threshold);
+    }
+
+    LibraryStats {
+        // `NotAdded` records linger after a title is removed, and every library
+        // view filters them out (see `library_projection`). Counting them here
+        // would contradict the number shown on the library screen.
+        titles: history
+            .library
+            .values()
+            .filter(|record| record.status != AnimeStatus::NotAdded)
+            .count(),
+        by_status: AnimeStatus::ALL
+            .iter()
+            .map(|status| {
+                (
+                    *status,
+                    history
+                        .library
+                        .values()
+                        .filter(|record| record.status == *status)
+                        .count(),
+                )
+            })
+            .collect(),
+        episodes_watched,
+        watch_seconds,
+        estimated_episodes,
+    }
+}
+
 /// One watched-state change for [`StorageManager::set_episodes_watched`].
 ///
 /// A slice of these updates is applied while holding one storage lock and is
@@ -1355,6 +1475,204 @@ mod tests {
             watched,
             updated_at,
         }
+    }
+
+    fn history_with(entries: Vec<(u32, u32, u32, &str, bool, f64, f64)>) -> AppHistory {
+        let mut history = AppHistory::default();
+        for (anime_id, season, episode, studio, watched, timestamp, duration) in entries {
+            history.progress.insert(
+                StorageManager::make_progress_key(anime_id, season, episode, studio),
+                WatchProgress {
+                    anime_id,
+                    anime_title: "Test".to_string(),
+                    season,
+                    episode,
+                    studio_name: studio.to_string(),
+                    timestamp,
+                    duration,
+                    watched,
+                    updated_at: 0,
+                },
+            );
+        }
+        history
+    }
+
+    #[test]
+    fn watch_time_credits_the_real_position_when_it_is_known() {
+        // Watched to 1400s of a 1500s episode, threshold 90% (= 1350s floor).
+        // The real position wins, so nothing is estimated.
+        let history = history_with(vec![(1, 1, 1, "Dub", true, 1400.0, 1500.0)]);
+        let stats = library_stats(&history, Some(90));
+
+        assert_eq!(stats.episodes_watched, 1);
+        assert_eq!(stats.estimated_episodes, 0);
+        assert!((stats.watch_seconds - 1400.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn space_marked_episodes_are_estimated_from_the_median_known_duration() {
+        let history = history_with(vec![
+            // Two real durations → median 1500s.
+            (1, 1, 1, "Dub", true, 1500.0, 1500.0),
+            (1, 1, 2, "Dub", true, 1500.0, 1500.0),
+            // Marked watched without ever playing: no duration, no position.
+            (1, 1, 3, "Dub", true, 0.0, 0.0),
+        ]);
+        let stats = library_stats(&history, Some(90));
+
+        assert_eq!(stats.episodes_watched, 3);
+        assert_eq!(stats.estimated_episodes, 1);
+        // 1500 + 1500 + (1500 * 0.9)
+        assert!((stats.watch_seconds - 4350.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_history_with_no_durations_at_all_falls_back_to_a_fixed_estimate() {
+        let history = history_with(vec![(1, 1, 1, "Dub", true, 0.0, 0.0)]);
+        let stats = library_stats(&history, Some(90));
+
+        assert_eq!(stats.estimated_episodes, 1);
+        assert!((stats.watch_seconds - FALLBACK_EPISODE_SECONDS * 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn switching_dubs_does_not_double_count_an_episode() {
+        // Same episode under two studios must count once, not twice.
+        let history = history_with(vec![
+            (1, 1, 1, "Studio A", true, 1200.0, 1500.0),
+            (1, 1, 1, "Studio B", false, 300.0, 1500.0),
+        ]);
+        let stats = library_stats(&history, Some(90));
+
+        assert_eq!(stats.episodes_watched, 1);
+        // Largest position across both dubs, and the 1350s threshold floor.
+        assert!((stats.watch_seconds - 1350.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn unfinished_episodes_contribute_only_the_position_reached() {
+        let history = history_with(vec![(1, 1, 1, "Dub", false, 420.0, 1500.0)]);
+        let stats = library_stats(&history, Some(90));
+
+        assert_eq!(stats.episodes_watched, 0);
+        assert_eq!(stats.estimated_episodes, 0);
+        assert!((stats.watch_seconds - 420.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn disabled_threshold_credits_the_full_episode_length() {
+        // `None` means auto-watched is off, so a watched mark was deliberate.
+        let history = history_with(vec![(1, 1, 1, "Dub", true, 0.0, 1500.0)]);
+        let stats = library_stats(&history, None);
+
+        assert!((stats.watch_seconds - 1500.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn status_counts_follow_the_canonical_status_order() {
+        let mut history = AppHistory::default();
+        for (id, status) in [
+            (1, AnimeStatus::Watching),
+            (2, AnimeStatus::Completed),
+            (3, AnimeStatus::Completed),
+            (4, AnimeStatus::Dropped),
+            // Leftover from a removed title: must not inflate the total.
+            (5, AnimeStatus::NotAdded),
+        ] {
+            history.library.insert(
+                id,
+                AnimeLibraryRecord {
+                    title: format!("Title {id}"),
+                    status,
+                    updated_at: 0,
+                    release: None,
+                },
+            );
+        }
+        let stats = library_stats(&history, Some(90));
+
+        // Five records, but the `NotAdded` one is not a library title.
+        assert_eq!(stats.titles, 4);
+        assert_eq!(
+            stats.by_status,
+            AnimeStatus::ALL
+                .iter()
+                .map(|status| (
+                    *status,
+                    match status {
+                        AnimeStatus::Watching => 1,
+                        AnimeStatus::Completed => 2,
+                        AnimeStatus::Dropped => 1,
+                        AnimeStatus::NotAdded => 1,
+                        _ => 0,
+                    }
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_empty_history_reports_zeroes_rather_than_dividing_by_nothing() {
+        let stats = library_stats(&AppHistory::default(), Some(90));
+
+        assert_eq!(stats.titles, 0);
+        assert_eq!(stats.episodes_watched, 0);
+        assert_eq!(stats.estimated_episodes, 0);
+        assert!((stats.watch_seconds - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn export_file_name_is_timestamped_and_filesystem_safe() {
+        let name = export_file_name(chrono::Local::now());
+
+        assert!(name.starts_with("anihub-library-"), "got {name}");
+        assert!(name.ends_with(".json"), "got {name}");
+        // Windows rejects colons in file names, so the time must not use them.
+        assert!(!name.contains(':'), "got {name}");
+        // "YYYY-MM-DD_HH-MM-SS" between the prefix and the extension.
+        let stamp = name
+            .trim_start_matches("anihub-library-")
+            .trim_end_matches(".json");
+        assert_eq!(stamp.len(), 19, "unexpected stamp {stamp}");
+        assert_eq!(stamp.matches('_').count(), 1, "unexpected stamp {stamp}");
+    }
+
+    #[test]
+    fn exported_library_json_can_be_read_back() {
+        // `AppHistory` denies unknown fields, so an export that drifts from the
+        // struct would be unusable as an import. This pins the round trip.
+        let mut history = AppHistory::default();
+        history.progress.insert(
+            "42".to_string(),
+            progress(42, "K-On!", 1, 3, "Studio", true, 1_700),
+        );
+        history.library.insert(
+            42,
+            AnimeLibraryRecord {
+                title: "K-On!".to_string(),
+                status: AnimeStatus::Watching,
+                updated_at: 1_700,
+                // A release with some fields unset also covers the
+                // `skip_serializing_if` paths on the way back in.
+                release: Some(LibraryReleaseMetadata {
+                    title: "Сезон 1".to_string(),
+                    kind: LibraryReleaseKind::Season,
+                    season: 1,
+                    part: Some(1),
+                    episodes_count: Some(13),
+                    first_episode: Some(1),
+                    airing_status: None,
+                    next_airing_episode: None,
+                    next_airing_at: None,
+                }),
+            },
+        );
+
+        let bytes = serde_json::to_vec_pretty(&history).unwrap();
+        let restored: AppHistory = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(restored, history);
     }
 
     #[test]

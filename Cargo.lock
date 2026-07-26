@@ -55,6 +55,7 @@ name = "anihub-cli"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "crossterm",
  "directories",
