@@ -840,57 +840,113 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
             .count()
             .max(18) as u16;
 
+        let hints = framed_shortcuts_line(&context_shortcuts(app));
+        let plan = status_bar_plan(rows[1].width, brand_w, hints.width() as u16);
+        let mut constraints = Vec::new();
+        if plan.brand {
+            constraints.push(Constraint::Length(brand_w));
+        }
+        constraints.push(Constraint::Min(1));
+        if plan.spacer {
+            constraints.push(Constraint::Length(brand_w));
+        }
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(brand_w),
-                Constraint::Min(1),
-                Constraint::Length(brand_w),
-            ])
+            .constraints(constraints)
             .split(rows[1]);
+        let hints_column = usize::from(plan.brand);
 
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " ani",
-                    Style::default()
-                        .fg(color_text())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "hub",
-                    Style::default()
-                        .fg(color_primary())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "-cli",
-                    Style::default()
-                        .fg(color_text())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" | v{} ", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(color_dim()),
-                ),
-            ]))
-            .style(Style::default().bg(color_background()))
-            .alignment(Alignment::Left),
-            columns[0],
-        );
-        // Centered framed keybinds: │ Enter Далі  ·  e Статус │
-        f.render_widget(
-            Paragraph::new(framed_shortcuts_line(&context_shortcuts(app)))
+        if plan.brand {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        " ani",
+                        Style::default()
+                            .fg(color_text())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "hub",
+                        Style::default()
+                            .fg(color_primary())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "-cli",
+                        Style::default()
+                            .fg(color_text())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" | v{} ", env!("CARGO_PKG_VERSION")),
+                        Style::default().fg(color_dim()),
+                    ),
+                ]))
                 .style(Style::default().bg(color_background()))
-                .alignment(Alignment::Center),
-            columns[1],
-        );
-        // Symmetric empty side keeps the bind strip visually centered.
+                .alignment(Alignment::Left),
+                columns[0],
+            );
+        }
+        // Centered framed keybinds: │ Enter Далі  ·  e Статус │
+        let hints_area = columns[hints_column];
         f.render_widget(
-            Paragraph::new("").style(Style::default().bg(color_background())),
-            columns[2],
+            Paragraph::new(framed_shortcuts_line(&fit_shortcuts(
+                &context_shortcuts(app),
+                hints_area.width,
+            )))
+            .style(Style::default().bg(color_background()))
+            .alignment(Alignment::Center),
+            hints_area,
         );
+        if plan.spacer {
+            // Symmetric empty side keeps the bind strip visually centered.
+            f.render_widget(
+                Paragraph::new("").style(Style::default().bg(color_background())),
+                columns[hints_column + 1],
+            );
+        }
     }
+}
+
+/// Which decorations the shortcut row can afford.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StatusBarPlan {
+    brand: bool,
+    spacer: bool,
+}
+
+/// Below this the shortcut strip is not worth showing a brand next to.
+const MIN_SHORTCUTS_WIDTH: u16 = 40;
+
+/// The right-hand spacer exists only to keep the shortcut strip optically
+/// centred against the brand on the left. Both are decoration, so a narrow
+/// terminal gives up the spacer, then the brand, rather than cutting the
+/// shortcuts mid-word — which is what happened at the 80-column minimum.
+fn status_bar_plan(width: u16, brand_w: u16, hints_w: u16) -> StatusBarPlan {
+    StatusBarPlan {
+        brand: width >= brand_w.saturating_add(MIN_SHORTCUTS_WIDTH),
+        spacer: width >= brand_w.saturating_mul(2).saturating_add(hints_w),
+    }
+}
+
+/// Drops trailing hints until the strip fits the space it was given. The
+/// leading ones are the primary actions, so truncation eats the tail instead of
+/// cutting a label in half.
+fn fit_shortcuts(shortcuts: &str, width: u16) -> String {
+    let parts = shortcuts
+        .split("  ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    for keep in (1..=parts.len()).rev() {
+        let candidate = parts[..keep].join("  ");
+        if framed_shortcuts_line(&candidate).width() as u16 <= width {
+            return candidate;
+        }
+    }
+    parts
+        .first()
+        .map_or_else(String::new, |part| (*part).to_string())
 }
 
 /// Build `│  key Action  ·  key Action  │` with purple rails.
@@ -2309,6 +2365,56 @@ mod tests {
         assert_eq!(colorfgbg_prefers_light("0;15"), Some(true));
         assert_eq!(colorfgbg_prefers_light("0;7"), Some(true));
         assert_eq!(colorfgbg_prefers_light("unknown"), None);
+    }
+
+    #[test]
+    fn a_narrow_status_bar_drops_decoration_instead_of_cutting_hints() {
+        // Wide enough for brand + hints + mirror spacer: keep all three.
+        let wide = status_bar_plan(160, 21, 60);
+        assert!(wide.brand && wide.spacer);
+
+        // 21 + 60 + 21 does not fit in 80, so the purely decorative mirror goes
+        // first while the brand stays.
+        let narrow = status_bar_plan(80, 21, 60);
+        assert!(narrow.brand && !narrow.spacer);
+
+        // Too narrow to leave the hints a usable strip: the brand goes too.
+        let tiny = status_bar_plan(55, 21, 60);
+        assert!(!tiny.brand && !tiny.spacer);
+    }
+
+    #[test]
+    fn shortcuts_shed_trailing_hints_rather_than_being_cut_mid_word() {
+        set_active_theme(
+            ColorMode::AniHubRgb,
+            ThemePreset::CatppuccinMocha,
+            SurfaceMode::Auto,
+            true,
+        );
+        // The longest real line in the app, from the library screen.
+        let full = "Enter Відкрити  Space Усе переглянуто  s Сортування  e Статус  / Пошук";
+        assert!(
+            framed_shortcuts_line(full).width() > 80,
+            "fixture is no longer the wide case"
+        );
+
+        for width in [80u16, 59, 40, 24] {
+            let fitted = fit_shortcuts(full, width);
+            let rendered = framed_shortcuts_line(&fitted).width() as u16;
+            assert!(
+                rendered <= width || fitted.split("  ").count() == 1,
+                "width {width}: {rendered} wide for {fitted:?}"
+            );
+            // Whatever survives must be whole hints, never a partial label.
+            for part in fitted.split("  ") {
+                assert!(full.contains(part), "width {width} invented {part:?}");
+            }
+            // The primary action is never the one dropped.
+            assert!(fitted.starts_with("Enter Відкрити"));
+        }
+
+        // Given room, nothing is dropped at all.
+        assert_eq!(fit_shortcuts(full, 200), full);
     }
 
     #[test]
