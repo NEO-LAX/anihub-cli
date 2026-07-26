@@ -428,46 +428,18 @@ pub(super) fn render_sort_popup(f: &mut Frame, app: &AppState) {
     let Some(selected) = app.library.sort_popup else {
         return;
     };
-    let actions = [
-        ("Enter", "Застосувати / ↕", color_highlight()),
-        ("Esc", "", color_dim()),
-    ];
-    let area = centered_fixed(f.area(), dialog_width_for(54, &actions), 11);
-    let block = dialog_block(
-        " Сортування бібліотеки ",
-        color_highlight(),
-        color_highlight(),
-    );
-    f.render_widget(Clear, area);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let items = LibrarySort::ALL
+    let options = LibrarySort::ALL
         .iter()
         .map(|sort| {
             let active = *sort == app.library.sort;
-            let reversed = active && app.library.sort_reversed;
-            let marker = if active { "✓" } else { " " };
-            ListItem::new(format!(
-                "{marker} {} · {}",
+            sort_option_row(
                 sort.label(),
-                sort.order_label(reversed)
-            ))
+                sort.order_label(active && app.library.sort_reversed),
+                active,
+            )
         })
         .collect::<Vec<_>>();
-    let list = List::new(items)
-        .highlight_symbol(">> ")
-        .highlight_style(selection_style());
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected));
-    f.render_stateful_widget(list, rows[0], &mut state);
-    f.render_widget(
-        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
-        rows[1],
-    );
+    super::render_sort_popup(f, " Сортування бібліотеки ", &options, selected);
 }
 
 pub(super) fn render_watched_confirmation(f: &mut Frame, app: &AppState) {

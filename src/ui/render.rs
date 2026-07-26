@@ -1824,6 +1824,54 @@ fn render_help_popup(f: &mut Frame) {
     );
 }
 
+/// Popup height for a sort dialog. Derived from the option count: the two
+/// callers previously hardcoded 10 and 11 and had already drifted apart.
+fn sort_popup_height(option_count: usize) -> u16 {
+    u16::try_from(option_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(6)
+}
+
+/// Shared sort dialog. Callers format their own option rows, since only the
+/// labels and the active/reversed markers differ between search and library.
+pub(super) fn render_sort_popup(f: &mut Frame, title: &str, options: &[String], selected: usize) {
+    let actions = [
+        ("Enter", "Застосувати / ↕", color_highlight()),
+        ("Esc", "", color_dim()),
+    ];
+    let area = centered_fixed(
+        f.area(),
+        dialog_width_for(54, &actions),
+        sort_popup_height(options.len()),
+    );
+    let block = dialog_block(title, color_highlight(), color_highlight());
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let list = List::new(options.iter().map(|option| ListItem::new(option.clone())))
+        .highlight_symbol(">> ")
+        .highlight_style(selection_style());
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected));
+    f.render_stateful_widget(list, rows[0], &mut state);
+    f.render_widget(
+        Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center),
+        rows[1],
+    );
+}
+
+/// Formats one sort option row; the marker shows the active choice and its
+/// direction.
+pub(super) fn sort_option_row(label: &str, order_label: &str, active: bool) -> String {
+    let marker = if active { "✓" } else { " " };
+    format!("{marker} {label} · {order_label}")
+}
+
 /// Shared confirm/info dialog with centered body and key-action footer.
 fn render_confirm_dialog(
     f: &mut Frame,
@@ -2365,6 +2413,59 @@ mod tests {
         assert_eq!(colorfgbg_prefers_light("0;15"), Some(true));
         assert_eq!(colorfgbg_prefers_light("0;7"), Some(true));
         assert_eq!(colorfgbg_prefers_light("unknown"), None);
+    }
+
+    #[test]
+    fn the_shared_sort_popup_renders_every_option_and_the_footer() {
+        // Taking plain rows instead of &AppState is what makes this testable at
+        // all; the two per-tab copies could not be rendered in a test.
+        let options = ["Рік", "Назва", "Рейтинг", "Прогрес", "Нещодавні"]
+            .iter()
+            .enumerate()
+            .map(|(index, label)| sort_option_row(label, "↓", index == 2))
+            .collect::<Vec<_>>();
+        set_active_theme(
+            ColorMode::AniHubRgb,
+            ThemePreset::CatppuccinMocha,
+            SurfaceMode::Auto,
+            true,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_sort_popup(frame, " Сортування бібліотеки ", &options, 2))
+            .unwrap();
+        let output = rendered_text(&terminal);
+
+        assert!(output.contains("Сортування бібліотеки"));
+        for label in ["Рік", "Назва", "Рейтинг", "Прогрес", "Нещодавні"]
+        {
+            assert!(output.contains(label), "missing option {label}");
+        }
+        assert!(output.contains("Застосувати"));
+        // Exactly one option is marked active.
+        assert_eq!(output.matches('✓').count(), 1);
+    }
+
+    #[test]
+    fn sort_popup_height_follows_the_option_count() {
+        // The two callers used to hardcode this and had already drifted: 10 for
+        // the four search options, 11 for the five library ones.
+        assert_eq!(sort_popup_height(4), 10);
+        assert_eq!(sort_popup_height(5), 11);
+        assert_eq!(
+            sort_popup_height(SearchSort::ALL.len()),
+            sort_popup_height(4)
+        );
+        assert_eq!(
+            sort_popup_height(LibrarySort::ALL.len()),
+            sort_popup_height(5)
+        );
+    }
+
+    #[test]
+    fn sort_option_rows_mark_only_the_active_choice() {
+        assert_eq!(sort_option_row("Рік", "↓", true), "✓ Рік · ↓");
+        assert_eq!(sort_option_row("Рік", "↓", false), "  Рік · ↓");
     }
 
     #[test]
