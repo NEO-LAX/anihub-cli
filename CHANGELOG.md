@@ -32,6 +32,11 @@ starts at 0.8.0.
 
 ### Fixed
 
+- A dub available on both hosts under the same name showed only the Ashdi copy,
+  even when MoonAnime carried far more of the run. Hunter x Hunter offered 62
+  episodes instead of 146. The name merge exists to fold alias spellings
+  together, so it now keeps whichever source reaches further; the episode count
+  on each row tells them apart.
 - Titles containing a standalone `x`, such as "Hunter x Hunter", were read as
   roman-numeral season 10. Since the mainline counter takes the maximum season
   it has seen, this would also have pushed later entries in the same franchise

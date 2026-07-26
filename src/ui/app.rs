@@ -2596,7 +2596,10 @@ fn dubbing_choices_for_sources(
     sources: &EpisodeSourcesResponse,
     season_num: u32,
 ) -> Vec<DubbingChoice<'_>> {
-    let mut seen_names = HashSet::new();
+    // Normalized studio name -> episodes already offered under it. The name
+    // merge exists to fold alias spellings of one dub together (FanWoxUA and
+    // FanVoxUA, the subtitle variants), not to hide a whole second host.
+    let mut offered: HashMap<String, u32> = HashMap::new();
     let mut choices = Vec::new();
     for studio in sources
         .ashdi
@@ -2606,7 +2609,8 @@ fn dubbing_choices_for_sources(
         let source_name = normalize_studio_name(&studio.studio_name);
         let display_alias = richer_duplicate_label(sources, season_num, &source_name);
         let normalized_name = normalize_studio_name(display_alias.unwrap_or(&studio.studio_name));
-        if seen_names.insert(normalized_name) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = offered.entry(normalized_name) {
+            slot.insert(studio.episodes_count);
             choices.push(DubbingChoice::Ashdi(studio, display_alias));
         }
     }
@@ -2615,7 +2619,16 @@ fn dubbing_choices_for_sources(
         .iter()
         .filter(|studio| studio.season_number == season_num)
     {
-        if seen_names.insert(normalize_studio_name(&studio.studio_name)) {
+        let name = normalize_studio_name(&studio.studio_name);
+        // AniHub hosts long runs only partially on Ashdi — Hunter x Hunter has
+        // 62 episodes there against 146 on MoonAnime under the same dub name.
+        // Suppressing the larger source as a duplicate would hide most of the
+        // title, so it is kept and the episode counts tell the rows apart.
+        let richer = offered
+            .get(&name)
+            .is_none_or(|offered| studio.episodes_count > *offered);
+        if richer {
+            offered.insert(name, studio.episodes_count);
             choices.push(DubbingChoice::MoonAnime(studio));
         }
     }
@@ -2830,10 +2843,76 @@ mod tests {
         };
 
         let choices = dubbing_choices_for_sources(&sources, 2);
-        assert_eq!(choices.len(), 2);
+
+        // The transliterations still merge into one labelled row each...
         assert_eq!(choices[0].studio_name(), "Клан Кайзоку");
+        assert!(!choices[0].is_moonanime());
         assert_eq!(choices[1].studio_name(), "Субтитри · Клан Кайзоку");
-        assert!(choices.iter().all(|choice| !choice.is_moonanime()));
+        assert!(!choices[1].is_moonanime());
+
+        // ...but the MoonAnime copy of the dub carries 16 episodes against
+        // Ashdi's 10, so it is offered rather than hidden as a duplicate. The
+        // episode counts shown on each row tell them apart. The subtitle track
+        // has fewer episodes than its Ashdi counterpart and stays merged.
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[2].studio_name(), "Клан Кайзоку");
+        assert!(choices[2].is_moonanime());
+        assert_eq!(choices[2].episodes_count(), 16);
+    }
+
+    #[test]
+    fn a_partial_ashdi_run_does_not_hide_the_complete_moonanime_one() {
+        // Hunter x Hunter, real shape from the API: the same dub name, but
+        // Ashdi hosts 62 of the 146 episodes. Suppressing MoonAnime as a
+        // duplicate put 84 episodes out of reach.
+        let sources = EpisodeSourcesResponse {
+            ashdi: vec![AshdiStudio {
+                id: 1,
+                studio_name: "FanVoxUA".to_string(),
+                season_number: 1,
+                episodes: Vec::new(),
+                episodes_count: 62,
+            }],
+            moonanime: vec![MoonAnimeSourceMarker {
+                studio_name: "FanVoxUA".to_string(),
+                season_number: 1,
+                episodes_count: 146,
+                episodes: Vec::new(),
+            }],
+        };
+
+        let choices = dubbing_choices_for_sources(&sources, 1);
+
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].episodes_count(), 62);
+        assert!(!choices[0].is_moonanime());
+        assert_eq!(choices[1].episodes_count(), 146);
+        assert!(choices[1].is_moonanime());
+    }
+
+    #[test]
+    fn an_equally_sized_moonanime_copy_is_still_merged_away() {
+        // Same dub, same reach, two spellings — nothing to gain from a second
+        // row, which is what the name merge is for.
+        let sources = EpisodeSourcesResponse {
+            ashdi: vec![AshdiStudio {
+                id: 1,
+                studio_name: "FanVoxUA".to_string(),
+                season_number: 1,
+                episodes: Vec::new(),
+                episodes_count: 24,
+            }],
+            moonanime: vec![MoonAnimeSourceMarker {
+                studio_name: "FanWoxUa".to_string(),
+                season_number: 1,
+                episodes_count: 24,
+                episodes: Vec::new(),
+            }],
+        };
+
+        let choices = dubbing_choices_for_sources(&sources, 1);
+        assert_eq!(choices.len(), 1);
+        assert!(!choices[0].is_moonanime());
     }
 
     #[test]
