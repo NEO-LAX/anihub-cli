@@ -314,7 +314,11 @@ fn episode_identity_changed(
 }
 
 fn apply_playback_settings(app: &AppState, timeline: &mut PlaybackTimeline) -> Result<()> {
-    player::configure_mpv(&app.settings.mpv_path, &app.settings.mpv_extra_args)?;
+    player::configure_mpv(
+        &app.settings.mpv_path,
+        &app.settings.mpv_extra_args,
+        app.settings.stream_quality,
+    )?;
     if !app.settings.resume_from_timestamp {
         timeline.clear_resume_positions();
     }

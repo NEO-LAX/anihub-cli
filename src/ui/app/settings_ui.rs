@@ -106,8 +106,9 @@ impl AppState {
                 self.settings_ui.discord_config_changed = true;
                 self.persist_settings();
             }
-            8 => self.open_settings_text(SettingsInput::MpvPath),
-            9 => self.open_settings_text(SettingsInput::MpvArgs),
+            8 => self.open_settings_choice(SettingsChoiceKind::StreamQuality),
+            9 => self.open_settings_text(SettingsInput::MpvPath),
+            10 => self.open_settings_text(SettingsInput::MpvArgs),
             _ => {}
         }
     }
@@ -165,9 +166,10 @@ impl AppState {
                     crate::platform::path_open_command(crate::platform::Platform::current(), &path);
                 self.spawn_external(command, "теку даних");
             }
-            1 => self.open_url_in_browser(GITHUB_URL, "GitHub"),
-            2 => self.open_update_popup(),
-            3 => match self.poster_disk_cache.clear() {
+            1 => self.export_library(),
+            2 => self.open_url_in_browser(GITHUB_URL, "GitHub"),
+            3 => self.open_update_popup(),
+            4 => match self.poster_disk_cache.clear() {
                 Ok(()) => {
                     self.poster_cache.invalidate_all();
                     self.set_info_status("Кеш постерів очищено");
@@ -176,8 +178,35 @@ impl AppState {
                     self.set_error_status(format!("Не вдалося очистити постери: {error}"));
                 }
             },
-            4 => self.library.clear_confirmation = true,
+            5 => self.library.clear_confirmation = true,
             _ => {}
+        }
+    }
+
+    /// Writes the whole watch history and library to a timestamped JSON file in
+    /// the data directory, so it sits next to the "open data folder" action the
+    /// user needs to actually reach it.
+    fn export_library(&mut self) {
+        let path = self
+            .settings_store
+            .data_dir()
+            .join(crate::storage::export_file_name(chrono::Local::now()));
+        let result = anyhow::Context::context(
+            serde_json::to_vec_pretty(&self.history),
+            "не вдалося серіалізувати бібліотеку",
+        )
+        .and_then(|bytes: Vec<u8>| crate::atomic_file::write(&path, &bytes));
+        match result {
+            Ok(()) => {
+                let titles = self.history.library.len();
+                self.set_info_status(format!(
+                    "Експортовано {titles} тайтлів → {}",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                self.set_error_status(format!("Не вдалося експортувати бібліотеку: {error}"));
+            }
         }
     }
 
@@ -321,6 +350,12 @@ impl AppState {
                         self.settings.default_library_filter = filter;
                         self.library.filter = library_filter_from_setting(filter);
                     }
+                    SettingsChoiceKind::StreamQuality => {
+                        self.settings.stream_quality = StreamQuality::ALL
+                            .get(editor.selected)
+                            .copied()
+                            .unwrap_or_default();
+                    }
                 }
                 self.persist_settings();
             }
@@ -368,11 +403,7 @@ impl AppState {
     }
 
     pub(super) fn handle_settings_key(&mut self, key_code: KeyCode) {
-        let rows = match self.settings_ui.tab {
-            SettingsTab::General => 10,
-            SettingsTab::Themes => ThemePreset::ALL.len() + 3,
-            SettingsTab::About => 5,
-        };
+        let rows = self.settings_ui.tab.row_count();
         match key_code {
             KeyCode::Tab => {
                 self.settings_ui.tab = self.settings_ui.tab.next();
@@ -382,17 +413,20 @@ impl AppState {
                 self.settings_ui.tab = self.settings_ui.tab.previous();
                 self.settings_ui.selected = 0;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            // Read-only tabs report zero rows; the wrap-around arithmetic below
+            // would divide by zero and underflow on them.
+            KeyCode::Up | KeyCode::Char('k') if rows > 0 => {
                 self.settings_ui.selected =
                     self.settings_ui.selected.checked_sub(1).unwrap_or(rows - 1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') if rows > 0 => {
                 self.settings_ui.selected = (self.settings_ui.selected + 1) % rows;
             }
             KeyCode::Char(' ') | KeyCode::Enter => match self.settings_ui.tab {
                 SettingsTab::General => self.activate_general_setting(),
                 SettingsTab::Themes => self.activate_theme_setting(),
                 SettingsTab::About => self.activate_about_setting(),
+                SettingsTab::Stats => {}
             },
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => self.switch_primary_tab(PrimaryTab::Search),

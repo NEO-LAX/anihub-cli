@@ -29,6 +29,41 @@ pub enum SearchMode {
     Extended,
 }
 
+/// Coarse stream-quality preference, expressed through mpv's `--hls-bitrate`.
+/// AniHub serves HLS master playlists, so mpv still does the variant selection;
+/// this only says which end of the ladder it should prefer. It deliberately is
+/// not a resolution picker — the app never parses the variant list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamQuality {
+    #[default]
+    Auto,
+    Max,
+    Min,
+}
+
+impl StreamQuality {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Max, Self::Min];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Авто",
+            Self::Max => "Максимальна",
+            Self::Min => "Мінімальна",
+        }
+    }
+
+    /// `None` keeps mpv's own default, so the setting stays a no-op until the
+    /// user picks a side.
+    pub const fn mpv_arg(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Max => Some("--hls-bitrate=max"),
+            Self::Min => Some("--hls-bitrate=min"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreset {
@@ -255,6 +290,7 @@ pub struct Settings {
     /// Discord application. New settings files omit this obsolete override.
     #[serde(rename = "discord_application_id", skip_serializing)]
     pub legacy_discord_application_id: String,
+    pub stream_quality: StreamQuality,
     pub mpv_path: String,
     pub mpv_extra_args: String,
     /// Preserve settings written by a newer AniHub version. Older binaries
@@ -291,6 +327,7 @@ impl Default for Settings {
             transparent_background: true,
             discord_presence: false,
             legacy_discord_application_id: String::new(),
+            stream_quality: StreamQuality::Auto,
             mpv_path: "mpv".to_string(),
             mpv_extra_args: String::new(),
             unknown_fields: BTreeMap::new(),
@@ -698,6 +735,26 @@ mod tests {
             serde_json::to_value(settings).unwrap().get("future_option"),
             Some(&serde_json::json!([1, 2, 3]))
         );
+    }
+
+    #[test]
+    fn settings_written_before_stream_quality_existed_still_load_as_auto() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("stream_quality");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.stream_quality, StreamQuality::Auto);
+        // Auto must stay a no-op so upgrading cannot change how mpv behaves.
+        assert_eq!(settings.stream_quality.mpv_arg(), None);
+        assert!(!settings.unknown_fields.contains_key("stream_quality"));
+    }
+
+    #[test]
+    fn stream_quality_maps_onto_hls_bitrate_bounds() {
+        assert_eq!(StreamQuality::Auto.mpv_arg(), None);
+        assert_eq!(StreamQuality::Max.mpv_arg(), Some("--hls-bitrate=max"));
+        assert_eq!(StreamQuality::Min.mpv_arg(), Some("--hls-bitrate=min"));
+        assert_eq!(StreamQuality::ALL.len(), 3);
     }
 
     #[test]

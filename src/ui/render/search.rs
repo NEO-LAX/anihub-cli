@@ -337,6 +337,17 @@ fn render_sidebar_details_area(
                 .alignment(Alignment::Center),
             );
         }
+        if let Some(next_airing) =
+            next_airing_label(release.next_airing_episode, release.next_airing_at)
+        {
+            text.push(
+                Line::from(Span::styled(
+                    next_airing,
+                    Style::default().fg(color_highlight()),
+                ))
+                .alignment(Alignment::Center),
+            );
+        }
         if let Some(genres) = &release.genres {
             if !genres.is_empty() {
                 text.push(Line::from(""));

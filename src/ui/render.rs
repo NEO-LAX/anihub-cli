@@ -1,3 +1,4 @@
+use chrono::TimeZone;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -20,7 +21,10 @@ mod library;
 mod search;
 mod settings;
 #[cfg(test)]
-use settings::{selected_theme_preview, theme_settings_display_row};
+use settings::{
+    about_settings_items, format_watch_time, general_settings_items, selected_theme_preview,
+    stats_rows, theme_settings_display_row,
+};
 
 #[derive(Clone, Copy)]
 struct ThemePalette {
@@ -431,9 +435,129 @@ pub fn render(f: &mut Frame, app: &mut AppState) {
         settings::render_choice_popup(f, app);
     } else if let Some((_, anime_title)) = app.library.pending_delete_confirmation.clone() {
         render_delete_popup(f, &anime_title);
+    } else if app.show_synopsis {
+        render_synopsis_popup(f, app);
     } else if app.show_help {
         render_help_popup(f);
     }
+}
+
+/// Synopsis text for the current selection, plus the title to show above it.
+/// Details from the per-title endpoint win over the franchise release entry:
+/// both carry a description, but the endpoint's is the fuller one.
+fn synopsis_subject(app: &AppState) -> Option<(String, String)> {
+    let from_details = |details: &api::AnimeDetails| {
+        synopsis_text(details.description.as_deref())
+            .map(|text| (details.title_ukrainian.clone(), text))
+    };
+
+    if app.is_library_mode() {
+        return app.content.current_details.as_ref().and_then(from_details);
+    }
+
+    if let Some(found) = sidebar_details_override(app)
+        .as_ref()
+        .and_then(&from_details)
+    {
+        return Some(found);
+    }
+    if let Some(found) = selected_release_for_sidebar(app).and_then(|release| {
+        synopsis_text(release.description.as_deref()).map(|text| (release.title.clone(), text))
+    }) {
+        return Some(found);
+    }
+    app.content.current_details.as_ref().and_then(from_details)
+}
+
+/// AniHub returns descriptions as an optional field that is sometimes present
+/// but blank, which would otherwise open an empty popup.
+fn synopsis_text(raw: Option<&str>) -> Option<String> {
+    let text = raw?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Keeps the last page of a synopsis in view instead of scrolling past the end.
+fn clamped_synopsis_scroll(scroll: u16, line_count: usize, viewport: u16) -> u16 {
+    let max_scroll =
+        u16::try_from(line_count.saturating_sub(viewport as usize)).unwrap_or(u16::MAX);
+    scroll.min(max_scroll)
+}
+
+fn render_synopsis_popup(f: &mut Frame, app: &mut AppState) {
+    let subject = synopsis_subject(app);
+    app.synopsis_scroll = draw_synopsis_popup(
+        f,
+        subject
+            .as_ref()
+            .map(|(title, text)| (title.as_str(), text.as_str())),
+        app.synopsis_scroll,
+    );
+}
+
+/// Draws the popup and returns the scroll offset clamped to the wrapped text,
+/// which only becomes knowable once the popup geometry is resolved.
+fn draw_synopsis_popup(f: &mut Frame, subject: Option<(&str, &str)>, scroll: u16) -> u16 {
+    let actions = [
+        ("↑↓ PgUp/PgDn", "Гортати", color_secondary()),
+        ("i / Esc", "Закрити", color_dim()),
+    ];
+    let frame = f.area();
+    let area = centered_fixed(
+        frame,
+        dialog_width_for(72, &actions),
+        frame.height.saturating_sub(6).clamp(7, 24),
+    );
+    let block = dialog_block(" Опис ", color_primary(), color_primary());
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let footer = Paragraph::new(action_footer_line(&actions)).alignment(Alignment::Center);
+
+    let Some((title, text)) = subject else {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "Опис недоступний",
+                Style::default().fg(color_dim()),
+            ))
+            .alignment(Alignment::Center),
+            rows[1],
+        );
+        f.render_widget(footer, rows[2]);
+        return 0;
+    };
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_with_ellipsis(title, rows[0].width as usize),
+            Style::default()
+                .fg(color_secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        rows[0],
+    );
+
+    // Wrapping happens here rather than through `Paragraph::wrap` so that the
+    // scroll offset counts the same lines the user sees.
+    let lines = wrap_text(text, rows[1].width as usize);
+    let scroll = clamped_synopsis_scroll(scroll, lines.len(), rows[1].height);
+
+    let body = lines
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(color_text()))))
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(body).scroll((scroll, 0)), rows[1]);
+    f.render_widget(footer, rows[2]);
+    scroll
 }
 
 fn render_header(f: &mut Frame, app: &AppState, area: Rect) {
@@ -840,7 +964,7 @@ fn context_shortcuts(app: &AppState) -> String {
     }
     match app.focus {
         FocusPanel::SearchList => {
-            "Enter Далі  s Сортування  e Статус  c Продовжити  / Пошук".to_string()
+            "Enter Далі  s Сортування  e Статус  c Продовжити  i Опис  / Пошук".to_string()
         }
         FocusPanel::ReleaseList
             if app.has_release_catalog() && !app.selected_release_available() =>
@@ -848,7 +972,7 @@ fn context_shortcuts(app: &AppState) -> String {
             "Недоступно на AniHub  Esc Назад".to_string()
         }
         FocusPanel::ReleaseList | FocusPanel::DubbingList => {
-            "Enter Далі  Space Переглянуто  e Статус  Esc Назад".to_string()
+            "Enter Далі  Space Переглянуто  e Статус  i Опис  Esc Назад".to_string()
         }
         FocusPanel::EpisodeList => {
             if app
@@ -902,6 +1026,23 @@ fn label_with_metadata(label: &str, metadata: &[String]) -> String {
     } else {
         format!("{label} [{}]", metadata.join(" · "))
     }
+}
+
+fn next_airing_label(episode: Option<u32>, airing_at: Option<i64>) -> Option<String> {
+    next_airing_label_at(episode, airing_at, chrono::Utc::now().timestamp())
+}
+
+/// Renders an upcoming episode as `далі E9 · 14.03 19:30`, in local time.
+/// Airing dates that already passed are dropped: AniList keeps serving them
+/// until it refreshes, and a countdown to the past reads as a bug.
+fn next_airing_label_at(episode: Option<u32>, airing_at: Option<i64>, now: i64) -> Option<String> {
+    let episode = episode?;
+    let airing_at = airing_at?;
+    if airing_at <= now {
+        return None;
+    }
+    let local = chrono::Local.timestamp_opt(airing_at, 0).single()?;
+    Some(format!("далі E{episode} · {}", local.format("%d.%m %H:%M")))
 }
 
 fn sidebar_poster_height(inner: Rect, title_height: u16) -> u16 {
@@ -1594,6 +1735,7 @@ fn render_help_popup(f: &mut Frame) {
         row("d", "Видалити прогрес"),
         row("s", "Сортування списку"),
         row("o", "У браузері"),
+        row("i", "Опис тайтлу"),
         row("Tab", "Категорія"),
     ];
 
@@ -1816,6 +1958,11 @@ fn release_list_item(
                 |available| format!("{available}/{episodes}"),
             );
         metadata.push(format!("{} сер.", episodes));
+    }
+    if let Some(next_airing) =
+        next_airing_label(release.next_airing_episode, release.next_airing_at)
+    {
+        metadata.push(next_airing);
     }
     if unavailable {
         metadata.push("⚠ недоступно".to_string());
@@ -2142,6 +2289,188 @@ mod tests {
         assert_eq!(colorfgbg_prefers_light("0;15"), Some(true));
         assert_eq!(colorfgbg_prefers_light("0;7"), Some(true));
         assert_eq!(colorfgbg_prefers_light("unknown"), None);
+    }
+
+    #[test]
+    fn watch_time_drops_empty_units_and_never_shows_a_bare_zero() {
+        assert_eq!(format_watch_time(0.0), "—");
+        assert_eq!(format_watch_time(-5.0), "—");
+        assert_eq!(format_watch_time(29.0), "—"); // rounds to 0 minutes
+        assert_eq!(format_watch_time(31.0), "1 хв");
+        assert_eq!(format_watch_time(90.0 * 60.0), "1 год 30 хв");
+        assert_eq!(format_watch_time(60.0 * 60.0), "1 год");
+        // Past a day, minutes are noise.
+        assert_eq!(format_watch_time(25.5 * 3600.0), "1 д 1 год");
+        assert_eq!(format_watch_time(24.0 * 3600.0), "1 д");
+    }
+
+    #[test]
+    fn stats_marks_the_total_approximate_only_when_something_was_estimated() {
+        let exact = crate::storage::LibraryStats {
+            titles: 4,
+            by_status: vec![(AnimeStatus::Completed, 4)],
+            episodes_watched: 10,
+            watch_seconds: 3600.0,
+            estimated_episodes: 0,
+        };
+        let rows = stats_rows(&exact);
+        let watch_row = rows.iter().find(|(label, _)| label == "Час перегляду");
+        assert_eq!(watch_row.map(|(_, value)| value.as_str()), Some("1 год"));
+        assert!(!rows.iter().any(|(label, _)| label.contains("оцінено")));
+        // 4 of 4 completed.
+        assert!(
+            rows.iter()
+                .any(|(label, value)| label == "Завершено" && value == "100%")
+        );
+
+        let estimated = crate::storage::LibraryStats {
+            estimated_episodes: 3,
+            ..exact
+        };
+        let rows = stats_rows(&estimated);
+        assert_eq!(
+            rows.iter()
+                .find(|(label, _)| label == "Час перегляду")
+                .map(|(_, value)| value.as_str()),
+            Some("≈ 1 год")
+        );
+        assert!(rows.iter().any(|(label, _)| label.contains("оцінено")));
+    }
+
+    #[test]
+    fn stats_omits_zero_and_not_added_statuses_and_survives_an_empty_library() {
+        let stats = crate::storage::LibraryStats {
+            titles: 0,
+            by_status: vec![
+                (AnimeStatus::NotAdded, 7),
+                (AnimeStatus::Watching, 0),
+                (AnimeStatus::Dropped, 2),
+            ],
+            episodes_watched: 0,
+            watch_seconds: 0.0,
+            estimated_episodes: 0,
+        };
+        let rows = stats_rows(&stats);
+
+        // NotAdded is an internal state, and empty buckets are noise.
+        assert!(!rows.iter().any(|(label, _)| label == "Не додано"));
+        assert!(!rows.iter().any(|(label, _)| label == "Дивлюся"));
+        assert!(rows.iter().any(|(label, _)| label == "Кинуто"));
+        // No titles means no percentage to divide out.
+        assert!(!rows.iter().any(|(label, _)| label == "Завершено"));
+    }
+
+    #[test]
+    fn settings_row_counts_match_the_rendered_rows() {
+        // Row counts drive both keyboard navigation and which index each
+        // `activate_*_setting` arm handles. If a row is added to one side only,
+        // it becomes unreachable or shifts every action below it.
+        assert_eq!(
+            general_settings_items(&crate::settings::Settings::default(), 60).len(),
+            SettingsTab::General.row_count()
+        );
+        assert_eq!(
+            about_settings_items(60).len(),
+            SettingsTab::About.row_count()
+        );
+    }
+
+    #[test]
+    fn blank_descriptions_do_not_open_a_synopsis() {
+        assert_eq!(synopsis_text(None), None);
+        assert_eq!(synopsis_text(Some("")), None);
+        assert_eq!(synopsis_text(Some("   \n\t ")), None);
+        assert_eq!(
+            synopsis_text(Some("  Історія про клуб легкої музики.  ")).as_deref(),
+            Some("Історія про клуб легкої музики.")
+        );
+    }
+
+    fn draw_synopsis(
+        width: u16,
+        height: u16,
+        subject: Option<(&str, &str)>,
+        scroll: u16,
+    ) -> (String, u16) {
+        set_active_theme(
+            ColorMode::AniHubRgb,
+            ThemePreset::CatppuccinMocha,
+            SurfaceMode::Auto,
+            true,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut clamped = 0;
+        terminal
+            .draw(|frame| clamped = draw_synopsis_popup(frame, subject, scroll))
+            .unwrap();
+        (rendered_text(&terminal), clamped)
+    }
+
+    #[test]
+    fn synopsis_popup_shows_the_title_body_and_scroll_actions() {
+        let (output, clamped) = draw_synopsis(
+            80,
+            24,
+            Some(("K-On!", "Юї вступає до клубу легкої музики.")),
+            0,
+        );
+
+        assert!(output.contains("Опис"));
+        assert!(output.contains("K-On!"));
+        assert!(output.contains("клубу легкої музики"));
+        assert!(output.contains("Гортати"));
+        assert!(output.contains("Закрити"));
+        assert_eq!(clamped, 0);
+    }
+
+    #[test]
+    fn synopsis_popup_scrolls_long_text_and_reports_the_clamped_offset() {
+        // Far more lines than any viewport, so the offset has to be clamped.
+        let long = (1..=200)
+            .map(|n| format!("речення-{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (top, _) = draw_synopsis(80, 24, Some(("Довгий опис", &long)), 0);
+        let (scrolled, clamped) = draw_synopsis(80, 24, Some(("Довгий опис", &long)), 9_000);
+
+        assert!(top.contains("речення-1 "));
+        assert!(!scrolled.contains("речення-1 "));
+        assert!(scrolled.contains("речення-200"));
+        assert!(
+            clamped > 0 && clamped < 9_000,
+            "offset should be clamped to the last page, got {clamped}"
+        );
+    }
+
+    #[test]
+    fn synopsis_popup_explains_a_missing_description_instead_of_rendering_blank() {
+        let (output, clamped) = draw_synopsis(80, 24, None, 42);
+
+        assert!(output.contains("Опис недоступний"));
+        assert_eq!(clamped, 0);
+    }
+
+    #[test]
+    fn synopsis_scroll_stops_at_the_last_page() {
+        // 40 wrapped lines in a 10-row viewport: the last useful offset is 30.
+        assert_eq!(clamped_synopsis_scroll(0, 40, 10), 0);
+        assert_eq!(clamped_synopsis_scroll(25, 40, 10), 25);
+        assert_eq!(clamped_synopsis_scroll(30, 40, 10), 30);
+        assert_eq!(clamped_synopsis_scroll(500, 40, 10), 30);
+        // Text that already fits must not scroll at all.
+        assert_eq!(clamped_synopsis_scroll(7, 6, 10), 0);
+    }
+
+    #[test]
+    fn next_airing_badge_needs_both_fields_and_a_future_date() {
+        // The exact rendered time depends on the local timezone, so only the
+        // episode marker is pinned here.
+        let label = next_airing_label_at(Some(9), Some(2_000), 1_000);
+        assert!(label.is_some_and(|label| label.starts_with("далі E9 · ")));
+
+        assert_eq!(next_airing_label_at(Some(9), Some(2_000), 2_000), None);
+        assert_eq!(next_airing_label_at(Some(9), None, 1_000), None);
+        assert_eq!(next_airing_label_at(None, Some(2_000), 1_000), None);
     }
 
     fn release(

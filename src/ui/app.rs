@@ -7,7 +7,7 @@ use crate::cache::MetadataCache;
 use crate::poster_cache::PosterCache;
 use crate::settings::{
     DefaultLibraryFilter, GITHUB_URL, LibrarySortPreference, SearchSortPreference, Settings,
-    SettingsStore, StartScreen, ThemePreset, UpdateCheck, mpv_is_available,
+    SettingsStore, StartScreen, StreamQuality, ThemePreset, UpdateCheck, mpv_is_available,
 };
 use crate::storage::{
     AnimeStatus, AnimeStatusUpdate, AppHistory, EpisodeWatchedUpdate, LibraryReleaseMetadata,
@@ -122,16 +122,18 @@ pub enum SettingsTab {
     #[default]
     General,
     Themes,
+    Stats,
     About,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 3] = [Self::General, Self::Themes, Self::About];
+    pub const ALL: [Self; 4] = [Self::General, Self::Themes, Self::Stats, Self::About];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "Основні",
             Self::Themes => "Теми",
+            Self::Stats => "Статистика",
             Self::About => "Про",
         }
     }
@@ -144,6 +146,20 @@ impl SettingsTab {
     pub fn previous(self) -> Self {
         let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
         Self::ALL[index.checked_sub(1).unwrap_or(Self::ALL.len() - 1)]
+    }
+
+    /// Selectable rows in each tab. This must stay in step with the item lists
+    /// built in `ui::render::settings` and with the index arms in
+    /// `activate_general_setting` / `activate_about_setting`; a mismatch makes
+    /// rows unreachable or activates the wrong setting.
+    pub fn row_count(self) -> usize {
+        match self {
+            Self::General => 11,
+            Self::Themes => ThemePreset::ALL.len() + 3,
+            // Read-only screen: nothing to select or activate.
+            Self::Stats => 0,
+            Self::About => 6,
+        }
     }
 }
 
@@ -158,6 +174,7 @@ pub enum SettingsInput {
 pub enum SettingsChoiceKind {
     StartScreen,
     LibraryFilter,
+    StreamQuality,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +195,7 @@ impl SettingsChoiceKind {
         match self {
             Self::StartScreen => " Стартовий екран ",
             Self::LibraryFilter => " Фільтр бібліотеки ",
+            Self::StreamQuality => " Якість відео ",
         }
     }
 
@@ -187,6 +205,10 @@ impl SettingsChoiceKind {
             Self::LibraryFilter => DefaultLibraryFilter::ALL
                 .iter()
                 .map(|filter| filter.label())
+                .collect(),
+            Self::StreamQuality => StreamQuality::ALL
+                .iter()
+                .map(|quality| quality.label())
                 .collect(),
         }
     }
@@ -200,6 +222,10 @@ impl SettingsChoiceKind {
             Self::LibraryFilter => DefaultLibraryFilter::ALL
                 .iter()
                 .position(|filter| *filter == settings.default_library_filter)
+                .unwrap_or(0),
+            Self::StreamQuality => StreamQuality::ALL
+                .iter()
+                .position(|quality| *quality == settings.stream_quality)
                 .unwrap_or(0),
         }
     }
@@ -220,6 +246,8 @@ pub const THRESHOLD_MIN: u8 = 50;
 pub const THRESHOLD_MAX: u8 = 100;
 pub const THRESHOLD_STEP: u8 = 5;
 pub const THRESHOLD_BAR_WIDTH: usize = 12;
+/// PgUp/PgDn step inside the synopsis popup, in wrapped lines.
+const SYNOPSIS_PAGE_STEP: u16 = 5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
@@ -310,6 +338,10 @@ pub struct AppState {
     pub status_retry_available: bool,
     pub retry_requested: bool,
     pub show_help: bool,
+    pub show_synopsis: bool,
+    /// Scroll offset of the synopsis popup, in wrapped lines. Clamped during
+    /// render, where the wrap width and viewport height are finally known.
+    pub synopsis_scroll: u16,
     /// (display title, direct MoonAnime iframe URL)
     pub moonanime_browser_prompt: Option<(String, String)>,
 
@@ -407,6 +439,8 @@ impl AppState {
             status_retry_available: false,
             retry_requested: false,
             show_help: false,
+            show_synopsis: false,
+            synopsis_scroll: 0,
             moonanime_browser_prompt: None,
 
             details_cache,
@@ -909,6 +943,10 @@ impl AppState {
                     }
                     if self.show_help {
                         self.show_help = false;
+                        return Ok(());
+                    }
+
+                    if self.handle_synopsis_popup(shortcut) {
                         return Ok(());
                     }
 
@@ -1651,6 +1689,40 @@ impl AppState {
         iframe_url: impl Into<String>,
     ) {
         self.moonanime_browser_prompt = Some((title.into(), iframe_url.into()));
+    }
+
+    pub fn open_synopsis(&mut self) {
+        self.show_synopsis = true;
+        self.synopsis_scroll = 0;
+    }
+
+    /// Scrolls or dismisses the synopsis popup. Scrolling is only bounded from
+    /// above here; the lower bound needs the wrapped line count, so render
+    /// clamps `synopsis_scroll` once it knows the popup geometry.
+    fn handle_synopsis_popup(&mut self, key_code: KeyCode) -> bool {
+        if !self.show_synopsis {
+            return false;
+        }
+        match key_code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i' | 'q') => {
+                self.show_synopsis = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.synopsis_scroll = self.synopsis_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.synopsis_scroll = self.synopsis_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.synopsis_scroll = self.synopsis_scroll.saturating_sub(SYNOPSIS_PAGE_STEP);
+            }
+            KeyCode::PageDown => {
+                self.synopsis_scroll = self.synopsis_scroll.saturating_add(SYNOPSIS_PAGE_STEP);
+            }
+            KeyCode::Home => self.synopsis_scroll = 0,
+            _ => {}
+        }
+        true
     }
 
     fn handle_moonanime_browser_prompt(&mut self, key_code: KeyCode) -> bool {
@@ -2552,9 +2624,23 @@ mod tests {
     #[test]
     fn settings_tabs_cycle_in_both_directions() {
         assert_eq!(SettingsTab::General.next(), SettingsTab::Themes);
-        assert_eq!(SettingsTab::Themes.next(), SettingsTab::About);
+        assert_eq!(SettingsTab::Themes.next(), SettingsTab::Stats);
+        assert_eq!(SettingsTab::Stats.next(), SettingsTab::About);
         assert_eq!(SettingsTab::About.next(), SettingsTab::General);
         assert_eq!(SettingsTab::General.previous(), SettingsTab::About);
+        assert_eq!(SettingsTab::About.previous(), SettingsTab::Stats);
+    }
+
+    #[test]
+    fn read_only_tabs_report_no_selectable_rows() {
+        // `handle_settings_key` divides by this; zero must stay intentional and
+        // guarded rather than becoming an accidental panic.
+        assert_eq!(SettingsTab::Stats.row_count(), 0);
+        for tab in SettingsTab::ALL {
+            if tab != SettingsTab::Stats {
+                assert!(tab.row_count() > 0, "{tab:?} needs selectable rows");
+            }
+        }
     }
 
     #[test]

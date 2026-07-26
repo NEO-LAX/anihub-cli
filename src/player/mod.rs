@@ -1,4 +1,5 @@
 use crate::platform;
+use crate::settings::StreamQuality;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -581,15 +582,28 @@ impl Default for MpvLaunchSettings {
 
 static MPV_LAUNCH_SETTINGS: OnceLock<RwLock<MpvLaunchSettings>> = OnceLock::new();
 
-pub fn configure_mpv(path: &str, extra_args: &str) -> Result<()> {
+/// Merges the quality preference with the user's own mpv arguments. The
+/// preference goes first so an explicit `--hls-bitrate` among the user's
+/// arguments still wins — mpv honors the last occurrence of an option.
+fn launch_extra_args(extra_args: &str, quality: StreamQuality) -> Result<Vec<String>> {
     let parsed = shell_words::split(extra_args).context("Invalid additional mpv arguments")?;
+    Ok(quality
+        .mpv_arg()
+        .map(ToString::to_string)
+        .into_iter()
+        .chain(parsed)
+        .collect())
+}
+
+pub fn configure_mpv(path: &str, extra_args: &str, quality: StreamQuality) -> Result<()> {
+    let extra_args = launch_extra_args(extra_args, quality)?;
     let settings = MpvLaunchSettings {
         path: if path.trim().is_empty() {
             "mpv".to_string()
         } else {
             path.trim().to_string()
         },
-        extra_args: parsed,
+        extra_args,
     };
     *MPV_LAUNCH_SETTINGS
         .get_or_init(|| RwLock::new(MpvLaunchSettings::default()))
@@ -933,6 +947,44 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use tokio::net::UnixListener;
+
+    #[test]
+    fn auto_quality_adds_no_mpv_argument() {
+        assert_eq!(
+            launch_extra_args("--hwdec=auto", StreamQuality::Auto).unwrap(),
+            vec!["--hwdec=auto".to_string()]
+        );
+        assert!(
+            launch_extra_args("", StreamQuality::Auto)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quality_preference_precedes_user_arguments_so_they_can_override_it() {
+        assert_eq!(
+            launch_extra_args("--fs", StreamQuality::Min).unwrap(),
+            vec!["--hls-bitrate=min".to_string(), "--fs".to_string()]
+        );
+
+        // A user who spells the option out themselves must still win, which
+        // only holds if theirs comes last.
+        let args = launch_extra_args("--hls-bitrate=1500000", StreamQuality::Max).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--hls-bitrate=max".to_string(),
+                "--hls-bitrate=1500000".to_string()
+            ]
+        );
+        assert_eq!(args.last().unwrap(), "--hls-bitrate=1500000");
+    }
+
+    #[test]
+    fn malformed_user_arguments_are_reported_rather_than_dropped() {
+        assert!(launch_extra_args("--title=\"unclosed", StreamQuality::Max).is_err());
+    }
 
     #[cfg(unix)]
     async fn run_fake_playlist_server(
