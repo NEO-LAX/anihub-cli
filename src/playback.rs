@@ -1732,6 +1732,16 @@ fn source_extra_args(source: StreamSource, subtitle_urls: &[String]) -> Vec<Stri
     args
 }
 
+/// Trailing advice for a failed resolution. MoonAnime obfuscates its embed, so
+/// decoding is expected to break when the page changes; a bare error would leave
+/// the user with no way forward even though the browser handoff still works.
+fn resolution_hint(source: StreamSource) -> &'static str {
+    match source {
+        StreamSource::Ashdi => "",
+        StreamSource::MoonAnime => " · натисніть o щоб відкрити в браузері",
+    }
+}
+
 async fn resolve_playlist_entry(
     target: PlayTarget,
     parser: Arc<api::AshdiParser>,
@@ -1764,9 +1774,10 @@ async fn resolve_playlist_entry(
                     }
                 } => result
                     .map_err(|error| anyhow!(
-                        "не вдалося отримати S{}E{}: {error}",
+                        "не вдалося отримати S{}E{}: {error}{}",
                         target.season,
-                        target.episode
+                        target.episode,
+                        resolution_hint(target.source)
                     ))?,
             };
             let now = Instant::now();
@@ -1957,6 +1968,17 @@ mod supervisor_tests {
             source: StreamSource::MoonAnime,
             ..target(episode, start_time)
         }
+    }
+
+    #[test]
+    fn a_failed_moonanime_resolution_points_at_the_browser_fallback() {
+        // The embed is deliberately obfuscated, so this failure is expected to
+        // happen eventually. It must not be a dead end.
+        let hint = resolution_hint(StreamSource::MoonAnime);
+        assert!(hint.contains('o'), "no key suggested in {hint:?}");
+        assert!(hint.contains("браузер"));
+        // Ashdi has no such fallback, so it must not promise one.
+        assert_eq!(resolution_hint(StreamSource::Ashdi), "");
     }
 
     #[test]

@@ -9,6 +9,9 @@ debug.txt
 *.md
 !README.md
 !README.uk.md
+!CHANGELOG.md
+!PROJECT_STATUS.md
+!ROADMAP.md
 
 # Python (якщо ці скрипти тобі не потрібні в репозиторії)
 # Якщо потрібні — просто видали наступний рядок

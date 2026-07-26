@@ -65,7 +65,8 @@ Original AniHub RGB palette by default. Optional ANSI 16 / ANSI 256 modes with c
 ### 📺 Terminal + mpv
 
 Ashdi episodes run in **mpv** (prev / next via the native playlist).  
-Browser-only MoonAnime titles open in your browser after confirmation.
+MoonAnime titles open in your browser after confirmation — or play in **mpv**
+too, once you enable the experimental setting (see below).
 
 <img src="assets/mpv-terminal.jpg" alt="mpv and terminal" width="900" />
 
@@ -102,14 +103,31 @@ On pause the bar hides and the status shows **Пауза**. Desktop Discord only
 
 | | |
 | :--- | :--- |
-| 🔍 **Search** | Strict (≤20) or extended (≤100) · franchise grouping for seasons & films |
-| 📖 **Library** | Statuses, filters, resume timestamps, watched toggle |
-| ▶️ **Playback** | Ashdi → mpv · MoonAnime → browser · autoplay next |
+| 🔍 **Search** | Strict (≤20) or extended (≤100) · franchise grouping for seasons & films · next-episode countdown |
+| 📖 **Library** | Statuses, filters, resume timestamps, watched toggle · JSON export |
+| ▶️ **Playback** | Ashdi → mpv · MoonAnime → browser, or mpv (experimental) · autoplay next |
+| 🎚 **Quality** | Auto / highest / lowest, handed to mpv as `--hls-bitrate` |
+| 📄 **Synopsis** | `i` shows the description of the selected title |
+| 📊 **Stats** | Episodes watched, titles per status, estimated watch time |
 | 🖼 **Posters** | Kitty / iTerm2 / Sixel / halfblocks when the terminal supports it |
 | 🎨 **Themes** | AniHub RGB + ANSI 16/256 palettes · surface & transparency controls |
 | 💬 **Discord** | Rich Presence with progress bar (opt-in) |
-| 💾 **Caches** | Metadata SWR cache · ~150 MiB poster cache with prune |
+| 💾 **Caches** | Metadata SWR cache · ~150 MiB poster cache with prune |
 | ⌨️ **Keys** | Shortcuts work on **EN** and **UA/RU (ЙЦУКЕН)** layouts |
+
+### MoonAnime in mpv (experimental)
+
+**Settings → Основні → ІНТЕГРАЦІЇ → MoonAnime у mpv** — off by default.
+
+MoonAnime does not expose its stream URL the way Ashdi does: the embed page
+hides it behind two layers of obfuscation. anihub-cli decodes them without any
+extra tools installed, then plays the episode in mpv with the usual watch
+progress, resume, autoplay and — where MoonAnime provides them — subtitles
+(attached but not switched on; `j` in mpv cycles them).
+
+That obfuscation is deliberate, so expect this to break whenever MoonAnime
+reshapes the page. Nothing is lost when it does: press `o` to open the episode
+in your browser, exactly as before.
 
 > Full changelog → [GitHub Releases](https://github.com/NEO-LAX/anihub-cli/releases)
 
@@ -206,6 +224,7 @@ Footer shows context-aware hints. Press `?` or `h` for full help.
 | `c` | Continue watching |
 | `e` | Set library status |
 | `Space` | Toggle watched |
+| `i` | Synopsis of the selected title |
 | `o` | Open in browser |
 | `r` | Retry after a network error |
 | `q` | Quit |
