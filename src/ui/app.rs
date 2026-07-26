@@ -154,7 +154,7 @@ impl SettingsTab {
     /// rows unreachable or activates the wrong setting.
     pub fn row_count(self) -> usize {
         match self {
-            Self::General => 11,
+            Self::General => 12,
             Self::Themes => ThemePreset::ALL.len() + 3,
             // Read-only screen: nothing to select or activate.
             Self::Stats => 0,
@@ -1778,6 +1778,13 @@ impl AppState {
     }
 
     fn activate_selected_episode(&mut self) {
+        // With direct playback enabled, MoonAnime episodes go through the normal
+        // mpv path; the browser handoff stays as the fallback for when it is off
+        // or when decoding the embed fails.
+        if self.settings.moonanime_direct_playback && self.selected_dubbing_is_moonanime() {
+            self.playback.play_requested = true;
+            return;
+        }
         if !self.prompt_selected_moonanime_episode() {
             self.playback.play_requested = true;
         }

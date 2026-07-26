@@ -291,6 +291,10 @@ pub struct Settings {
     #[serde(rename = "discord_application_id", skip_serializing)]
     pub legacy_discord_application_id: String,
     pub stream_quality: StreamQuality,
+    /// Experimental: decode MoonAnime embeds and play them in mpv instead of
+    /// handing the iframe to a browser. Off by default — MoonAnime obfuscates
+    /// the stream URL, so this breaks whenever they reshape the embed page.
+    pub moonanime_direct_playback: bool,
     pub mpv_path: String,
     pub mpv_extra_args: String,
     /// Preserve settings written by a newer AniHub version. Older binaries
@@ -328,6 +332,7 @@ impl Default for Settings {
             discord_presence: false,
             legacy_discord_application_id: String::new(),
             stream_quality: StreamQuality::Auto,
+            moonanime_direct_playback: false,
             mpv_path: "mpv".to_string(),
             mpv_extra_args: String::new(),
             unknown_fields: BTreeMap::new(),

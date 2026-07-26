@@ -628,6 +628,11 @@ pub struct MpvPlaylistEntry {
     pub title: String,
     pub start_time: Option<f64>,
     pub referrer: String,
+    /// Per-entry mpv options. MoonAnime needs an `Accept-Language` header (its
+    /// CDN answers 400 without one) and `--no-ytdl`, since the manifest is
+    /// already resolved and mpv's ytdl hook would otherwise re-resolve it into a
+    /// single lower-quality variant.
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -689,6 +694,7 @@ pub fn build_mpv_args(
         args.push("--{".to_string());
         args.push(format!("--force-media-title={}", entry.title));
         args.push(format!("--referrer={}", entry.referrer));
+        args.extend(entry.extra_args.iter().cloned());
         if let Some(start_time) = entry
             .start_time
             .filter(|time| time.is_finite() && *time > 0.0)
@@ -949,6 +955,58 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[test]
+    fn per_entry_options_land_inside_the_entry_block() {
+        let endpoint = IpcEndpoint::for_session(99);
+        let entry = MpvPlaylistEntry {
+            media_url: "https://s.moonanime.art/a/manifest.m3u8".to_string(),
+            title: "Anime - Ep 1".to_string(),
+            start_time: None,
+            referrer: "https://moonanime.art/".to_string(),
+            extra_args: vec![
+                "--http-header-fields-append=Accept-Language: uk".to_string(),
+                "--no-ytdl".to_string(),
+            ],
+        };
+        let args = build_mpv_args(&endpoint, std::slice::from_ref(&entry), 0, &[]);
+
+        // `-append` rather than `=`: mpv splits the plain form on commas.
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--http-header-fields-append=Accept-Language: uk"),
+            "missing header arg in {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--http-header-fields="))
+        );
+        // The header must sit inside the entry's own `--{ ... --}` block.
+        let open = args.iter().position(|arg| arg == "--{").unwrap();
+        let close = args.iter().position(|arg| arg == "--}").unwrap();
+        let header = args
+            .iter()
+            .position(|arg| arg.starts_with("--http-header-fields-append="))
+            .unwrap();
+        assert!(open < header && header < close);
+    }
+
+    #[test]
+    fn entries_without_extra_options_emit_none() {
+        let endpoint = IpcEndpoint::for_session(98);
+        let entry = MpvPlaylistEntry {
+            media_url: "https://ashdi.vip/a/index.m3u8".to_string(),
+            title: "Anime - Ep 1".to_string(),
+            start_time: None,
+            referrer: "https://ashdi.vip/".to_string(),
+            extra_args: Vec::new(),
+        };
+        let args = build_mpv_args(&endpoint, std::slice::from_ref(&entry), 0, &[]);
+
+        assert!(!args.iter().any(|arg| arg.contains("http-header-fields")));
+        assert!(!args.iter().any(|arg| arg == "--no-ytdl"));
+    }
+
+    #[test]
     fn auto_quality_adds_no_mpv_argument() {
         assert_eq!(
             launch_extra_args("--hwdec=auto", StreamQuality::Auto).unwrap(),
@@ -1060,6 +1118,7 @@ mod tests {
             title: format!("Anime - Ep {episode}"),
             start_time: None,
             referrer: "https://ref.test/".to_string(),
+            extra_args: Vec::new(),
         }
     }
 
@@ -1080,18 +1139,21 @@ mod tests {
                 title: "Anime - Ep 1".to_string(),
                 start_time: None,
                 referrer: "https://ref.test/".to_string(),
+                extra_args: Vec::new(),
             },
             MpvPlaylistEntry {
                 media_url: "https://media.test/2.m3u8".to_string(),
                 title: "Anime - Ep 2".to_string(),
                 start_time: Some(42.0),
                 referrer: "https://ref.test/".to_string(),
+                extra_args: Vec::new(),
             },
             MpvPlaylistEntry {
                 media_url: "https://media.test/3.m3u8".to_string(),
                 title: "Anime - Ep 3".to_string(),
                 start_time: None,
                 referrer: "https://ref.test/".to_string(),
+                extra_args: Vec::new(),
             },
         ];
         let args = build_mpv_args(&endpoint, &entries, 1, &["--hwdec=auto".to_string()]);
@@ -1123,6 +1185,7 @@ mod tests {
             title: "Anime - Ep 2".to_string(),
             start_time: Some(42.5),
             referrer: "https://ref.test/".to_string(),
+            extra_args: Vec::new(),
         };
         assert_eq!(
             loadfile_insert_command(&entry, 3),

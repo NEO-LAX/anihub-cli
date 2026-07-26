@@ -9,6 +9,7 @@ repository = "https://github.com/NEO-LAX/anihub-cli"
 
 [dependencies]
 anyhow = "1.0.102"
+base64 = "0.22"
 chrono = "0.4.44"
 crossterm = "0.29.0"
 directories = "6.0.0"

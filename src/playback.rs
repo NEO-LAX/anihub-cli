@@ -28,6 +28,16 @@ pub struct PlayTarget {
     pub studio_name: String,
     /// HTTP Referer for the Ashdi player page.
     pub referrer: String,
+    /// Which host serves `stream_page_url`, and therefore how the stream URL is
+    /// obtained and what headers mpv needs.
+    pub source: StreamSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StreamSource {
+    #[default]
+    Ashdi,
+    MoonAnime,
 }
 
 /// A complete, ordered playback timeline with one selected entry.
@@ -329,12 +339,64 @@ pub fn selected_play_target(app: &AppState) -> Option<PlayTarget> {
         start_time: None,
         studio_name,
         referrer: "https://ashdi.vip/".to_string(),
+        source: StreamSource::Ashdi,
+    })
+}
+
+/// MoonAnime counterpart of [`selected_play_target`]. The embed URL takes the
+/// place of the Ashdi player page; everything downstream is identical, so watch
+/// progress, resume and Discord presence keep working unchanged.
+pub fn selected_moonanime_play_target(app: &AppState) -> Option<PlayTarget> {
+    let index = app.content.selected_episode_index?;
+    let crate::ui::app::EpisodeChoice::MoonAnime(episode) =
+        app.selected_episode_choices().get(index).copied()?
+    else {
+        return None;
+    };
+    let season = app.selected_season_num()?;
+    let studio_name = app
+        .selected_dubbing_choice()
+        .map(|choice| choice.studio_name().to_string())
+        .unwrap_or_else(|| "MoonAnime".to_string());
+
+    let details = app.content.current_details.as_ref();
+    let anime_title = details
+        .map(|details| details.title_ukrainian.clone())
+        .or_else(|| app.selected_release().map(|release| release.title.clone()))
+        .unwrap_or_default();
+
+    Some(PlayTarget {
+        anime_id: details.map_or(0, |details| details.id),
+        player_title: details.map_or_else(
+            || anime_title.clone(),
+            |details| {
+                format!(
+                    "{} ({})",
+                    details.title_ukrainian,
+                    details.year.unwrap_or(0)
+                )
+            },
+        ),
+        anime_title,
+        season,
+        episode: episode.episode_number,
+        episode_title: format!("Серія {}", episode.episode_number),
+        stream_page_url: episode.iframe_url.clone(),
+        start_time: None,
+        studio_name,
+        referrer: "https://moonanime.art/".to_string(),
+        source: StreamSource::MoonAnime,
     })
 }
 
 /// Build a deterministic timeline around the selected target. The supervisor
 /// resolves the complete timeline before launching mpv.
 pub fn build_playback_timeline(app: &AppState, target: &PlayTarget) -> PlaybackTimeline {
+    // The neighbor window is built from Ashdi studio listings, so a MoonAnime
+    // episode plays on its own rather than silently pulling in Ashdi entries.
+    if target.source != StreamSource::Ashdi {
+        return PlaybackTimeline::single(target.clone());
+    }
     let Some(sources) = app.content.current_sources.as_ref() else {
         return PlaybackTimeline::single(target.clone());
     };
@@ -438,6 +500,7 @@ fn play_target_for_release(
         start_time: None,
         studio_name: studio.studio_name.clone(),
         referrer: "https://ashdi.vip/".to_string(),
+        source: StreamSource::Ashdi,
     }
 }
 
@@ -1589,9 +1652,30 @@ const PLAYLIST_RESOLUTION_CONCURRENCY: usize = 6;
 /// playlist entries during this short grace period.
 const PLAYLIST_NEIGHBOR_GRACE: Duration = Duration::from_secs(2);
 
+/// Per-entry mpv options for a given source. Ashdi needs nothing beyond the
+/// referrer that every entry already carries.
+fn source_extra_args(source: StreamSource) -> Vec<String> {
+    match source {
+        StreamSource::Ashdi => Vec::new(),
+        StreamSource::MoonAnime => vec![
+            // `-append` rather than assigning the list: mpv splits
+            // `--http-header-fields` on commas, which header values may contain.
+            format!(
+                "--http-header-fields-append={}",
+                api::moonanime::accept_language_header()
+            ),
+            // The manifest is already resolved. Left to its own devices mpv
+            // hands the URL to yt-dlp, which re-resolves it down to one variant
+            // and quietly overrides the quality preference.
+            "--no-ytdl".to_string(),
+        ],
+    }
+}
+
 async fn resolve_playlist_entry(
     target: PlayTarget,
     parser: Arc<api::AshdiParser>,
+    moonanime: Arc<api::MoonAnimeParser>,
     cancellation: TaskCancellation,
     url_cache: Arc<Mutex<HashMap<String, CachedStreamUrl>>>,
 ) -> Result<MpvPlaylistEntry> {
@@ -1606,12 +1690,20 @@ async fn resolve_playlist_entry(
             title: format!("{} - {}", target.player_title, target.episode_title),
             start_time: target.start_time,
             referrer: target.referrer,
+            extra_args: source_extra_args(target.source),
         });
     }
 
     let url = tokio::select! {
         _ = cancellation.cancelled() => return Err(anyhow!("playlist resolution cancelled")),
-        result = parser.extract_m3u8(&target.stream_page_url) => result
+        result = async {
+            match target.source {
+                StreamSource::Ashdi => parser.extract_m3u8(&target.stream_page_url).await,
+                StreamSource::MoonAnime => {
+                    moonanime.extract_manifest(&target.stream_page_url).await
+                }
+            }
+        } => result
             .map_err(|error| anyhow!(
                 "не вдалося отримати S{}E{}: {error}",
                 target.season,
@@ -1634,6 +1726,7 @@ async fn resolve_playlist_entry(
         title: format!("{} - {}", target.player_title, target.episode_title),
         start_time: target.start_time,
         referrer: target.referrer,
+        extra_args: source_extra_args(target.source),
     })
 }
 
@@ -1657,12 +1750,14 @@ async fn resolve_playlist(
     }
 
     let parser = Arc::new(api::AshdiParser::new()?);
+    let moonanime = Arc::new(api::MoonAnimeParser::new()?);
     let selected_offset = timeline.current_index - window_start;
     let mut entries = vec![None; window_end - window_start];
     entries[selected_offset] = Some(
         resolve_playlist_entry(
             window_targets[selected_offset].clone(),
             parser.clone(),
+            moonanime.clone(),
             cancellation.clone(),
             url_cache.clone(),
         )
@@ -1679,6 +1774,7 @@ async fn resolve_playlist(
     let mut tasks = JoinSet::new();
     for (offset, target) in neighbor_targets {
         let parser = parser.clone();
+        let moonanime = moonanime.clone();
         let concurrency = concurrency.clone();
         let cancellation = cancellation.clone();
         let url_cache = url_cache.clone();
@@ -1690,7 +1786,8 @@ async fn resolve_playlist(
             let result = match permit {
                 Ok(permit) => {
                     let result =
-                        resolve_playlist_entry(target, parser, cancellation, url_cache).await;
+                        resolve_playlist_entry(target, parser, moonanime, cancellation, url_cache)
+                            .await;
                     drop(permit);
                     result
                 }
@@ -1766,6 +1863,7 @@ mod supervisor_tests {
             start_time,
             studio_name: "dub".to_string(),
             referrer: "https://ashdi.vip/".to_string(),
+            source: StreamSource::Ashdi,
         }
     }
 
@@ -2060,6 +2158,7 @@ mod supervisor_tests {
             start_time: None,
             studio_name: "dub".to_string(),
             referrer: "https://ashdi.vip/".to_string(),
+            source: StreamSource::Ashdi,
         }
     }
 

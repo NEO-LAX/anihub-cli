@@ -286,6 +286,7 @@ impl ResourceCoordinator {
             start_time: resolved.start_time,
             studio_name: resolved.studio_name,
             referrer: "https://ashdi.vip/".to_string(),
+            source: crate::playback::StreamSource::Ashdi,
         };
         self.ready_playback = Some(build_active_playback_timeline(app, &target));
         self.pending_continue = None;

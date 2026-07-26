@@ -160,6 +160,11 @@ pub(super) fn general_settings_items(
             inner_width,
         ),
         settings_item("Якість відео", settings.stream_quality.label(), inner_width),
+        settings_item(
+            "MoonAnime у mpv (експеримент)",
+            on_off(settings.moonanime_direct_playback),
+            inner_width,
+        ),
         settings_item("Шлях до mpv", &settings.mpv_path, inner_width),
         settings_item(
             "Додаткові аргументи mpv",

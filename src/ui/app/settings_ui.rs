@@ -107,8 +107,12 @@ impl AppState {
                 self.persist_settings();
             }
             8 => self.open_settings_choice(SettingsChoiceKind::StreamQuality),
-            9 => self.open_settings_text(SettingsInput::MpvPath),
-            10 => self.open_settings_text(SettingsInput::MpvArgs),
+            9 => {
+                self.settings.moonanime_direct_playback = !self.settings.moonanime_direct_playback;
+                self.persist_settings();
+            }
+            10 => self.open_settings_text(SettingsInput::MpvPath),
+            11 => self.open_settings_text(SettingsInput::MpvArgs),
             _ => {}
         }
     }

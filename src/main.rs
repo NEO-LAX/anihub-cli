@@ -212,7 +212,9 @@ async fn main() -> Result<()> {
 
         if app.playback.play_requested {
             app.playback.play_requested = false;
-            if let Some(target) = selected_play_target(&app) {
+            let selected = selected_play_target(&app)
+                .or_else(|| playback::selected_moonanime_play_target(&app));
+            if let Some(target) = selected {
                 let mut timeline = build_active_playback_timeline(&app, &target);
                 if let Err(error) = apply_playback_settings(&app, &mut timeline) {
                     app.set_error_status(format!("Помилка відтворення: {error}"));
