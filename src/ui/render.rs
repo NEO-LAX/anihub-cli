@@ -840,15 +840,21 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
             .count()
             .max(18) as u16;
 
+        let help = help_pointer_line();
         let hints = framed_shortcuts_line(&context_shortcuts(app));
-        let plan = status_bar_plan(rows[1].width, brand_w, hints.width() as u16);
+        let plan = status_bar_plan(
+            rows[1].width,
+            brand_w,
+            hints.width() as u16,
+            help.width() as u16,
+        );
         let mut constraints = Vec::new();
         if plan.brand {
             constraints.push(Constraint::Length(brand_w));
         }
         constraints.push(Constraint::Min(1));
-        if plan.spacer {
-            constraints.push(Constraint::Length(brand_w));
+        if plan.right > 0 {
+            constraints.push(Constraint::Length(plan.right));
         }
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -898,21 +904,25 @@ fn render_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
             .alignment(Alignment::Center),
             hints_area,
         );
-        if plan.spacer {
-            // Symmetric empty side keeps the bind strip visually centered.
+        if plan.right > 0 {
+            // The one place the help key is advertised outside the help popup
+            // itself, which you have to already know about to open.
             f.render_widget(
-                Paragraph::new("").style(Style::default().bg(color_background())),
+                Paragraph::new(help)
+                    .style(Style::default().bg(color_background()))
+                    .alignment(Alignment::Right),
                 columns[hints_column + 1],
             );
         }
     }
 }
 
-/// Which decorations the shortcut row can afford.
+/// What the shortcut row can afford beside the hints themselves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StatusBarPlan {
     brand: bool,
-    spacer: bool,
+    /// Width of the right-hand column, `0` when the help pointer is dropped.
+    right: u16,
 }
 
 /// Below this the shortcut strip is not worth showing a brand next to.
@@ -922,11 +932,37 @@ const MIN_SHORTCUTS_WIDTH: u16 = 40;
 /// centred against the brand on the left. Both are decoration, so a narrow
 /// terminal gives up the spacer, then the brand, rather than cutting the
 /// shortcuts mid-word — which is what happened at the 80-column minimum.
-fn status_bar_plan(width: u16, brand_w: u16, hints_w: u16) -> StatusBarPlan {
-    StatusBarPlan {
-        brand: width >= brand_w.saturating_add(MIN_SHORTCUTS_WIDTH),
-        spacer: width >= brand_w.saturating_mul(2).saturating_add(hints_w),
-    }
+fn status_bar_plan(width: u16, brand_w: u16, hints_w: u16, help_w: u16) -> StatusBarPlan {
+    let brand = width >= brand_w.saturating_add(MIN_SHORTCUTS_WIDTH);
+    let left = if brand { brand_w } else { 0 };
+    // With room to spare, mirror the brand width so the hints stay optically
+    // centred; when tight, give the column only what the pointer needs.
+    let right = if width >= brand_w.saturating_mul(2).saturating_add(hints_w) {
+        brand_w
+    } else if width
+        >= left
+            .saturating_add(MIN_SHORTCUTS_WIDTH)
+            .saturating_add(help_w)
+    {
+        help_w
+    } else {
+        0
+    };
+    StatusBarPlan { brand, right }
+}
+
+/// `? Довідка` — the pointer that makes every other shortcut discoverable.
+fn help_pointer_line() -> Line<'static> {
+    Line::from(vec![
+        // Leading gap so the pointer does not touch the shortcut strip's rail.
+        Span::styled(
+            "  ?",
+            Style::default()
+                .fg(color_secondary())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Довідка ", Style::default().fg(color_dim())),
+    ])
 }
 
 /// Drops trailing hints until the strip fits the space it was given. The
@@ -2469,19 +2505,48 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_status_bar_drops_decoration_instead_of_cutting_hints() {
-        // Wide enough for brand + hints + mirror spacer: keep all three.
-        let wide = status_bar_plan(160, 21, 60);
-        assert!(wide.brand && wide.spacer);
+    fn a_narrow_status_bar_sheds_decoration_before_the_help_pointer() {
+        // brand 21, full hints 60, pointer 10.
+        // Roomy: brand plus a mirrored right column keeps the hints centred.
+        let wide = status_bar_plan(160, 21, 60, 10);
+        assert!(wide.brand);
+        assert_eq!(wide.right, 21);
 
-        // 21 + 60 + 21 does not fit in 80, so the purely decorative mirror goes
-        // first while the brand stays.
-        let narrow = status_bar_plan(80, 21, 60);
-        assert!(narrow.brand && !narrow.spacer);
+        // 80 cannot fit 21 + 60 + 21, so the right column shrinks to just the
+        // pointer instead of vanishing — it is the only place `?` is advertised.
+        let narrow = status_bar_plan(80, 21, 60, 10);
+        assert!(narrow.brand);
+        assert_eq!(narrow.right, 10);
 
-        // Too narrow to leave the hints a usable strip: the brand goes too.
-        let tiny = status_bar_plan(55, 21, 60);
-        assert!(!tiny.brand && !tiny.spacer);
+        // Tighter still: the brand goes, the pointer stays.
+        let tight = status_bar_plan(60, 21, 60, 10);
+        assert!(!tight.brand);
+        assert_eq!(tight.right, 10);
+
+        // Only when even the hints would be squeezed below their minimum does
+        // the pointer go as well.
+        let tiny = status_bar_plan(45, 21, 60, 10);
+        assert!(!tiny.brand);
+        assert_eq!(tiny.right, 0);
+    }
+
+    #[test]
+    fn the_help_pointer_names_a_key_that_actually_opens_help() {
+        set_active_theme(
+            ColorMode::AniHubRgb,
+            ThemePreset::CatppuccinMocha,
+            SurfaceMode::Auto,
+            true,
+        );
+        let rendered = help_pointer_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains('?'), "no key in {rendered:?}");
+        assert!(rendered.contains("Довідка"));
+        // `?` and `h` both open the popup (see handle_events); `?` is advertised.
+        assert!(rendered.trim().starts_with('?'));
     }
 
     #[test]

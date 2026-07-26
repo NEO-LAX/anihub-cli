@@ -27,6 +27,8 @@ starts at 0.8.0.
 - **Library export** to a timestamped JSON file in the data directory
   (settings → Про → Експортувати бібліотеку).
 - **Next-episode countdown in search results**, matching the library.
+- **`? Довідка` pointer** in the bottom-right of the status bar. The help key
+  was previously documented only inside the help popup itself and in the README.
 
 ### Fixed
 
