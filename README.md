@@ -113,7 +113,7 @@ On pause the bar hides and the status shows **Пауза**. Desktop Discord only
 | 🎨 **Themes** | AniHub RGB + ANSI 16/256 palettes · surface & transparency controls |
 | 💬 **Discord** | Rich Presence with progress bar (opt-in) |
 | 💾 **Caches** | Metadata SWR cache · ~150 MiB poster cache with prune |
-| ⌨️ **Keys** | Shortcuts work on **EN** and **UA/RU (ЙЦУКЕН)** layouts |
+| ⌨️ **Keys** | Shortcuts work on **English** and **Ukrainian** layouts |
 
 ### MoonAnime in mpv (experimental)
 
